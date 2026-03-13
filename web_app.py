@@ -7,6 +7,16 @@ from flask import Flask, Response, jsonify, render_template_string, request
 from angel import AngelCore, get_elevenlabs_mp3, transcribe_with_whisper
 
 
+def _sanitize_text(s: str) -> str:
+    """
+    Strip/replace any invalid Unicode (including surrogate characters)
+    so Flask/Werkzeug can safely encode responses.
+    """
+    if not isinstance(s, str):
+        s = str(s)
+    return s.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
 
@@ -290,7 +300,10 @@ def create_app() -> Flask:
 
     @app.route("/", methods=["GET"])
     def index():
-        return render_template_string(INDEX_HTML)
+        # Sanitize the HTML template itself in case any stray surrogates
+        # make their way into it (e.g. from string concatenation).
+        safe_html = _sanitize_text(INDEX_HTML)
+        return render_template_string(safe_html)
 
     @app.route("/api/message", methods=["POST"])
     def api_message():
@@ -299,6 +312,7 @@ def create_app() -> Flask:
         if not message:
             return jsonify({"error": "Empty message"}), 400
         reply = angel.generate_reply(message)
+        reply = _sanitize_text(reply)
         return jsonify({"reply": reply})
 
     @app.route("/api/voice", methods=["POST"])
@@ -315,7 +329,12 @@ def create_app() -> Flask:
             reply = "I couldn't clearly hear what you said."
             return jsonify({"transcript": "", "reply": reply})
         reply = angel.generate_reply(transcript)
-        return jsonify({"transcript": transcript, "reply": reply})
+        return jsonify(
+            {
+                "transcript": _sanitize_text(transcript),
+                "reply": _sanitize_text(reply),
+            }
+        )
 
     @app.route("/api/tts", methods=["POST"])
     def api_tts():
