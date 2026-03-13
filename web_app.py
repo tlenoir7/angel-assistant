@@ -142,6 +142,7 @@ def create_app() -> Flask:
           <button id="voice-btn">🎤 Hold to speak</button>
         </div>
       </footer>
+      <audio id="tts-audio" style="display:none;" preload="auto"></audio>
       <script>
         const chat = document.getElementById("chat");
         const statusEl = document.getElementById("status");
@@ -149,6 +150,7 @@ def create_app() -> Flask:
         const sendBtn = document.getElementById("send-btn");
         const voiceBtn = document.getElementById("voice-btn");
         const voiceToggle = document.getElementById("voice-toggle");
+        const ttsAudio = document.getElementById("tts-audio");
 
         let voiceMode = true;
 
@@ -172,13 +174,39 @@ def create_app() -> Flask:
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ text: text }),
             });
-            if (!resp.ok) return;
+            if (!resp.ok) {
+              console.error("TTS request failed with status", resp.status);
+              // Fallback to Web Speech API if available
+              if ("speechSynthesis" in window) {
+                const u = new SpeechSynthesisUtterance(text);
+                window.speechSynthesis.speak(u);
+              }
+              return;
+            }
             const blob = await resp.blob();
             const url = URL.createObjectURL(blob);
-            const audio = new Audio(url);
-            audio.onended = () => URL.revokeObjectURL(url);
-            await audio.play();
-          } catch (e) {}
+            ttsAudio.src = url;
+            ttsAudio.onended = () => {
+              URL.revokeObjectURL(url);
+            };
+            try {
+              await ttsAudio.play();
+              console.log("TTS audio playback started successfully.");
+            } catch (playErr) {
+              console.error("TTS audio playback failed:", playErr);
+              // Fallback to Web Speech API if audio playback fails
+              if ("speechSynthesis" in window) {
+                const u = new SpeechSynthesisUtterance(text);
+                window.speechSynthesis.speak(u);
+              }
+            }
+          } catch (e) {
+            console.error("TTS request or playback error:", e);
+            if ("speechSynthesis" in window) {
+              const u = new SpeechSynthesisUtterance(text);
+              window.speechSynthesis.speak(u);
+            }
+          }
         }
 
         function appendMessage(sender, text) {
@@ -374,7 +402,10 @@ def create_app() -> Flask:
                     }
                 ), 503
 
-            return Response(mp3_bytes, mimetype="audio/mpeg")
+            resp = Response(mp3_bytes, mimetype="audio/mpeg")
+            resp.headers["Content-Type"] = "audio/mpeg"
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
         except Exception as e:
             # Log full traceback to server logs so Railway shows the real cause.
             print(f"[api_tts] Exception: {e}", flush=True)
