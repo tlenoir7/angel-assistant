@@ -341,13 +341,39 @@ def create_app() -> Flask:
         try:
             data = request.get_json(silent=True) or {}
             text = (data.get("text") or "").strip()
+            text_len = len(text)
+
+            api_key_present = bool(os.getenv("ELEVENLABS_API_KEY"))
+            voice_id = os.getenv("ELEVENLABS_VOICE_ID") or "EXAVITQu4vr4xnSDxMaL"
+
+            # Diagnostic logging so Railway shows what's going on.
+            print(
+                f"[api_tts] called | api_key_present={api_key_present} "
+                f"| voice_id={voice_id} | text_len={text_len}",
+                flush=True,
+            )
+
             if not text:
                 return jsonify({"error": "Missing or empty text"}), 400
+
+            if not api_key_present:
+                return jsonify(
+                    {
+                        "error": "ELEVENLABS_API_KEY is not set in the environment; TTS is unavailable."
+                    }
+                ), 503
+
             mp3_bytes = get_elevenlabs_mp3(text)
             if not mp3_bytes:
                 return jsonify(
-                    {"error": "TTS unavailable (check ELEVENLABS_API_KEY and logs)"}
+                    {
+                        "error": (
+                            "TTS generation failed or returned empty audio. "
+                            "Check server logs for details (api key, voice id, response)."
+                        )
+                    }
                 ), 503
+
             return Response(mp3_bytes, mimetype="audio/mpeg")
         except Exception as e:
             # Log full traceback to server logs so Railway shows the real cause.
