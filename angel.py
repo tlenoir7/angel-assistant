@@ -9,8 +9,6 @@ from io import BytesIO
 import wave
 import tempfile
 
-import pyaudio
-import pygame
 import requests
 from colorama import init as colorama_init, Fore, Style
 from dotenv import load_dotenv
@@ -18,8 +16,18 @@ from dotenv import load_dotenv
 import anthropic
 from mem0 import Memory
 
+# Desktop-only: optional so cloud (e.g. Railway) can run without them
 try:
-    # Local, low-latency Whisper implementation
+    import pyaudio
+except ImportError:
+    pyaudio = None
+
+try:
+    import pygame
+except ImportError:
+    pygame = None
+
+try:
     from faster_whisper import WhisperModel as _WhisperModel
 except ImportError:
     _WhisperModel = None
@@ -441,8 +449,11 @@ def strip_markdown(text: str) -> str:
 def _record_microphone(duration_seconds: int = 8, rate: int = 16000) -> bytes:
     """
     Record audio from the default microphone for a fixed duration and
-    return WAV bytes suitable for Whisper.
+    return WAV bytes suitable for Whisper. Returns empty bytes if pyaudio
+    is not available (e.g. on cloud servers).
     """
+    if pyaudio is None:
+        return b""
     print(
         f"{Fore.YELLOW}Recording for about {duration_seconds} seconds... "
         f"start speaking now.{Style.RESET_ALL}"
@@ -542,6 +553,7 @@ def transcribe_with_whisper(audio_wav_bytes: bytes) -> str:
 def speak_with_elevenlabs(text: str):
     """
     Stream Angel's reply from ElevenLabs Flash model and play it immediately.
+    No-op if pygame is not available (e.g. on cloud servers).
     """
     if not text:
         return
@@ -549,6 +561,9 @@ def speak_with_elevenlabs(text: str):
     # Clean up Markdown so speech sounds natural
     cleaned = strip_markdown(text)
     if not cleaned:
+        return
+
+    if pygame is None:
         return
 
     api_key = get_env_var("ELEVENLABS_API_KEY")
