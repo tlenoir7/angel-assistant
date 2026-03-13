@@ -205,6 +205,24 @@ def _append_local_memory(user_id: str, memory_text: str, metadata: dict):
         print(traceback.format_exc())
 
 
+def _strip_transcript_prefixes_from_memory(text: str) -> str:
+    """
+    Remove 'User:' and 'Angel:' dialogue structure from memory content so the
+    system prompt does not contain transcript-style text that could cause the
+    model to continue fake conversations.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    # If format is "User: ... | Angel: ...", keep only Angel's response
+    if " | Angel:" in text:
+        parts = text.split(" | Angel:", 1)
+        text = parts[1].strip() if len(parts) > 1 else text
+    # Strip any remaining "User:" or "Angel:" prefixes (e.g. at line start)
+    text = re.sub(r"^\s*User:\s*", "", text)
+    text = re.sub(r"^\s*Angel:\s*", "", text)
+    return text.strip()
+
+
 def summarize_memories_for_prompt(memories) -> str:
     """
     Convert raw Mem0 memories into a concise text block for Claude.
@@ -254,11 +272,15 @@ def summarize_memories_for_prompt(memories) -> str:
 
     lines = []
     for m in memories_sorted:
-        text = (
+        raw = (
             (m.get("memory") if isinstance(m, dict) else None)
             or (m.get("data") if isinstance(m, dict) else None)
             or ""
         )
+        if not raw:
+            continue
+        # Strip User:/Angel: transcript format so the model doesn't continue fake dialogue
+        text = _strip_transcript_prefixes_from_memory(raw)
         if not text:
             continue
 
@@ -301,6 +323,7 @@ Behavior:
 - Remember the user’s preferences, history, and goals over time, and gently use them to personalize your guidance.
 - When appropriate, reflect patterns you notice in the user’s life to help them grow.
 - Avoid filler or over-the-top enthusiasm; be concise, steady, and reassuring.
+- You must NEVER generate fake user messages, fake dialogue, or continue a conversation that is not happening. You only respond to the actual current message from the user. Do not output "User:" or simulate the user speaking; you are Angel and you reply only as Angel, once, to the real user input.
 """
 
     if voice_mode:
@@ -759,7 +782,7 @@ class AngelCore:
                 print(traceback.format_exc())
 
             if not self._use_mem0_cloud:
-                local_text = f"User: {messages[0]['content']} | Angel: {messages[1]['content']}"
+                local_text = memory_reply  # Save only Angel's response, not User/Angel transcript
                 _append_local_memory(self.user_id, local_text, metadata)
         except Exception as e:
             print(f"{Fore.RED}Warning: could not store memory (AngelCore): {e}{Style.RESET_ALL}")
@@ -923,8 +946,8 @@ def main():
                 print(f"{Fore.RED}Error saving memory to Mem0: {e}{Style.RESET_ALL}")
                 print(traceback.format_exc())
 
-            # Always save to local JSON as a persistent fallback
-            local_text = f"User: {messages[0]['content']} | Angel: {messages[1]['content']}"
+            # Always save to local JSON as a persistent fallback (Angel's response only)
+            local_text = reply if not use_voice else strip_markdown(reply)
             _append_local_memory(user_id, local_text, metadata)
         except Exception as e:
             print(f"{Fore.RED}Warning: could not store memory: {e}{Style.RESET_ALL}")
