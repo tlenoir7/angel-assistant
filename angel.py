@@ -307,16 +307,11 @@ Behavior:
         persona += """
 
 Additional instructions for voice conversations:
-- Default to 1–2 short sentences for casual conversation, reactions, confirmations, and simple answers.
-- Use 3–5 sentences when the user’s question genuinely needs some explanation or brief reasoning.
-- Only give longer, more detailed responses when the user explicitly asks for it (for example: “tell me more”, “explain”, “walk me through”, “give me a full plan”, or similar).
-- Read the nature of the question carefully and match your response length to what the moment actually needs.
 - Respond in a natural, conversational speaking style.
 - Prefer simpler phrasing over long or complex sentences.
 - Avoid lists, headings, bullet points, or any document-style formatting.
 - Do not use Markdown formatting of any kind.
 - Imagine you are talking directly to the user in real time.
-- Keep a gentle, steady pace and avoid sounding like you are reading a document.
 """
 
     persona += f"""
@@ -552,25 +547,7 @@ def transcribe_with_whisper(audio_wav_bytes: bytes) -> str:
     """
     global _WHISPER_MODEL
 
-    # Preferred path: local faster-whisper for low latency and no network hop.
-    if _WhisperModel is not None:
-        try:
-            if _WHISPER_MODEL is None:
-                # You can change "small.en" to another checkpoint if desired.
-                _WHISPER_MODEL = _WhisperModel("small.en", device="cpu", compute_type="int8")
-
-            # Run transcription from in-memory WAV bytes.
-            audio_buffer = BytesIO(audio_wav_bytes)
-            segments, _info = _WHISPER_MODEL.transcribe(audio_buffer, beam_size=1)
-            text_parts = [seg.text.strip() for seg in segments if getattr(seg, "text", "").strip()]
-            text = " ".join(text_parts).strip()
-            if text:
-                return text
-        except Exception as e:
-            print(f"{Fore.RED}Error using faster-whisper, falling back to OpenAI: {e}{Style.RESET_ALL}")
-            print(traceback.format_exc())
-
-    # Fallback: OpenAI Whisper API
+    # Primary path: OpenAI Whisper API for best accuracy.
     api_key = get_env_var("OPENAI_API_KEY")
     url = "https://api.openai.com/v1/audio/transcriptions"
 
@@ -595,11 +572,28 @@ def transcribe_with_whisper(audio_wav_bytes: bytes) -> str:
         resp.raise_for_status()
         payload = resp.json()
         text = (payload.get("text") or "").strip()
-        return text
+        if text:
+            return text
     except Exception as e:
         print(f"{Fore.RED}Error transcribing audio with Whisper API: {e}{Style.RESET_ALL}")
         print(traceback.format_exc())
-        return ""
+
+    # Fallback: local faster-whisper if available.
+    if _WhisperModel is not None:
+        try:
+            if _WHISPER_MODEL is None:
+                _WHISPER_MODEL = _WhisperModel("small.en", device="cpu", compute_type="int8")
+            audio_buffer = BytesIO(audio_wav_bytes)
+            segments, _info = _WHISPER_MODEL.transcribe(audio_buffer, beam_size=1)
+            text_parts = [seg.text.strip() for seg in segments if getattr(seg, "text", "").strip()]
+            text = " ".join(text_parts).strip()
+            if text:
+                return text
+        except Exception as e:
+            print(f"{Fore.RED}Error using faster-whisper fallback: {e}{Style.RESET_ALL}")
+            print(traceback.format_exc())
+
+    return ""
 
 
 def get_elevenlabs_mp3(text: str) -> bytes | None:
@@ -736,15 +730,12 @@ class AngelCore:
         else:
             augmented_user_message = user_message
 
-        # Use a faster model (Haiku) for voice mode, keep Sonnet for text mode.
+        # Use Haiku for voice (speed) and Sonnet for text. Both can return
+        # full, detailed answers; we don't impose extra length limits here.
         model = "claude-haiku-4-5" if self.use_voice else "claude-sonnet-4-5"
         reply = call_claude(
             self.anthropic_client, system_prompt, augmented_user_message, model=model
         )
-
-        # Post-process for voice mode to enforce concise spoken responses.
-        if self.use_voice:
-            reply = self._shorten_for_voice_if_needed(user_message, reply)
 
         # For voice mode, strip Markdown before saving to memory so
         # memories stay clean and speech-oriented.
@@ -774,63 +765,6 @@ class AngelCore:
             print(f"{Fore.RED}Warning: could not store memory (AngelCore): {e}{Style.RESET_ALL}")
 
         return reply
-
-    def _shorten_for_voice_if_needed(self, user_message: str, reply: str) -> str:
-        """
-        For voice mode, keep responses tight. If Claude's reply is
-        unnecessarily long for a simple conversational turn, ask Claude
-        to shorten it to the essential point in one sentence.
-        """
-        text = reply.strip()
-        if not text:
-            return reply
-
-        # Rough sentence splitting by common punctuation.
-        sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
-        if len(sentences) <= 2:
-            return reply
-
-        # Heuristic: treat this as a "simple" exchange if the user didn't
-        # clearly ask for a long explanation.
-        lower = user_message.lower()
-        wants_detail = any(
-            kw in lower
-            for kw in [
-                "tell me more",
-                "explain",
-                "walk me through",
-                "full explanation",
-                "in detail",
-                "step by step",
-                "give me a plan",
-                "detailed",
-            ]
-        )
-        if wants_detail:
-            return reply
-
-        # Ask Haiku to rewrite the reply into a single, natural sentence.
-        try:
-            system = (
-                "You are rewriting Angel's spoken reply for voice.\n"
-                "Shorten it to ONE short, natural sentence that keeps only the essential point.\n"
-                "Do not add new information. Do not use Markdown or lists."
-            )
-            new_reply = call_claude(
-                self.anthropic_client,
-                system,
-                user_message=(
-                    f"Original user message:\n{user_message}\n\n"
-                    f"Original Angel reply:\n{reply}\n\n"
-                    "Return only the shortened one-sentence reply."
-                ),
-                model="claude-haiku-4-5",
-            )
-            return new_reply.strip() or reply
-        except Exception as e:
-            print(f"{Fore.RED}Error shortening voice reply: {e}{Style.RESET_ALL}")
-            print(traceback.format_exc())
-            return reply
 
 
 def main():
