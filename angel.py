@@ -763,10 +763,6 @@ class AngelCore:
 
             try:
                 self.memory_client.add(messages, user_id=self.user_id, metadata=metadata)
-                print(
-                    f"{Fore.MAGENTA}MEMORY SAVED (Mem0, AngelCore):{Style.RESET_ALL} "
-                    f"{messages[0]['content']} || {messages[1]['content']}"
-                )
             except Exception as e:
                 print(f"{Fore.RED}Error saving memory to Mem0: {e}{Style.RESET_ALL}")
                 print(traceback.format_exc())
@@ -774,10 +770,6 @@ class AngelCore:
             if not self._use_mem0_cloud:
                 local_text = f"User: {messages[0]['content']} | Angel: {messages[1]['content']}"
                 _append_local_memory(self.user_id, local_text, metadata)
-                print(
-                    f"{Fore.MAGENTA}MEMORY SAVED (local, AngelCore):{Style.RESET_ALL} "
-                    f"{local_text}"
-                )
         except Exception as e:
             print(f"{Fore.RED}Warning: could not store memory (AngelCore): {e}{Style.RESET_ALL}")
 
@@ -993,10 +985,6 @@ def main():
             # Try saving to Mem0; if it fails, print full error/traceback
             try:
                 memory_client.add(messages, user_id=user_id, metadata=metadata)
-                print(
-                    f"{Fore.MAGENTA}MEMORY SAVED (Mem0):{Style.RESET_ALL} "
-                    f"{messages[0]['content']} || {messages[1]['content']}"
-                )
             except Exception as e:
                 print(f"{Fore.RED}Error saving memory to Mem0: {e}{Style.RESET_ALL}")
                 print(traceback.format_exc())
@@ -1004,10 +992,6 @@ def main():
             # Always save to local JSON as a persistent fallback
             local_text = f"User: {messages[0]['content']} | Angel: {messages[1]['content']}"
             _append_local_memory(user_id, local_text, metadata)
-            print(
-                f"{Fore.MAGENTA}MEMORY SAVED (local):{Style.RESET_ALL} "
-                f"{local_text}"
-            )
         except Exception as e:
             print(f"{Fore.RED}Warning: could not store memory: {e}{Style.RESET_ALL}")
 

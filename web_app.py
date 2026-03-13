@@ -1,5 +1,6 @@
 import os
 from io import BytesIO
+import traceback
 
 from flask import Flask, Response, jsonify, render_template_string, request
 
@@ -318,14 +319,22 @@ def create_app() -> Flask:
 
     @app.route("/api/tts", methods=["POST"])
     def api_tts():
-        data = request.get_json(silent=True) or {}
-        text = (data.get("text") or "").strip()
-        if not text:
-            return jsonify({"error": "Missing or empty text"}), 400
-        mp3_bytes = get_elevenlabs_mp3(text)
-        if not mp3_bytes:
-            return jsonify({"error": "TTS unavailable (check ELEVENLABS_API_KEY)"}), 503
-        return Response(mp3_bytes, mimetype="audio/mpeg")
+        try:
+            data = request.get_json(silent=True) or {}
+            text = (data.get("text") or "").strip()
+            if not text:
+                return jsonify({"error": "Missing or empty text"}), 400
+            mp3_bytes = get_elevenlabs_mp3(text)
+            if not mp3_bytes:
+                return jsonify(
+                    {"error": "TTS unavailable (check ELEVENLABS_API_KEY and logs)"}
+                ), 503
+            return Response(mp3_bytes, mimetype="audio/mpeg")
+        except Exception as e:
+            # Log full traceback to server logs so Railway shows the real cause.
+            print(f"[api_tts] Exception: {e}", flush=True)
+            traceback.print_exc()
+            return jsonify({"error": f"TTS error: {str(e)}"}), 500
 
     return app
 
