@@ -36,6 +36,53 @@ BASE_DIR = Path(__file__).resolve().parent
 LOCAL_MEMORY_FILE = BASE_DIR / "tyler_memories.json"
 _WHISPER_MODEL = None
 TAVILY_API_URL = "https://api.tavily.com/search"
+MEM0_API_BASE_URL = "https://api.mem0.ai"
+
+
+class Mem0CloudClient:
+    """
+    Minimal Mem0 Cloud client using HTTP API.
+
+    Uses MEM0_API_KEY (Authorization: Token <key>).
+    """
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Token {self.api_key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    def get_all(self, user_id: str):
+        # v2 get memories (POST /v2/memories/)
+        url = f"{MEM0_API_BASE_URL}/v2/memories/"
+        payload = {
+            "filters": {"user_id": user_id},
+            "page": 1,
+            "page_size": 200,
+        }
+        resp = requests.post(url, headers=self._headers(), json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+    def add(self, messages, user_id: str, metadata: dict | None = None):
+        # v1 add memories endpoint supports version="v2"
+        url = f"{MEM0_API_BASE_URL}/v1/memories/"
+        payload = {
+            "user_id": user_id,
+            "messages": messages,
+            "metadata": metadata or {},
+            "version": "v2",
+            "output_format": "v1.1",
+            "async_mode": True,
+            "infer": True,
+        }
+        resp = requests.post(url, headers=self._headers(), json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
 
 
 # Monkey-patch Mem0's Anthropic LLM so it does not send top_p (Anthropic forbids
@@ -91,6 +138,11 @@ def build_memory_client() -> Memory:
     Configure Mem0 to use Anthropic as the LLM provider.
     Mem0 will use OpenAI embeddings via OPENAI_API_KEY.
     """
+    mem0_api_key = os.getenv("MEM0_API_KEY")
+    if mem0_api_key:
+        # Cloud storage mode
+        return Mem0CloudClient(mem0_api_key)  # type: ignore[return-value]
+
     _patch_mem0_anthropic_no_top_p()
     config = {
         "llm": {
@@ -627,6 +679,7 @@ class AngelCore:
 
         self.memory_client = build_memory_client()
         self.anthropic_client = create_anthropic_client()
+        self._use_mem0_cloud = bool(os.getenv("MEM0_API_KEY"))
 
     def _fetch_combined_memories(self):
         try:
@@ -639,13 +692,17 @@ class AngelCore:
             print(f"{Fore.RED}Warning: could not fetch memories: {e}{Style.RESET_ALL}")
             memories = []
 
-        local = _load_local_memories(self.user_id)
-
         combined = []
         if isinstance(memories, list):
             combined.extend(memories)
-        if isinstance(local, list):
-            combined.extend(local)
+        elif isinstance(memories, dict) and isinstance(memories.get("results"), list):
+            combined.extend(memories["results"])
+
+        # Local JSON fallback mode only (do not mix local + cloud to avoid duplicates)
+        if not self._use_mem0_cloud:
+            local = _load_local_memories(self.user_id)
+            if isinstance(local, list):
+                combined.extend(local)
         return combined
 
     def load_initial_memory_summary(self) -> str:
@@ -713,12 +770,13 @@ class AngelCore:
                 print(f"{Fore.RED}Error saving memory to Mem0: {e}{Style.RESET_ALL}")
                 print(traceback.format_exc())
 
-            local_text = f"User: {messages[0]['content']} | Angel: {messages[1]['content']}"
-            _append_local_memory(self.user_id, local_text, metadata)
-            print(
-                f"{Fore.MAGENTA}MEMORY SAVED (local, AngelCore):{Style.RESET_ALL} "
-                f"{local_text}"
-            )
+            if not self._use_mem0_cloud:
+                local_text = f"User: {messages[0]['content']} | Angel: {messages[1]['content']}"
+                _append_local_memory(self.user_id, local_text, metadata)
+                print(
+                    f"{Fore.MAGENTA}MEMORY SAVED (local, AngelCore):{Style.RESET_ALL} "
+                    f"{local_text}"
+                )
         except Exception as e:
             print(f"{Fore.RED}Warning: could not store memory (AngelCore): {e}{Style.RESET_ALL}")
 
