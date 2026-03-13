@@ -1,0 +1,26 @@
+{
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "restartPolicyType": "ON_FAILURE"
+  },
+  "env": {
+    "ANTHROPIC_API_KEY": {
+      "required": true
+    },
+    "OPENAI_API_KEY": {
+      "required": true
+    },
+    "ELEVENLABS_API_KEY": {
+      "required": false
+    },
+    "TAVILY_API_KEY": {
+      "required": false
+    },
+    "ANGEL_USER_ID": {
+      "required": false
+    }
+  }
+}
+
