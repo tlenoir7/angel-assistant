@@ -1,9 +1,9 @@
 import os
 from io import BytesIO
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request
 
-from angel import AngelCore, transcribe_with_whisper
+from angel import AngelCore, get_elevenlabs_mp3, transcribe_with_whisper
 
 
 def create_app() -> Flask:
@@ -106,12 +106,21 @@ def create_app() -> Flask:
         #send-btn:active, #voice-btn:active {
           background-color: #3e3e3e;
         }
+        #voice-toggle.on { background-color: #2e7d32; }
+        #voice-toggle.off { background-color: #424242; }
       </style>
     </head>
     <body>
       <header>
-        <h1>Angel</h1>
-        <span>Personal AI Companion – Mobile</span>
+        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+          <div>
+            <h1>Angel</h1>
+            <span>Personal AI Companion – Mobile</span>
+          </div>
+          <button id="voice-toggle" type="button" style="padding: 6px 12px; border-radius: 6px; border: none; background: #2e2e2e; color: #fff; font-size: 0.85rem; cursor: pointer; white-space: nowrap;">
+            &#128266; Voice Mode
+          </button>
+        </div>
       </header>
       <main id="chat"></main>
       <footer>
@@ -128,6 +137,38 @@ def create_app() -> Flask:
         const textInput = document.getElementById("text-input");
         const sendBtn = document.getElementById("send-btn");
         const voiceBtn = document.getElementById("voice-btn");
+        const voiceToggle = document.getElementById("voice-toggle");
+
+        let voiceMode = true;
+
+        function updateVoiceToggleLabel() {
+          voiceToggle.textContent = voiceMode ? "\uD83D\uDD0A Voice Mode" : "\uD83D\uDD07 Text Mode";
+          voiceToggle.classList.toggle("on", voiceMode);
+          voiceToggle.classList.toggle("off", !voiceMode);
+        }
+
+        voiceToggle.addEventListener("click", () => {
+          voiceMode = !voiceMode;
+          updateVoiceToggleLabel();
+        });
+        updateVoiceToggleLabel();
+
+        async function playTts(text) {
+          if (!text || !voiceMode) return;
+          try {
+            const resp = await fetch("/api/tts", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ text: text }),
+            });
+            if (!resp.ok) return;
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            audio.onended = () => URL.revokeObjectURL(url);
+            await audio.play();
+          } catch (e) {}
+        }
 
         function appendMessage(sender, text) {
           const div = document.createElement("div");
@@ -154,6 +195,7 @@ def create_app() -> Flask:
             });
             const data = await resp.json();
             appendMessage("Angel", data.reply);
+            await playTts(data.reply);
           } catch (e) {
             appendMessage("Angel", "I ran into an error processing that.");
           } finally {
@@ -199,6 +241,7 @@ def create_app() -> Flask:
                   appendMessage("You", data.transcript);
                 }
                 appendMessage("Angel", data.reply);
+                await playTts(data.reply);
               } catch (e) {
                 appendMessage("Angel", "I couldn't process that voice message.");
               } finally {
@@ -272,6 +315,17 @@ def create_app() -> Flask:
             return jsonify({"transcript": "", "reply": reply})
         reply = angel.generate_reply(transcript)
         return jsonify({"transcript": transcript, "reply": reply})
+
+    @app.route("/api/tts", methods=["POST"])
+    def api_tts():
+        data = request.get_json(silent=True) or {}
+        text = (data.get("text") or "").strip()
+        if not text:
+            return jsonify({"error": "Missing or empty text"}), 400
+        mp3_bytes = get_elevenlabs_mp3(text)
+        if not mp3_bytes:
+            return jsonify({"error": "TTS unavailable (check ELEVENLABS_API_KEY)"}), 503
+        return Response(mp3_bytes, mimetype="audio/mpeg")
 
     return app
 

@@ -43,6 +43,9 @@ class AngelApp:
         # and 1500 (too strict for your setup).
         self.energy_threshold = 800.0
 
+        # Voice vs text output: when True, Angel speaks replies via ElevenLabs
+        self.voice_output_enabled = True
+
         # System tray icon (initialized in main)
         self.tray_icon: pystray.Icon | None = None
 
@@ -126,6 +129,14 @@ class AngelApp:
         )
         settings_btn.pack(side=tk.RIGHT, padx=12, pady=8)
 
+        self.voice_toggle_btn = ttk.Button(
+            header,
+            text="\uD83D\uDD0A Voice",
+            command=self._toggle_voice_output,
+            style="Angel.TButton",
+        )
+        self.voice_toggle_btn.pack(side=tk.RIGHT, padx=4, pady=8)
+
         minimize_btn = ttk.Button(
             header,
             text="Minimize to tray",
@@ -182,6 +193,13 @@ class AngelApp:
 
     def set_status(self, text: str):
         self.status_label.config(text=text)
+
+    def _toggle_voice_output(self):
+        self.voice_output_enabled = not self.voice_output_enabled
+        if self.voice_output_enabled:
+            self.voice_toggle_btn.config(text="\uD83D\uDD0A Voice")
+        else:
+            self.voice_toggle_btn.config(text="\uD83D\uDD07 Text")
 
     def on_mic_pressed(self):
         """
@@ -268,9 +286,10 @@ class AngelApp:
         self.root.after(0, self.append_message, "You", transcript)
         self.root.after(0, self.append_message, "Angel", reply)
 
-        # Play TTS (blocks this worker thread but not the UI)
-        self.root.after(0, self.set_status, "Status: Active – Angel is speaking...")
-        speak_with_elevenlabs(reply)
+        # Play TTS when Voice Mode is on (blocks this worker thread but not the UI)
+        if self.voice_output_enabled:
+            self.root.after(0, self.set_status, "Status: Active – Angel is speaking...")
+            speak_with_elevenlabs(reply)
 
         # Only set status to Listening if nothing else has started
         if gen_id == self.current_generation:

@@ -602,27 +602,22 @@ def transcribe_with_whisper(audio_wav_bytes: bytes) -> str:
         return ""
 
 
-def speak_with_elevenlabs(text: str):
+def get_elevenlabs_mp3(text: str) -> bytes | None:
     """
-    Stream Angel's reply from ElevenLabs Flash model and play it immediately.
-    No-op if pygame is not available (e.g. on cloud servers).
+    Generate MP3 bytes for the given text using ElevenLabs Flash.
+    Uses ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID from environment.
+    Returns None if key is missing, text is empty, or the API call fails.
+    Used by both desktop (pygame playback) and web (stream to browser).
     """
     if not text:
-        return
-
-    # Clean up Markdown so speech sounds natural
+        return None
     cleaned = strip_markdown(text)
     if not cleaned:
-        return
-
-    if pygame is None:
-        return
-
-    api_key = get_env_var("ELEVENLABS_API_KEY")
-    # You can override the default voice via ELEVENLABS_VOICE_ID in .env
+        return None
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    if not api_key:
+        return None
     voice_id = os.getenv("ELEVENLABS_VOICE_ID") or "EXAVITQu4vr4xnSDxMaL"
-
-    # Use the non-streaming endpoint so we can save a complete MP3 first
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     headers = {
         "xi-api-key": api_key,
@@ -631,29 +626,35 @@ def speak_with_elevenlabs(text: str):
     body = {
         "text": cleaned,
         "model_id": "eleven_flash_v2",
-        # High-compatibility MP3 format that pygame can play easily
         "output_format": "mp3_44100_128",
     }
-
-    print(f"{Fore.MAGENTA}Angel is speaking...{Style.RESET_ALL}")
-    tmp_path = None
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=120)
         resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        print(f"{Fore.RED}Error getting ElevenLabs audio: {e}{Style.RESET_ALL}")
+        return None
 
-        # Save full MP3 to a temporary file
+
+def speak_with_elevenlabs(text: str):
+    """
+    Stream Angel's reply from ElevenLabs Flash model and play it immediately.
+    No-op if pygame is not available (e.g. on cloud servers).
+    """
+    mp3_bytes = get_elevenlabs_mp3(text)
+    if not mp3_bytes or pygame is None:
+        return
+    print(f"{Fore.MAGENTA}Angel is speaking...{Style.RESET_ALL}")
+    tmp_path = None
+    try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            tmp.write(resp.content)
+            tmp.write(mp3_bytes)
             tmp_path = tmp.name
-
-        # Initialize pygame mixer lazily (once per process)
         if not pygame.mixer.get_init():
-            pygame.mixer.init()  # Let pygame choose appropriate settings
-
+            pygame.mixer.init()
         pygame.mixer.music.load(tmp_path)
         pygame.mixer.music.play()
-
-        # Block until playback finishes
         while pygame.mixer.music.get_busy():
             pygame.time.Clock().tick(50)
     except Exception as e:
