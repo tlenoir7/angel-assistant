@@ -162,6 +162,30 @@ class AngelApp:
         self.chat.pack(fill=tk.BOTH, expand=True)
         self.chat.config(state=tk.DISABLED)
 
+        # Text input row (above bottom bar)
+        text_row = tk.Frame(main_frame, bg="#121212", height=40)
+        text_row.pack(fill=tk.X, side=tk.BOTTOM, pady=(4, 0))
+
+        self.text_entry = tk.Entry(
+            text_row,
+            bg="#1E1E1E",
+            fg="#FFFFFF",
+            insertbackground="#FFFFFF",
+            relief=tk.FLAT,
+            font=("Segoe UI", 10),
+            exportselection=True,
+        )
+        self.text_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 4), pady=6)
+        self.text_entry.bind("<Return>", self._on_text_enter)
+
+        send_btn = ttk.Button(
+            text_row,
+            text="Send",
+            command=self._send_text_message,
+            style="Angel.TButton",
+        )
+        send_btn.pack(side=tk.LEFT, padx=(0, 8), pady=6)
+
         # Bottom bar
         bottom = tk.Frame(main_frame, bg="#121212", height=60)
         bottom.pack(fill=tk.X, side=tk.BOTTOM, pady=(4, 8))
@@ -200,6 +224,35 @@ class AngelApp:
             self.voice_toggle_btn.config(text="\uD83D\uDD0A Voice")
         else:
             self.voice_toggle_btn.config(text="\uD83D\uDD07 Text")
+
+    def _on_text_enter(self, event):
+        """Submit typed message on Enter."""
+        self._send_text_message()
+        return "break"
+
+    def _send_text_message(self):
+        """
+        Send the contents of the text entry to Angel, display both messages
+        in the chat, and speak Angel's reply if voice output is enabled.
+        """
+        msg = (self.text_entry.get() or "").strip()
+        if not msg:
+            return
+        self.text_entry.delete(0, tk.END)
+
+        self.append_message("You", msg)
+        self.set_status("Status: Thinking...")
+
+        def do_reply():
+            reply = self.core.generate_reply(msg)
+            self.root.after(0, self.append_message, "Angel", reply)
+            if self.voice_output_enabled:
+                self.root.after(0, self.set_status, "Status: Angel is speaking...")
+                speak_with_elevenlabs(reply)
+            status = "Status: Active (listening)" if self.active else "Status: Paused"
+            self.root.after(0, self.set_status, status)
+
+        threading.Thread(target=do_reply, daemon=True).start()
 
     def on_mic_pressed(self):
         """
