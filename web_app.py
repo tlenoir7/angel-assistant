@@ -517,6 +517,21 @@ def create_app() -> Flask:
             "generated_at": briefing_generated_at,
         })
 
+    @app.route("/api/trigger_briefing", methods=["POST"])
+    def api_trigger_briefing():
+        """Testing only: run the morning briefing job immediately (generate, store, send email)."""
+        global morning_briefing, briefing_generated_at
+        try:
+            _run_morning_briefing_job()
+            return jsonify({
+                "status": "ok",
+                "briefing": morning_briefing,
+                "generated_at": briefing_generated_at,
+            })
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
     @app.route("/api/check_in", methods=["GET"])
     def api_check_in():
         global check_in_message, check_in_generated_at
