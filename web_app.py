@@ -4,6 +4,8 @@ import traceback
 
 from flask import Flask, Response, jsonify, render_template_string, request
 
+# AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
+# (works for both /api/message and /api/voice; desktop and mobile)
 from angel import AngelCore, get_elevenlabs_mp3, transcribe_with_whisper
 
 

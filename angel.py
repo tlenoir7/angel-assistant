@@ -38,6 +38,14 @@ _WHISPER_MODEL = None
 TAVILY_API_URL = "https://api.tavily.com/search"
 MEM0_API_BASE_URL = "https://api.mem0.ai"
 
+# Stage 2 memory categories
+CATEGORY_PATTERNS = "patterns"
+CATEGORY_PERSON_PROFILE = "person_profile"
+# Sentinel for Angel to output a new pattern (parsed and stored)
+ANGEL_PATTERN_PREFIX = "[ANGEL_PATTERN]:"
+# Sentinel for Angel to output a new/updated person profile (parsed and stored)
+ANGEL_PROFILE_PREFIX = "[ANGEL_PROFILE]:"
+
 
 class Mem0CloudClient:
     """
@@ -205,6 +213,72 @@ def _append_local_memory(user_id: str, memory_text: str, metadata: dict):
         print(traceback.format_exc())
 
 
+def add_structured_memory(
+    memory_client,
+    user_id: str,
+    text: str,
+    category: str,
+    person_name: str | None = None,
+    use_mem0_cloud: bool = False,
+) -> None:
+    """
+    Store a pattern or person profile in memory (local JSON and optionally Mem0).
+    """
+    metadata = {
+        "category": category,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "source": "angel-stage2",
+    }
+    if person_name:
+        metadata["person_name"] = person_name.strip()
+    _append_local_memory(user_id, text, metadata)
+    if use_mem0_cloud and hasattr(memory_client, "add"):
+        messages = [
+            {"role": "user", "content": f"[Angel internal] Store: {text[:500]}"},
+            {"role": "assistant", "content": "Stored."},
+        ]
+        try:
+            memory_client.add(messages, user_id=user_id, metadata=metadata)
+        except Exception as e:
+            print(f"{Fore.RED}Warning: could not store structured memory in cloud: {e}{Style.RESET_ALL}")
+
+
+def extract_stage2_from_reply(reply: str) -> tuple[str, str | None, tuple[str, str] | None]:
+    """
+    Parse reply for [ANGEL_PATTERN]: and [ANGEL_PROFILE]: name|text.
+    Returns (cleaned_reply, pattern_text or None, (person_name, profile_text) or None).
+    """
+    cleaned = reply
+    pattern_text = None
+    profile_tuple = None
+
+    if ANGEL_PATTERN_PREFIX in cleaned:
+        idx = cleaned.find(ANGEL_PATTERN_PREFIX)
+        rest = cleaned[idx + len(ANGEL_PATTERN_PREFIX) :].strip()
+        end = rest.find("\n\n") if "\n\n" in rest else len(rest)
+        line = rest[:end].split("\n")[0].strip()
+        if line:
+            pattern_text = line
+        cleaned = (cleaned[:idx].rstrip() + "\n" + rest[end:].lstrip()).strip()
+        cleaned = cleaned.rstrip()
+
+    if ANGEL_PROFILE_PREFIX in cleaned:
+        idx = cleaned.find(ANGEL_PROFILE_PREFIX)
+        rest = cleaned[idx + len(ANGEL_PROFILE_PREFIX) :].strip()
+        end = rest.find("\n\n") if "\n\n" in rest else len(rest)
+        block = rest[:end].strip()
+        if "|" in block:
+            name_part, text_part = block.split("|", 1)
+            pname = name_part.strip()
+            ptext = text_part.strip()
+            if pname and ptext:
+                profile_tuple = (pname, ptext)
+        cleaned = (cleaned[:idx].rstrip() + "\n" + rest[end:].lstrip()).strip()
+        cleaned = cleaned.rstrip()
+
+    return cleaned, pattern_text, profile_tuple
+
+
 def _strip_transcript_prefixes_from_memory(text: str) -> str:
     """
     Remove 'User:' and 'Angel:' dialogue structure from memory content so the
@@ -223,91 +297,159 @@ def _strip_transcript_prefixes_from_memory(text: str) -> str:
     return text.strip()
 
 
-def summarize_memories_for_prompt(memories) -> str:
-    """
-    Convert raw Mem0 memories into a concise text block for Claude.
-
-    Handles both:
-    - dict memories (typical Mem0 objects)
-    - plain string memories (fallback / legacy format)
-    - full Mem0 responses like {"results": [...], "total": N}
-    """
-    # Unwrap Mem0 response objects into a plain list of memory items
+def _normalize_memories_list(memories):
+    """Unwrap and normalize memory items into a list of dicts with memory, metadata, created_at."""
     if isinstance(memories, dict):
         if "results" in memories and isinstance(memories["results"], list):
             memories = memories["results"]
         elif "data" in memories and isinstance(memories["data"], list):
             memories = memories["data"]
-
     if not memories:
-        return "Angel currently has no prior memories about this user."
-
+        return []
     normalized = []
     for item in memories:
         if isinstance(item, dict):
             normalized.append(item)
         elif isinstance(item, str):
-            normalized.append(
-                {
-                    "memory": item,
-                    "metadata": {},
-                    "created_at": "",
-                }
-            )
+            normalized.append({"memory": item, "metadata": {}, "created_at": ""})
         else:
-            # Unknown type – skip
             continue
+    return normalized
 
+
+def summarize_memories_for_prompt(memories) -> str:
+    """
+    Convert raw Mem0 memories into a concise text block for Claude.
+    Uses general memories only (no sectioning). For full Stage 2 context use build_memory_summary_with_sections.
+    """
+    normalized = _normalize_memories_list(memories)
     if not normalized:
+        return "Angel currently has no prior memories about this user."
+    # Exclude structured Stage 2 entries so we don't duplicate
+    general = [
+        m
+        for m in normalized
+        if (isinstance(m.get("metadata"), dict) and (m.get("metadata") or {}).get("category") not in (CATEGORY_PATTERNS, CATEGORY_PERSON_PROFILE))
+        or not isinstance(m.get("metadata"), dict)
+    ]
+    if not general:
         return "Angel has only minimal prior information about this user."
-
-    # Sort by created time if available, otherwise keep original order
     try:
-        memories_sorted = sorted(
-            normalized,
-            key=lambda m: m.get("created_at") or "",
-        )
+        general_sorted = sorted(general, key=lambda m: m.get("created_at") or "")
     except Exception:
-        memories_sorted = normalized
-
+        general_sorted = general
     lines = []
-    for m in memories_sorted:
-        raw = (
-            (m.get("memory") if isinstance(m, dict) else None)
-            or (m.get("data") if isinstance(m, dict) else None)
-            or ""
-        )
+    for m in general_sorted:
+        raw = (m.get("memory") or m.get("data") or "")
         if not raw:
             continue
-        # Strip User:/Angel: transcript format so the model doesn't continue fake dialogue
         text = _strip_transcript_prefixes_from_memory(raw)
         if not text:
             continue
-
-        meta = m.get("metadata") if isinstance(m, dict) else {}
-        tags = None
-        if isinstance(meta, dict):
-            tags = meta.get("tags") or meta.get("category")
-
-        if tags:
-            lines.append(f"- ({tags}) {text}")
-        else:
-            lines.append(f"- {text}")
-
+        meta = m.get("metadata") or {}
+        tags = meta.get("tags") or meta.get("category") if isinstance(meta, dict) else None
+        lines.append(f"- ({tags}) {text}" if tags else f"- {text}")
     if not lines:
         return "Angel has only minimal prior information about this user."
-
-    header = (
-        "Angel's long-term understanding of the user, "
-        "summarized from past interactions:\n"
-    )
-    return header + "\n".join(lines)
+    return "Angel's long-term understanding of the user, summarized from past interactions:\n" + "\n".join(lines)
 
 
-def build_system_prompt(memory_summary: str, voice_mode: bool = False) -> str:
+def _person_mentioned_in_message(person_name: str, user_message: str) -> bool:
+    """True if person_name appears in user_message (case-insensitive, word or substring)."""
+    if not (person_name and user_message):
+        return False
+    name = person_name.strip().lower()
+    msg = user_message.lower()
+    return name in msg or f"{name}'s" in msg or f"{name} " in msg or f" {name}" in msg
+
+
+def build_memory_summary_with_sections(memories, user_message: str | None = None) -> str:
+    """
+    Build full memory summary with Stage 2 sections: general context, behavioral patterns,
+    and people profiles. If user_message is provided, only include profiles for people
+    mentioned in the message.
+    """
+    normalized = _normalize_memories_list(memories)
+    if not normalized:
+        return "Angel currently has no prior memories about this user."
+
+    general = []
+    pattern_texts = []
+    profiles_by_person: dict[str, tuple[str, str]] = {}  # person_name -> (created_at, text)
+
+    for m in normalized:
+        raw = (m.get("memory") or m.get("data") or "")
+        if not raw:
+            continue
+        text = _strip_transcript_prefixes_from_memory(raw)
+        if not text:
+            continue
+        meta = m.get("metadata") if isinstance(m, dict) else {} or {}
+        if not isinstance(meta, dict):
+            general.append((m.get("created_at") or "", text))
+            continue
+        cat = meta.get("category")
+        if cat == CATEGORY_PATTERNS:
+            pattern_texts.append((m.get("created_at") or "", text))
+            continue
+        if cat == CATEGORY_PERSON_PROFILE:
+            pname = (meta.get("person_name") or "").strip()
+            if pname:
+                created = m.get("created_at") or ""
+                if pname not in profiles_by_person or created > profiles_by_person[pname][0]:
+                    profiles_by_person[pname] = (created, text)
+            continue
+        general.append((m.get("created_at") or "", text))
+
+    parts = []
+
+    if general:
+        try:
+            general_sorted = sorted(general, key=lambda x: x[0])
+        except Exception:
+            general_sorted = general
+        lines = [t for _, t in general_sorted]
+        parts.append(
+            "Angel's long-term understanding of the user, summarized from past interactions:\n"
+            + "\n".join(f"- {t}" for t in lines)
+        )
+
+    if pattern_texts:
+        try:
+            pattern_texts.sort(key=lambda x: x[0])
+        except Exception:
+            pass
+        parts.append(
+            "Behavioral patterns Angel has noticed about the user (use these when relevant or when asked):\n"
+            + "\n".join(f"- {t}" for _, t in pattern_texts)
+        )
+
+    if profiles_by_person:
+        if user_message:
+            included = [name for name in profiles_by_person if _person_mentioned_in_message(name, user_message)]
+        else:
+            included = list(profiles_by_person.keys())
+        if included:
+            for name in sorted(included):
+                _, profile_text = profiles_by_person[name]
+                parts.append(f"Profile for {name}:\n{profile_text}")
+
+    if not parts:
+        return "Angel has only minimal prior information about this user."
+    return "\n\n".join(parts)
+
+
+def build_system_prompt(
+    memory_summary: str,
+    voice_mode: bool = False,
+    strategy_hint: bool = False,
+    pattern_hint: bool = False,
+    profile_hint: bool = False,
+) -> str:
     """
     Persona + behavioral instructions + memory context.
     When voice_mode is True, optimize for conversational spoken responses.
+    Stage 2 hints add explicit instructions for strategy, patterns, or profile.
     """
     persona = f"""
 You are Angel, a personal AI assistant and devoted companion.
@@ -326,6 +468,25 @@ Behavior:
 - You must NEVER generate fake user messages, fake dialogue, or continue a conversation that is not happening. You only respond to the actual current message from the user. Do not output "User:" or simulate the user speaking; you are Angel and you reply only as Angel, once, to the real user input.
 """
 
+    stage2 = """
+
+Stage 2 capabilities (use when relevant; also follow explicit user requests):
+
+1) Strategy: When the user describes a situation, problem, decision, or goal—or asks "give me a strategy", "what should I do", "how do I approach this", "make a plan"—provide a specific executable strategy: exact steps, reasoning, and what to watch for. Tailor every strategy to what you know about the user (Tyler) from memory.
+
+2) Patterns: You maintain a growing awareness of behavioral patterns in how Tyler thinks, reacts, decides, and behaves. When asked "what patterns do you notice" or "what have you noticed about me", summarize the patterns from memory. When a stored pattern is directly relevant to the current conversation, proactively mention it briefly. If in this turn you notice a new, recurring theme worth recording, add a single line at the end of your reply (on its own line): [ANGEL_PATTERN]: one concise sentence describing the pattern. Do not add [ANGEL_PATTERN] unless you genuinely identified a pattern this turn.
+
+3) People: You keep structured profiles for people Tyler mentions (name, role, communication style, history, what works with them, what doesn't, Tyler's relationship with them). When Tyler asks to "build a profile on [name]" or "what do you know about [name]" or "brief me on [person]", use or build that profile. If you create or update a profile, add a single block at the end of your reply (after your normal response): [ANGEL_PROFILE]: name|structured profile text. Keep the profile concise but complete. Do not add [ANGEL_PROFILE] unless you are actually saving a new or updated profile this turn.
+"""
+    if strategy_hint:
+        stage2 += "\nThis turn: the user is asking for a strategy or has described a situation requiring a plan—provide an executable strategy tailored to Tyler.\n"
+    if pattern_hint:
+        stage2 += "\nThis turn: the user is explicitly asking what patterns you notice—summarize patterns from memory and any relevant observations.\n"
+    if profile_hint:
+        stage2 += "\nThis turn: the user is asking about or to build a person profile—use the profile from memory if present, or create/update one and output it with [ANGEL_PROFILE].\n"
+
+    persona += stage2
+
     if voice_mode:
         persona += """
 
@@ -339,7 +500,7 @@ Additional instructions for voice conversations:
 
     persona += f"""
 
-Long-term memory context (from Mem0):
+Long-term memory context (from Mem0 and Stage 2):
 {memory_summary}
 """
     return persona.strip()
@@ -481,6 +642,201 @@ def maybe_search_web(user_message: str) -> str | None:
         print(f"{Fore.RED}Error during Tavily web search: {e}{Style.RESET_ALL}")
         print(traceback.format_exc())
         return None
+
+
+# ---- Stage 2: trigger detection ----
+
+STRATEGY_TRIGGERS = [
+    "give me a strategy",
+    "what should i do",
+    "how do i approach this",
+    "make a plan",
+    "give me a plan",
+    "what's the plan",
+    "how should i approach",
+]
+
+PATTERN_TRIGGERS = [
+    "what patterns do you notice",
+    "what have you noticed about me",
+    "patterns you notice",
+    "notice about me",
+]
+
+RESEARCH_TRIGGERS = [
+    "research this",
+    "deep dive",
+    "brief me on",
+    "investigate",
+    "research ",
+    "deep dive on",
+    "brief me ",
+]
+
+PROFILE_TRIGGERS = [
+    "build a profile on",
+    "what do you know about",
+    "brief me on ",
+    "profile on ",
+    "profile for ",
+]
+
+
+def detect_strategy_request(user_message: str) -> bool:
+    """True if the user is asking for a strategy or describing a situation that warrants one."""
+    lower = (user_message or "").strip().lower()
+    if any(phrase in lower for phrase in STRATEGY_TRIGGERS):
+        return True
+    # Heuristic: question-like or goal/situation words
+    if any(w in lower for w in ("what should i", "how do i", "how can i", "should i ", "decision", "problem", "goal", "situation", "approach")):
+        if "?" in user_message or len(lower.split()) >= 4:
+            return True
+    return False
+
+
+def detect_pattern_request(user_message: str) -> bool:
+    """True if the user is explicitly asking what patterns Angel notices."""
+    lower = (user_message or "").strip().lower()
+    return any(phrase in lower for phrase in PATTERN_TRIGGERS)
+
+
+def detect_research_request(user_message: str) -> bool:
+    """True if the user wants deep research / briefing."""
+    lower = (user_message or "").strip().lower()
+    return any(phrase in lower for phrase in RESEARCH_TRIGGERS)
+
+
+def detect_profile_request(user_message: str) -> tuple[bool, str | None]:
+    """
+    True if the user wants to build or see a profile. Returns (is_profile_request, person_name).
+    person_name may be empty if not clearly specified.
+    """
+    lower = (user_message or "").strip().lower()
+    for phrase in PROFILE_TRIGGERS:
+        if phrase in lower:
+            # Try to extract name: e.g. "brief me on John" -> John
+            after = lower.split(phrase, 1)[-1].strip()
+            if after:
+                name = after.split()[0] if after.split() else ""
+                for sep in (",", ".", "?", "!", "\n"):
+                    name = name.split(sep)[0].strip()
+                if name and len(name) < 50:
+                    return True, name
+            return True, None
+    return False, None
+
+
+def _tavily_search_one(query: str, api_key: str, max_results: int = 5, search_depth: str = "advanced") -> list[dict]:
+    """Run a single Tavily search. Returns list of result dicts."""
+    try:
+        payload = {
+            "query": query,
+            "search_depth": search_depth,
+            "max_results": max_results,
+            "topic": "general",
+            "include_answer": True,
+        }
+        resp = requests.post(
+            TAVILY_API_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=25,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("results") or []
+    except Exception as e:
+        print(f"{Fore.RED}Tavily search error: {e}{Style.RESET_ALL}")
+        return []
+
+
+def do_deep_research(
+    topic: str,
+    user_context: str,
+    anthropic_client: anthropic.Anthropic,
+    max_queries: int = 4,
+) -> str:
+    """
+    Multi-angle Tavily search + synthesis into a structured briefing:
+    key facts, context, implications, what it means for the user (Tyler) specifically.
+    """
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return "Deep research is unavailable (TAVILY_API_KEY not set)."
+
+    # Generate multiple search queries for different angles
+    try:
+        qresp = anthropic_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=400,
+            temperature=0.3,
+            system="You output only a JSON array of 3-5 short search query strings, no other text. Each query should cover a different angle: facts, recent news, implications, controversy, or practical impact.",
+            messages=[{"role": "user", "content": f"Topic to research: {topic}\n\nOutput a JSON array of search query strings only, e.g. [\"query1\", \"query2\"]"}],
+        )
+        qtext = ""
+        for block in qresp.content:
+            if getattr(block, "type", None) == "text":
+                qtext += block.text
+            elif isinstance(block, dict) and block.get("type") == "text":
+                qtext += block.get("text", "")
+        queries = json.loads(qtext) if qtext.strip().startswith("[") else [topic, f"{topic} latest", f"{topic} implications"]
+        if not isinstance(queries, list):
+            queries = [topic]
+        queries = [str(q).strip() for q in queries[:max_queries] if q]
+        if not queries:
+            queries = [topic]
+    except Exception as e:
+        print(f"{Fore.YELLOW}Could not generate research queries: {e}, using topic only.{Style.RESET_ALL}")
+        queries = [topic]
+
+    all_results = []
+    seen_urls = set()
+    for q in queries:
+        results = _tavily_search_one(q, api_key, max_results=5, search_depth="advanced")
+        for r in results:
+            url = r.get("url") or ""
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                all_results.append(r)
+
+    if not all_results:
+        return f"No substantive results found for: {topic}. Try rephrasing or a different topic."
+
+    # Build raw context for synthesis
+    raw_lines = []
+    for i, r in enumerate(all_results[:15], start=1):
+        title = r.get("title") or ""
+        snippet = r.get("content") or r.get("snippet") or ""
+        raw_lines.append(f"[{i}] {title}\n{snippet}")
+
+    raw_context = "\n\n".join(raw_lines)
+
+    try:
+        syn_resp = anthropic_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=2048,
+            temperature=0.3,
+            system="""You are Angel's research synthesizer. Produce a structured briefing in plain text with these sections:
+- Key facts (bullet or short paragraphs)
+- Context and background
+- Implications
+- What this means for Tyler specifically (given the user context below; if none, say what a thoughtful person should consider)
+
+Be concise, accurate, and cite sources by number [1], [2] where relevant. No markdown headers; use clear section labels.""",
+            messages=[
+                {"role": "user", "content": f"User context about Tyler (for personal relevance):\n{user_context[:1500]}\n\nWeb search results to synthesize:\n{raw_context}\n\nProduce the structured briefing now."},
+            ],
+        )
+        syn_text = ""
+        for block in syn_resp.content:
+            if getattr(block, "type", None) == "text":
+                syn_text += block.text
+            elif isinstance(block, dict) and block.get("type") == "text":
+                syn_text += block.get("text", "")
+        return syn_text.strip() or "Synthesis produced no output."
+    except Exception as e:
+        print(f"{Fore.RED}Deep research synthesis error: {e}{Style.RESET_ALL}")
+        return "Research synthesis failed. Here are raw excerpts:\n\n" + raw_context[:3000]
 
 
 def strip_markdown(text: str) -> str:
@@ -736,35 +1092,82 @@ class AngelCore:
 
     def generate_reply(self, user_message: str) -> str:
         merged_memories = self._fetch_combined_memories()
-        memory_summary = summarize_memories_for_prompt(merged_memories)
-        system_prompt = build_system_prompt(memory_summary, voice_mode=self.use_voice)
+        memory_summary = build_memory_summary_with_sections(merged_memories, user_message)
+
+        strategy_hint = detect_strategy_request(user_message)
+        pattern_hint = detect_pattern_request(user_message)
+        profile_requested, profile_person = detect_profile_request(user_message)
+        profile_hint = profile_requested
+        research_requested = detect_research_request(user_message)
+
+        system_prompt = build_system_prompt(
+            memory_summary,
+            voice_mode=self.use_voice,
+            strategy_hint=strategy_hint,
+            pattern_hint=pattern_hint,
+            profile_hint=profile_hint,
+        )
 
         print(f"{Fore.BLUE}Angel is thinking...{Style.RESET_ALL}")
 
-        # Optionally augment the user message with fresh web context.
-        web_context = maybe_search_web(user_message)
-        if web_context:
-            print(f"{Fore.BLUE}Angel: let me look that up for you...{Style.RESET_ALL}")
-            # Prepend web findings to the user's message so Claude can
-            # naturally integrate them into the reply.
+        augmented_user_message = user_message
+
+        # Stage 2 Deep Research: multi-angle Tavily + synthesis when triggered
+        if research_requested:
+            topic = user_message.strip()
+            for phrase in RESEARCH_TRIGGERS:
+                if phrase in topic.lower():
+                    topic = topic.lower().split(phrase, 1)[-1].strip()
+                    break
+            if not topic or len(topic) < 2:
+                topic = "current events and recent developments"
+            print(f"{Fore.BLUE}Angel: researching that for you...{Style.RESET_ALL}")
+            briefing = do_deep_research(
+                topic, memory_summary, self.anthropic_client
+            )
             augmented_user_message = (
-                f"{web_context}\n\nOriginal user question:\n{user_message}"
+                f"Research briefing (use this to answer):\n{briefing}\n\n"
+                f"Original user request:\n{user_message}"
             )
         else:
-            augmented_user_message = user_message
+            # Normal optional web context for factual queries
+            web_context = maybe_search_web(user_message)
+            if web_context:
+                print(f"{Fore.BLUE}Angel: let me look that up for you...{Style.RESET_ALL}")
+                augmented_user_message = (
+                    f"{web_context}\n\nOriginal user question:\n{user_message}"
+                )
 
-        # Use Haiku for voice (speed) and Sonnet for text. Both can return
-        # full, detailed answers; we don't impose extra length limits here.
         model = "claude-haiku-4-5" if self.use_voice else "claude-sonnet-4-5"
         reply = call_claude(
             self.anthropic_client, system_prompt, augmented_user_message, model=model
         )
 
-        # For voice mode, strip Markdown before saving to memory so
-        # memories stay clean and speech-oriented.
+        # Parse and store Stage 2 outputs; strip from reply
+        cleaned_reply, pattern_text, profile_tuple = extract_stage2_from_reply(reply)
+        if pattern_text:
+            add_structured_memory(
+                self.memory_client,
+                self.user_id,
+                pattern_text,
+                CATEGORY_PATTERNS,
+                person_name=None,
+                use_mem0_cloud=self._use_mem0_cloud,
+            )
+        if profile_tuple:
+            pname, ptext = profile_tuple
+            add_structured_memory(
+                self.memory_client,
+                self.user_id,
+                ptext,
+                CATEGORY_PERSON_PROFILE,
+                person_name=pname,
+                use_mem0_cloud=self._use_mem0_cloud,
+            )
+
+        reply = cleaned_reply
         memory_reply = strip_markdown(reply) if self.use_voice else reply
 
-        # Store this turn as memory candidate (same pattern as CLI)
         try:
             messages = [
                 {"role": "user", "content": user_message},
@@ -782,7 +1185,7 @@ class AngelCore:
                 print(traceback.format_exc())
 
             if not self._use_mem0_cloud:
-                local_text = memory_reply  # Save only Angel's response, not User/Angel transcript
+                local_text = memory_reply
                 _append_local_memory(self.user_id, local_text, metadata)
         except Exception as e:
             print(f"{Fore.RED}Warning: could not store memory (AngelCore): {e}{Style.RESET_ALL}")
@@ -913,12 +1316,66 @@ def main():
         if isinstance(current_local, list):
             merged_memories.extend(current_local)
 
-        memory_summary = summarize_memories_for_prompt(merged_memories)
-        system_prompt = build_system_prompt(memory_summary)
+        memory_summary = build_memory_summary_with_sections(merged_memories, user_message)
+        strategy_hint = detect_strategy_request(user_message)
+        pattern_hint = detect_pattern_request(user_message)
+        profile_hint = detect_profile_request(user_message)[0]
+        research_requested = detect_research_request(user_message)
+
+        system_prompt = build_system_prompt(
+            memory_summary,
+            voice_mode=use_voice,
+            strategy_hint=strategy_hint,
+            pattern_hint=pattern_hint,
+            profile_hint=profile_hint,
+        )
+
+        augmented_message = user_message
+        if research_requested:
+            topic = user_message.strip()
+            for phrase in RESEARCH_TRIGGERS:
+                if phrase in topic.lower():
+                    topic = topic.lower().split(phrase, 1)[-1].strip()
+                    break
+            if not topic or len(topic) < 2:
+                topic = "current events and recent developments"
+            print(f"{Fore.BLUE}Angel: researching that for you...{Style.RESET_ALL}")
+            briefing = do_deep_research(topic, memory_summary, anthropic_client)
+            augmented_message = (
+                f"Research briefing (use this to answer):\n{briefing}\n\n"
+                f"Original user request:\n{user_message}"
+            )
+        else:
+            web_ctx = maybe_search_web(user_message)
+            if web_ctx:
+                print(f"{Fore.BLUE}Angel: let me look that up for you...{Style.RESET_ALL}")
+                augmented_message = f"{web_ctx}\n\nOriginal user question:\n{user_message}"
 
         # Call Claude
         print(f"{Fore.BLUE}Angel is thinking...{Style.RESET_ALL}")
-        reply = call_claude(anthropic_client, system_prompt, user_message)
+        reply = call_claude(anthropic_client, system_prompt, augmented_message)
+
+        cleaned_reply, pattern_text, profile_tuple = extract_stage2_from_reply(reply)
+        if pattern_text:
+            add_structured_memory(
+                memory_client,
+                user_id,
+                pattern_text,
+                CATEGORY_PATTERNS,
+                person_name=None,
+                use_mem0_cloud=bool(os.getenv("MEM0_API_KEY")),
+            )
+        if profile_tuple:
+            pname, ptext = profile_tuple
+            add_structured_memory(
+                memory_client,
+                user_id,
+                ptext,
+                CATEGORY_PERSON_PROFILE,
+                person_name=pname,
+                use_mem0_cloud=bool(os.getenv("MEM0_API_KEY")),
+            )
+        reply = cleaned_reply
 
         print(f"{Fore.CYAN}Angel:{Style.RESET_ALL} {reply}")
         print()
@@ -929,25 +1386,23 @@ def main():
 
         # Store this turn as memory candidate
         try:
+            memory_reply = strip_markdown(reply) if use_voice else reply
             messages = [
                 {"role": "user", "content": user_message},
-                {"role": "assistant", "content": reply},
+                {"role": "assistant", "content": memory_reply},
             ]
-            # Metadata can be used later for filtering or categories
             metadata = {
                 "source": "angel-cli",
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             }
 
-            # Try saving to Mem0; if it fails, print full error/traceback
             try:
                 memory_client.add(messages, user_id=user_id, metadata=metadata)
             except Exception as e:
                 print(f"{Fore.RED}Error saving memory to Mem0: {e}{Style.RESET_ALL}")
                 print(traceback.format_exc())
 
-            # Always save to local JSON as a persistent fallback (Angel's response only)
-            local_text = reply if not use_voice else strip_markdown(reply)
+            local_text = memory_reply
             _append_local_memory(user_id, local_text, metadata)
         except Exception as e:
             print(f"{Fore.RED}Warning: could not store memory: {e}{Style.RESET_ALL}")
