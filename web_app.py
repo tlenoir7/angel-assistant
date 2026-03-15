@@ -260,6 +260,7 @@ def create_app() -> Flask:
       </footer>
       <audio id="tts-audio" style="display:none;" preload="auto"></audio>
       <script>
+        document.addEventListener("DOMContentLoaded", function() {
         const chat = document.getElementById("chat");
         const statusEl = document.getElementById("status");
         const textInput = document.getElementById("text-input");
@@ -270,7 +271,14 @@ def create_app() -> Flask:
         const briefingContainer = document.getElementById("briefing-container");
         const checkInContainer = document.getElementById("check-in-container");
 
-        let voiceMode = true;
+        console.log("[Angel] DOM elements:", { sendBtn: sendBtn != null, voiceToggle: voiceToggle != null, voiceBtn: voiceBtn != null, textInput: textInput != null });
+
+        var inputRow = document.getElementById("input-row");
+        if (inputRow) inputRow.style.display = "flex";
+        if (textInput) textInput.style.visibility = "visible";
+        if (sendBtn) sendBtn.style.visibility = "visible";
+
+        let voiceMode = false;
 
         function isToday(ts) {
           if (ts == null || ts === undefined) return false;
@@ -293,17 +301,21 @@ def create_app() -> Flask:
             console.log("[loadBriefingAndCheckIn] /api/check_in response:", { ok: checkRes.ok, message: checkInData.message ? "(present)" : null, generated_at: checkInData.generated_at });
             const showBriefing = briefingData.briefing && (isToday(briefingData.generated_at) || isWithinLast24Hours(briefingData.generated_at));
             console.log("[loadBriefingAndCheckIn] isToday=" + isToday(briefingData.generated_at) + ", within24h=" + isWithinLast24Hours(briefingData.generated_at) + ", showBriefing=" + showBriefing + ", generated_at=" + briefingData.generated_at);
-            if (showBriefing) {
-              const escaped = briefingData.briefing.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>");
-              briefingContainer.innerHTML = '<div class="briefing-block"><h3>☀️ Morning briefing</h3><p>' + escaped + '</p></div>';
-            } else {
-              briefingContainer.innerHTML = '';
+            if (briefingContainer) {
+              if (showBriefing) {
+                const escaped = briefingData.briefing.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\\n/g, "<br>");
+                briefingContainer.innerHTML = '<div class="briefing-block"><h3>☀️ Morning briefing</h3><p>' + escaped + '</p></div>';
+              } else {
+                briefingContainer.innerHTML = '';
+              }
             }
-            if (checkInData.message && checkInData.generated_at) {
-              const escapedCheckIn = checkInData.message.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-              checkInContainer.innerHTML = '<div class="check-in-block">' + escapedCheckIn + '</div>';
-            } else {
-              checkInContainer.innerHTML = '';
+            if (checkInContainer) {
+              if (checkInData.message && checkInData.generated_at) {
+                const escapedCheckIn = checkInData.message.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                checkInContainer.innerHTML = '<div class="check-in-block">' + escapedCheckIn + '</div>';
+              } else {
+                checkInContainer.innerHTML = '';
+              }
             }
           } catch (e) {
             console.error("Load briefing/check-in:", e);
@@ -312,6 +324,7 @@ def create_app() -> Flask:
         loadBriefingAndCheckIn();
 
         function updateVoiceToggleLabel() {
+          if (!voiceToggle) return;
           voiceToggle.textContent = voiceMode ? "\uD83D\uDD0A Voice Mode" : "\uD83D\uDD07 Text Mode";
           voiceToggle.classList.toggle("on", voiceMode);
           voiceToggle.classList.toggle("off", !voiceMode);
@@ -328,7 +341,7 @@ def create_app() -> Flask:
         }
 
         async function playTts(text) {
-          if (!text || !voiceMode) return;
+          if (!text || !voiceMode || !ttsAudio) return;
           try {
             const resp = await fetch("/api/tts", {
               method: "POST",
@@ -346,12 +359,12 @@ def create_app() -> Flask:
             }
             const blob = await resp.blob();
             const url = URL.createObjectURL(blob);
-            ttsAudio.src = url;
-            ttsAudio.onended = () => {
-              URL.revokeObjectURL(url);
-            };
+            if (ttsAudio) {
+              ttsAudio.src = url;
+              ttsAudio.onended = () => { URL.revokeObjectURL(url); };
+            }
             try {
-              await ttsAudio.play();
+              if (ttsAudio) await ttsAudio.play();
               console.log("TTS audio playback started successfully.");
             } catch (playErr) {
               console.error("TTS audio playback failed:", playErr);
@@ -371,6 +384,7 @@ def create_app() -> Flask:
         }
 
         function appendMessage(sender, text) {
+          if (!chat) return;
           const div = document.createElement("div");
           div.className = "msg " + (sender === "You" ? "from-user" : "from-angel");
           const bubble = document.createElement("div");
@@ -382,11 +396,12 @@ def create_app() -> Flask:
         }
 
         async function sendText() {
+          if (!textInput) return;
           const msg = textInput.value.trim();
           if (!msg) return;
           textInput.value = "";
           appendMessage("You", msg);
-          statusEl.textContent = "Angel is thinking...";
+          if (statusEl) statusEl.textContent = "Angel is thinking...";
           try {
             const resp = await fetch("/api/message", {
               method: "POST",
@@ -408,7 +423,7 @@ def create_app() -> Flask:
             console.error("sendText error:", e);
             appendMessage("Angel", "I ran into an error processing that.");
           } finally {
-            statusEl.textContent = "Idle";
+            if (statusEl) statusEl.textContent = "Idle";
           }
         }
 
@@ -419,12 +434,14 @@ def create_app() -> Flask:
             sendText();
           });
         }
-        textInput.addEventListener("keydown", function(e) {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            sendText();
-          }
-        });
+        if (textInput) {
+          textInput.addEventListener("keydown", function(e) {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              sendText();
+            }
+          });
+        }
 
         // Voice input using MediaRecorder
         let mediaRecorder = null;
@@ -443,7 +460,7 @@ def create_app() -> Flask:
             mediaRecorder.onstop = async () => {
               const blob = new Blob(chunks, { type: "audio/webm" });
               chunks = [];
-              statusEl.textContent = "Transcribing and thinking...";
+              if (statusEl) statusEl.textContent = "Transcribing and thinking...";
               appendMessage("You", "(voice message)");
               const formData = new FormData();
               formData.append("audio", blob, "audio.webm");
@@ -461,7 +478,7 @@ def create_app() -> Flask:
               } catch (e) {
                 appendMessage("Angel", "I couldn't process that voice message.");
               } finally {
-                statusEl.textContent = "Idle";
+                if (statusEl) statusEl.textContent = "Idle";
               }
             };
           } catch (e) {
@@ -469,34 +486,35 @@ def create_app() -> Flask:
           }
         }
 
-        voiceBtn.addEventListener("mousedown", async () => {
-          await initMedia();
-          if (!mediaRecorder) return;
-          chunks = [];
-          mediaRecorder.start();
-          statusEl.textContent = "Listening (hold button)...";
-        });
+        if (voiceBtn) {
+          voiceBtn.addEventListener("mousedown", async () => {
+            await initMedia();
+            if (!mediaRecorder) return;
+            chunks = [];
+            mediaRecorder.start();
+            if (statusEl) statusEl.textContent = "Listening (hold button)...";
+          });
+          voiceBtn.addEventListener("mouseup", () => {
+            if (mediaRecorder && mediaRecorder.state === "recording") {
+              mediaRecorder.stop();
+            }
+          });
+          voiceBtn.addEventListener("touchstart", async (e) => {
+            e.preventDefault();
+            await initMedia();
+            if (!mediaRecorder) return;
+            chunks = [];
+            mediaRecorder.start();
+            if (statusEl) statusEl.textContent = "Listening (hold button)...";
+          });
+          voiceBtn.addEventListener("touchend", (e) => {
+            e.preventDefault();
+            if (mediaRecorder && mediaRecorder.state === "recording") {
+              mediaRecorder.stop();
+            }
+          });
+        }
 
-        voiceBtn.addEventListener("mouseup", () => {
-          if (mediaRecorder && mediaRecorder.state === "recording") {
-            mediaRecorder.stop();
-          }
-        });
-
-        voiceBtn.addEventListener("touchstart", async (e) => {
-          e.preventDefault();
-          await initMedia();
-          if (!mediaRecorder) return;
-          chunks = [];
-          mediaRecorder.start();
-          statusEl.textContent = "Listening (hold button)...";
-        });
-
-        voiceBtn.addEventListener("touchend", (e) => {
-          e.preventDefault();
-          if (mediaRecorder && mediaRecorder.state === "recording") {
-            mediaRecorder.stop();
-          }
         });
       </script>
     </body>
