@@ -512,6 +512,233 @@ def create_anthropic_client() -> anthropic.Anthropic:
     return client
 
 
+# ---- GPT-4o native audio (voice mode) ----
+
+try:
+    from openai import OpenAI as OpenAIClient
+except ImportError:
+    OpenAIClient = None
+
+
+def create_openai_client():
+    """OpenAI client for GPT-4o audio and TTS. Requires OPENAI_API_KEY."""
+    if OpenAIClient is None:
+        raise RuntimeError("openai package is required for voice mode")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is required for GPT-4o voice mode")
+    return OpenAIClient(api_key=api_key)
+
+
+def call_gpt4o_audio(
+    system_prompt: str,
+    audio_wav_bytes: bytes,
+    voice: str = "alloy",
+    audio_format: str = "wav",
+) -> tuple[str, bytes | None, str]:
+    """
+    Send user audio to GPT-4o with Angel system prompt; get reply as text and audio.
+    Returns (reply_text, response_audio_bytes, user_transcript).
+    - reply_text = what Angel says (from message.content or message.audio.transcript).
+    - user_transcript = what the user said (from message.audio.input_transcript only).
+    These are never the same field.
+    """
+    import base64
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return "(OPENAI_API_KEY is required for voice.)", None, ""
+    base64_encoded_audio = base64.b64encode(audio_wav_bytes).decode("utf-8")
+
+    # GPT-4o audio input requires model 'gpt-4o-audio-preview' with modalities and audio params
+    payload = {
+        "model": "gpt-4o-audio-preview",
+        "modalities": ["text", "audio"],
+        "audio": {"voice": voice, "format": audio_format},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": base64_encoded_audio,
+                            "format": "wav",
+                        },
+                    }
+                ],
+            },
+        ],
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=120,
+        )
+        if not resp.ok:
+            body = resp.text
+            if resp.status_code == 400:
+                print(f"{Fore.RED}OpenAI 400 Bad Request - full response body:{Style.RESET_ALL}\n{body}")
+            else:
+                print(f"{Fore.RED}OpenAI voice API error {resp.status_code}:{Style.RESET_ALL}\n{body}")
+            return f"(Angel voice error {resp.status_code}: {body[:500]})", None, ""
+        data = resp.json()
+    except requests.RequestException as e:
+        err_resp = getattr(e, "response", None)
+        if err_resp is not None:
+            print(f"{Fore.RED}OpenAI voice request failed - response body:{Style.RESET_ALL}\n{err_resp.text}")
+        return f"(Angel encountered an error with voice: {e})", None, ""
+    except Exception as e:
+        return f"(Angel encountered an error with voice: {e})", None, ""
+
+    try:
+        choices = data.get("choices") or []
+        if not choices:
+            return "(No response from voice model.)", None, ""
+        msg = choices[0].get("message") or {}
+
+        # Print full response structure once so we can verify parsing
+        if not getattr(call_gpt4o_audio, "_logged_response_structure", False):
+            print(f"{Fore.CYAN}GPT-4o audio preview response structure (first time):{Style.RESET_ALL}")
+            try:
+                import json
+                # Redact base64 data for readability
+                def _redact(obj, depth=0):
+                    if depth > 10:
+                        return "<max depth>"
+                    if isinstance(obj, dict):
+                        return {k: _redact(v, depth + 1) if k != "data" else f"<base64 {len(v) if isinstance(v, str) else 0} chars>" for k, v in obj.items()}
+                    if isinstance(obj, list):
+                        return [_redact(x, depth + 1) for x in obj[:5]]
+                    return obj
+                print(json.dumps(_redact(data), indent=2, default=str)[:2000])
+            except Exception:
+                print(data)
+            call_gpt4o_audio._logged_response_structure = True
+
+        audio_obj = msg.get("audio") or {}
+
+        # reply_text = what Angel says — from message.content or output_text parts only (never audio.transcript)
+        reply_text = ""
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            reply_text = content.strip()
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    reply_text += part.get("text", "") or ""
+            reply_text = reply_text.strip()
+        # Fallback: transcript of Angel's audio output (assistant reply)
+        if not reply_text and isinstance(audio_obj, dict) and audio_obj.get("transcript"):
+            reply_text = (audio_obj.get("transcript") or "").strip()
+
+        # user_transcript = what the user said — from input_transcript only (never audio.transcript; that is Angel's reply)
+        user_transcript = ""
+        if isinstance(audio_obj, dict) and audio_obj.get("input_transcript"):
+            user_transcript = (audio_obj.get("input_transcript") or "").strip()
+
+        # Print both on first response to verify parsing
+        if not getattr(call_gpt4o_audio, "_logged_parsed_values", False):
+            print(f"{Fore.CYAN}[GPT-4o audio] reply_text (Angel): {repr(reply_text[:200])}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}[GPT-4o audio] user_transcript (You): {repr(user_transcript[:200])}{Style.RESET_ALL}")
+            call_gpt4o_audio._logged_parsed_values = True
+
+        # Parse audio from message.audio.data (base64)
+        audio_bytes = None
+        if isinstance(audio_obj, dict) and audio_obj.get("data"):
+            audio_bytes = base64.b64decode(audio_obj["data"])
+
+        return reply_text or "(no text)", audio_bytes, user_transcript
+    except Exception as e:
+        return f"(Error parsing voice response: {e})", None, ""
+
+
+def tts_gpt4o(text: str, voice: str = "alloy") -> bytes | None:
+    """
+    Convert text to speech using OpenAI TTS (e.g. for Claude's reply in complex-request path).
+    Returns MP3 bytes so pygame can play it reliably (same as ElevenLabs path).
+    """
+    if OpenAIClient is None or not (text or "").strip():
+        return None
+    cleaned = strip_markdown(text)
+    if not cleaned:
+        return None
+    client = create_openai_client()
+    try:
+        resp = client.audio.speech.create(
+            model="tts-1",
+            voice=voice,
+            input=cleaned[:4096],
+            response_format="mp3",
+        )
+        return resp.content
+    except Exception as e:
+        print(f"{Fore.RED}GPT-4o TTS error: {e}{Style.RESET_ALL}")
+    return None
+
+
+def play_mp3_bytes(mp3_bytes: bytes):
+    """
+    Play MP3 bytes (e.g. from tts_gpt4o or ElevenLabs). Same pattern as speak_with_elevenlabs:
+    write to temp file, play with pygame.mixer.music. No-op if pygame unavailable.
+    """
+    if not mp3_bytes or pygame is None:
+        return
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tmp.write(mp3_bytes)
+            tmp_path = tmp.name
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+        pygame.mixer.music.load(tmp_path)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(50)
+    except Exception as e:
+        print(f"{Fore.RED}Error playing MP3: {e}{Style.RESET_ALL}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def detect_complex_voice_request(transcript: str) -> bool:
+    """
+    True if the user's voice request should be handled by Claude (deep thinking) then TTS.
+    Triggers: research, deep dive, strategy, investigate, profile, what patterns.
+    """
+    if not (transcript or "").strip():
+        return False
+    lower = transcript.strip().lower()
+    triggers = [
+        "research",
+        "deep dive",
+        "strategy",
+        "investigate",
+        "profile",
+        "what patterns",
+        "brief me on",
+        "give me a strategy",
+        "what should i do",
+        "how do i approach this",
+        "make a plan",
+        "what patterns do you notice",
+        "what have you noticed about me",
+        "build a profile on",
+        "what do you know about",
+    ]
+    return any(t in lower for t in triggers)
+
+
 def call_claude(
     client: anthropic.Anthropic,
     system_prompt: str,
@@ -1041,6 +1268,33 @@ def speak_with_elevenlabs(text: str):
                 pass
 
 
+def play_wav_bytes(wav_bytes: bytes):
+    """
+    Play WAV bytes (e.g. from GPT-4o voice response or TTS). No-op if pygame unavailable.
+    """
+    if not wav_bytes or pygame is None:
+        return
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(wav_bytes)
+            tmp_path = tmp.name
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+        pygame.mixer.music.load(tmp_path)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(50)
+    except Exception as e:
+        print(f"{Fore.RED}Error playing WAV: {e}{Style.RESET_ALL}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 class AngelCore:
     """
     Core logic for Angel: memory, Claude, and (optionally) voice mode.
@@ -1191,6 +1445,30 @@ class AngelCore:
             print(f"{Fore.RED}Warning: could not store memory (AngelCore): {e}{Style.RESET_ALL}")
 
         return reply
+
+    def add_conversation_turn(self, user_message: str, assistant_message: str) -> None:
+        """
+        Store a voice turn in memory (e.g. after GPT-4o native reply).
+        Use this when the reply was not generated by generate_reply.
+        """
+        memory_reply = strip_markdown(assistant_message)
+        try:
+            messages = [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": memory_reply},
+            ]
+            metadata = {
+                "source": "angel-voice",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+            try:
+                self.memory_client.add(messages, user_id=self.user_id, metadata=metadata)
+            except Exception as e:
+                print(f"{Fore.RED}Error saving memory to Mem0: {e}{Style.RESET_ALL}")
+            if not self._use_mem0_cloud:
+                _append_local_memory(self.user_id, memory_reply, metadata)
+        except Exception as e:
+            print(f"{Fore.RED}Warning: could not store voice turn: {e}{Style.RESET_ALL}")
 
 
 def main():

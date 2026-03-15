@@ -16,7 +16,18 @@ import wave
 import pystray
 from PIL import Image, ImageDraw
 
-from angel import AngelCore, transcribe_with_whisper, speak_with_elevenlabs
+from angel import (
+    AngelCore,
+    transcribe_with_whisper,
+    speak_with_elevenlabs,
+    build_system_prompt,
+    build_memory_summary_with_sections,
+    call_gpt4o_audio,
+    tts_gpt4o,
+    play_wav_bytes,
+    play_mp3_bytes,
+    detect_complex_voice_request,
+)
 
 
 class AngelApp:
@@ -43,8 +54,10 @@ class AngelApp:
         # and 1500 (too strict for your setup).
         self.energy_threshold = 800.0
 
-        # Voice vs text output: when True, Angel speaks replies via ElevenLabs
+        # Voice vs text output: when True, Angel speaks replies
         self.voice_output_enabled = True
+        # When True, use ElevenLabs for voice (quality); when False, use GPT-4o native (speed)
+        self.use_elevenlabs_voice = False
 
         # System tray icon (initialized in main)
         self.tray_icon: pystray.Icon | None = None
@@ -314,37 +327,61 @@ class AngelApp:
 
     def _process_utterance(self, gen_id: int, wav_bytes: bytes):
         """
-        Turn a captured utterance into a transcript, get Angel's reply,
-        and speak it. Only the latest generation id will actually speak.
+        Turn a captured utterance into a reply and speak it.
+        Normal path (GPT-4o): no Whisper — send wav directly to GPT-4o, use transcript from response.
+        ElevenLabs path: transcribe first, then Claude + ElevenLabs (or Claude + TTS for complex).
         """
         if not self.active:
             return
 
-        transcript = transcribe_with_whisper(wav_bytes).strip()
-        if not transcript:
-            return
+        if self.use_elevenlabs_voice:
+            # Quality path: need transcript for Claude; transcribe then route
+            transcript = transcribe_with_whisper(wav_bytes).strip()
+            if not transcript:
+                return
+            self.root.after(0, self.set_status, "Status: Thinking (heard you)...")
+            if detect_complex_voice_request(transcript):
+                reply = self.core.generate_reply(transcript)
+                if gen_id != self.current_generation:
+                    return
+                self.root.after(0, self.append_message, "You", transcript)
+                self.root.after(0, self.append_message, "Angel", reply)
+                if self.voice_output_enabled:
+                    self.root.after(0, self.set_status, "Status: Active – Angel is speaking...")
+                    gpt_audio = tts_gpt4o(reply)
+                    if gpt_audio:
+                        play_mp3_bytes(gpt_audio)
+                    else:
+                        speak_with_elevenlabs(reply)
+            else:
+                reply = self.core.generate_reply(transcript)
+                if gen_id != self.current_generation:
+                    return
+                self.root.after(0, self.append_message, "You", transcript)
+                self.root.after(0, self.append_message, "Angel", reply)
+                if self.voice_output_enabled:
+                    self.root.after(0, self.set_status, "Status: Active – Angel is speaking...")
+                    speak_with_elevenlabs(reply)
+        else:
+            # Fast path: no Whisper — send wav directly to GPT-4o, use reply and user transcript from response
+            self.root.after(0, self.set_status, "Status: Thinking (heard you)...")
+            memories = self.core._fetch_combined_memories()
+            memory_summary = build_memory_summary_with_sections(memories, None)
+            system_prompt = build_system_prompt(memory_summary, voice_mode=True)
+            reply_text, reply_audio, user_transcript = call_gpt4o_audio(system_prompt, wav_bytes)
+            if gen_id != self.current_generation:
+                return
+            user_display = user_transcript.strip() if user_transcript else "(voice)"
+            self.root.after(0, self.append_message, "You", user_display)
+            self.root.after(0, self.append_message, "Angel", reply_text or "(no text)")
+            if reply_text:
+                self.core.add_conversation_turn(user_display, reply_text)
+            if self.voice_output_enabled and reply_audio:
+                self.root.after(0, self.set_status, "Status: Active – Angel is speaking...")
+                play_wav_bytes(reply_audio)
+            elif self.voice_output_enabled and reply_text:
+                speak_with_elevenlabs(reply_text)
 
-        # Immediately indicate that Angel heard you and start thinking,
-        # without waiting on other processing.
-        self.root.after(0, self.set_status, "Status: Thinking (heard you)...")
-
-        # Start Claude call right away for minimal latency.
-        reply = self.core.generate_reply(transcript)
-
-        # If a newer utterance has started since we began, skip speaking this one.
-        if gen_id != self.current_generation:
-            return
-
-        # Append messages to the UI after the reply is ready.
-        self.root.after(0, self.append_message, "You", transcript)
-        self.root.after(0, self.append_message, "Angel", reply)
-
-        # Play TTS when Voice Mode is on (blocks this worker thread but not the UI)
-        if self.voice_output_enabled:
-            self.root.after(0, self.set_status, "Status: Active – Angel is speaking...")
-            speak_with_elevenlabs(reply)
-
-        # Only set status to Listening if nothing else has started
         if gen_id == self.current_generation:
             self.root.after(0, self.set_status, "Status: Active (listening)")
 
@@ -442,8 +479,9 @@ class AngelApp:
                     else:
                         num_unvoiced = 0
 
-                    # Consider utterance ended after ~0.5s of silence
-                    if num_unvoiced > int(0.5 * 1000 / frame_duration_ms):
+                    # Consider utterance ended after 500ms of silence (less waiting after speech ends)
+                    silence_ms = 500
+                    if num_unvoiced > int(silence_ms / frame_duration_ms):
                         break
 
                 if time.time() - start_time > max_total_seconds:
@@ -490,6 +528,33 @@ class AngelApp:
         )
         mode_label.pack(padx=12, pady=4, anchor="w")
 
+        # ElevenLabs vs GPT-4o native for voice mode
+        self._elevenlabs_var = tk.BooleanVar(value=self.use_elevenlabs_voice)
+        elevenlabs_cb = tk.Checkbutton(
+            win,
+            text="Use ElevenLabs for voice (quality over speed)",
+            variable=self._elevenlabs_var,
+            bg="#1E1E1E",
+            fg="#CCCCCC",
+            selectcolor="#2E2E2E",
+            activebackground="#1E1E1E",
+            activeforeground="#CCCCCC",
+            font=("Segoe UI", 10),
+            command=self._on_elevenlabs_toggle,
+        )
+        elevenlabs_cb.pack(padx=12, pady=8, anchor="w")
+
+        voice_help = tk.Label(
+            win,
+            text="When unchecked, voice uses GPT-4o native (near-instant). "
+            "When checked, voice uses ElevenLabs for higher quality.",
+            bg="#1E1E1E",
+            fg="#888888",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+        )
+        voice_help.pack(padx=12, pady=(0, 8), anchor="w")
+
         info_label = tk.Label(
             win,
             text="Angel remembers you via the user id and Mem0.\n"
@@ -500,6 +565,10 @@ class AngelApp:
             justify=tk.LEFT,
         )
         info_label.pack(padx=12, pady=(4, 12), anchor="w")
+
+    def _on_elevenlabs_toggle(self):
+        if hasattr(self, "_elevenlabs_var"):
+            self.use_elevenlabs_voice = self._elevenlabs_var.get()
 
     # ---- Window + tray helpers ----
 
