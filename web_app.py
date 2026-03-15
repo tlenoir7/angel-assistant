@@ -1,12 +1,29 @@
 import os
+import time
 from io import BytesIO
 import traceback
 
 from flask import Flask, Response, jsonify, render_template_string, request
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
-# (works for both /api/message and /api/voice; desktop and mobile)
-from angel import AngelCore, get_elevenlabs_mp3, transcribe_with_whisper
+from angel import (
+    AngelCore,
+    get_elevenlabs_mp3,
+    transcribe_with_whisper,
+    generate_morning_briefing,
+    send_briefing_email,
+    create_anthropic_client,
+    build_memory_summary_with_sections,
+)
+
+# Module-level storage for morning briefing and check-in
+morning_briefing = None
+briefing_generated_at = None
+check_in_message = None
+check_in_generated_at = None
+last_activity_at = time.time()
+angel = None
 
 
 def _sanitize_text(s: str) -> str:
@@ -19,13 +36,74 @@ def _sanitize_text(s: str) -> str:
     return s.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
 
 
+def _run_morning_briefing_job():
+    global morning_briefing, briefing_generated_at
+    try:
+        user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+        client = create_anthropic_client()
+        memories = angel._fetch_combined_memories()
+        memory_summary = build_memory_summary_with_sections(memories, None)
+        tz = os.getenv("TIMEZONE", "America/Los_Angeles")
+        morning_briefing = generate_morning_briefing(client, user_id, memory_summary, timezone=tz)
+        briefing_generated_at = time.time()
+        send_briefing_email(morning_briefing)
+    except Exception as e:
+        traceback.print_exc()
+        morning_briefing = f"Briefing unavailable: {e}"
+        briefing_generated_at = time.time()
+
+
+def _run_check_in_job():
+    """If no activity for 4+ hours, generate a short check-in message (once per idle period)."""
+    global check_in_message, check_in_generated_at, last_activity_at
+    if time.time() - last_activity_at < 4 * 3600:
+        return
+    if check_in_message and check_in_generated_at and check_in_generated_at > last_activity_at:
+        return
+    try:
+        from angel import get_current_datetime_str
+        client = create_anthropic_client()
+        dt = get_current_datetime_str()
+        resp = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=256,
+            temperature=0.5,
+            system="You are Angel, Tyler's personal AI. Write one short, warm check-in message (1-2 sentences) as if Tyler hasn't been in touch for a few hours. No questions required. Be concise.",
+            messages=[{"role": "user", "content": f"Current context: {dt}. Generate a brief check-in."}],
+        )
+        text = ""
+        for block in resp.content:
+            if getattr(block, "type", None) == "text":
+                text += block.text
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text += block.get("text", "")
+        check_in_message = (text or "Just checking in.").strip()
+        check_in_generated_at = time.time()
+    except Exception as e:
+        traceback.print_exc()
+        check_in_message = "Thinking of you. Reach out when you're ready."
+        check_in_generated_at = time.time()
+
+
 def create_app() -> Flask:
+    global angel
     app = Flask(__name__)
 
     user_id = os.getenv("ANGEL_USER_ID", "railway-user")
     angel = AngelCore(user_id=user_id, use_voice=True)
     # Warm up memories once on startup
     angel.load_initial_memory_summary()
+
+    # Morning briefing: run at BRIEFING_TIME (default 08:00)
+    briefing_time = os.getenv("BRIEFING_TIME", "08:00").strip()
+    try:
+        hour, minute = map(int, briefing_time.split(":")[:2])
+    except Exception:
+        hour, minute = 8, 0
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(_run_morning_briefing_job, "cron", hour=hour, minute=minute)
+    scheduler.add_job(_run_check_in_job, "interval", minutes=15)
+    scheduler.start()
 
     INDEX_HTML = """
     <!doctype html>
@@ -121,6 +199,33 @@ def create_app() -> Flask:
         }
         #voice-toggle.on { background-color: #2e7d32; }
         #voice-toggle.off { background-color: #424242; }
+        .briefing-block {
+          margin-bottom: 16px;
+          padding: 14px 16px;
+          background: linear-gradient(135deg, #1a237e 0%, #0d47a1 100%);
+          border-radius: 12px;
+          border-left: 4px solid #4fc3f7;
+          color: #e3f2fd;
+        }
+        .briefing-block h3 {
+          margin: 0 0 8px 0;
+          font-size: 0.95rem;
+          color: #90caf9;
+        }
+        .briefing-block p {
+          margin: 0;
+          font-size: 0.9rem;
+          line-height: 1.5;
+          white-space: pre-wrap;
+        }
+        .check-in-block {
+          margin-bottom: 12px;
+          padding: 10px 14px;
+          background-color: #1b5e20;
+          border-radius: 10px;
+          color: #c8e6c9;
+          font-size: 0.9rem;
+        }
       </style>
     </head>
     <body>
@@ -135,7 +240,7 @@ def create_app() -> Flask:
           </button>
         </div>
       </header>
-      <main id="chat"></main>
+      <main id="chat"><div id="briefing-container"></div><div id="check-in-container"></div></main>
       <footer>
         <div id="status">Idle</div>
         <div id="input-row">
@@ -153,8 +258,38 @@ def create_app() -> Flask:
         const voiceBtn = document.getElementById("voice-btn");
         const voiceToggle = document.getElementById("voice-toggle");
         const ttsAudio = document.getElementById("tts-audio");
+        const briefingContainer = document.getElementById("briefing-container");
+        const checkInContainer = document.getElementById("check-in-container");
 
         let voiceMode = true;
+
+        function isToday(ts) {
+          if (!ts) return false;
+          const d = new Date(ts * 1000);
+          const today = new Date();
+          return d.getDate() === today.getDate() && d.getMonth() === today.getMonth() && d.getFullYear() === today.getFullYear();
+        }
+
+        async function loadBriefingAndCheckIn() {
+          try {
+            const [briefRes, checkRes] = await Promise.all([fetch("/api/briefing"), fetch("/api/check_in")]);
+            const briefingData = briefRes.ok ? await briefRes.json() : {};
+            const checkInData = checkRes.ok ? await checkRes.json() : {};
+            if (briefingData.briefing && isToday(briefingData.generated_at)) {
+              briefingContainer.innerHTML = '<div class="briefing-block"><h3>☀️ Morning briefing</h3><p>' + briefingData.briefing.replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>") + '</p></div>';
+            } else {
+              briefingContainer.innerHTML = '';
+            }
+            if (checkInData.message && checkInData.generated_at) {
+              checkInContainer.innerHTML = '<div class="check-in-block">' + checkInData.message.replace(/</g, "&lt;").replace(/>/g, "&gt;") + '</div>';
+            } else {
+              checkInContainer.innerHTML = '';
+            }
+          } catch (e) {
+            console.error("Load briefing/check-in:", e);
+          }
+        }
+        loadBriefingAndCheckIn();
 
         function updateVoiceToggleLabel() {
           voiceToggle.textContent = voiceMode ? "\uD83D\uDD0A Voice Mode" : "\uD83D\uDD07 Text Mode";
@@ -337,6 +472,10 @@ def create_app() -> Flask:
 
     @app.route("/api/message", methods=["POST"])
     def api_message():
+        global last_activity_at, check_in_message, check_in_generated_at
+        last_activity_at = time.time()
+        check_in_message = None
+        check_in_generated_at = None
         data = request.get_json(silent=True) or {}
         message = (data.get("message") or "").strip()
         if not message:
@@ -347,6 +486,10 @@ def create_app() -> Flask:
 
     @app.route("/api/voice", methods=["POST"])
     def api_voice():
+        global last_activity_at, check_in_message, check_in_generated_at
+        last_activity_at = time.time()
+        check_in_message = None
+        check_in_generated_at = None
         if "audio" not in request.files:
             return jsonify({"error": "Missing audio file"}), 400
         file = request.files["audio"]
@@ -365,6 +508,22 @@ def create_app() -> Flask:
                 "reply": _sanitize_text(reply),
             }
         )
+
+    @app.route("/api/briefing", methods=["GET"])
+    def api_briefing():
+        global morning_briefing, briefing_generated_at
+        return jsonify({
+            "briefing": morning_briefing,
+            "generated_at": briefing_generated_at,
+        })
+
+    @app.route("/api/check_in", methods=["GET"])
+    def api_check_in():
+        global check_in_message, check_in_generated_at
+        return jsonify({
+            "message": check_in_message,
+            "generated_at": check_in_generated_at,
+        })
 
     @app.route("/api/tts", methods=["POST"])
     def api_tts():

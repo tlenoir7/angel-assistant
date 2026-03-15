@@ -20,6 +20,18 @@
     },
     "ANGEL_USER_ID": {
       "required": false
+    },
+    "TYLER_EMAIL": {
+      "required": false
+    },
+    "BRIEFING_TIME": {
+      "required": false
+    },
+    "TIMEZONE": {
+      "required": false
+    },
+    "GMAIL_APP_PASSWORD": {
+      "required": false
     }
   }
 }

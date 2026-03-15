@@ -27,6 +27,7 @@ from angel import (
     play_wav_bytes,
     play_mp3_bytes,
     detect_complex_voice_request,
+    generate_morning_briefing,
 )
 
 
@@ -666,6 +667,39 @@ def main():
     root = tk.Tk()
     app = AngelApp(root, user_id=user_id)
     root.protocol("WM_DELETE_WINDOW", app.minimize_to_tray)
+
+    # Morning briefing: run at BRIEFING_TIME (default 08:00)
+    def _desktop_briefing_job():
+        try:
+            memories = app.core._fetch_combined_memories()
+            memory_summary = build_memory_summary_with_sections(memories, None)
+            tz = os.getenv("TIMEZONE", "America/Los_Angeles")
+            briefing = generate_morning_briefing(
+                app.core.anthropic_client,
+                app.core.user_id,
+                memory_summary,
+                timezone=tz,
+            )
+            root.after(0, app.append_message, "Angel", "[Morning briefing]\n\n" + briefing)
+            if app.voice_output_enabled:
+                root.after(0, app.set_status, "Status: Angel is speaking (briefing)...")
+                threading.Thread(target=lambda: speak_with_elevenlabs(briefing), daemon=True).start()
+        except Exception as e:
+            root.after(0, app.append_message, "Angel", f"[Briefing unavailable: {e}]")
+
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        briefing_time = os.getenv("BRIEFING_TIME", "08:00").strip()
+        hour, minute = 8, 0
+        if ":" in briefing_time:
+            parts = briefing_time.split(":")
+            hour = int(parts[0]) if parts[0].isdigit() else 8
+            minute = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        desktop_scheduler = BackgroundScheduler()
+        desktop_scheduler.add_job(_desktop_briefing_job, "cron", hour=hour, minute=minute)
+        desktop_scheduler.start()
+    except Exception as e:
+        print(f"Scheduler not started: {e}")
 
     # Create system tray icon with controls
     icon = _create_tray_icon(app, root)

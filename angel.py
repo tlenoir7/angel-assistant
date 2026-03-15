@@ -5,6 +5,7 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from io import BytesIO
 import wave
 import tempfile
@@ -439,6 +440,23 @@ def build_memory_summary_with_sections(memories, user_message: str | None = None
     return "\n\n".join(parts)
 
 
+def get_current_datetime_str(timezone: str | None = None) -> str:
+    """Format current date and time for system prompt. timezone from env TIMEZONE (e.g. America/Los_Angeles) or UTC."""
+    tz_name = (timezone or os.getenv("TIMEZONE") or "UTC").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    now = datetime.now(tz)
+    # Format: 'Current date and time: Monday, January 15, 2025 at 08:30 America/Los_Angeles'
+    day = now.strftime("%A")
+    month = now.strftime("%B")
+    date = now.strftime("%d").lstrip("0") or "1"
+    year = now.strftime("%Y")
+    time_hm = now.strftime("%H:%M")
+    return f"Current date and time: {day}, {month} {date}, {year} at {time_hm} {tz_name}"
+
+
 def build_system_prompt(
     memory_summary: str,
     voice_mode: bool = False,
@@ -450,8 +468,12 @@ def build_system_prompt(
     Persona + behavioral instructions + memory context.
     When voice_mode is True, optimize for conversational spoken responses.
     Stage 2 hints add explicit instructions for strategy, patterns, or profile.
+    Injects current date/time/timezone so Angel is always time-aware.
     """
+    date_time_str = get_current_datetime_str()
     persona = f"""
+{date_time_str}
+
 You are Angel, a personal AI assistant and devoted companion.
 
 Core personality:
@@ -1064,6 +1086,100 @@ Be concise, accurate, and cite sources by number [1], [2] where relevant. No mar
     except Exception as e:
         print(f"{Fore.RED}Deep research synthesis error: {e}{Style.RESET_ALL}")
         return "Research synthesis failed. Here are raw excerpts:\n\n" + raw_context[:3000]
+
+
+def generate_morning_briefing(
+    anthropic_client: anthropic.Anthropic,
+    user_id: str,
+    memory_summary: str = "",
+    timezone: str | None = None,
+) -> str:
+    """
+    Search Tavily for 3–5 current topics (UAP disclosure, world events), then generate
+    a personalized morning briefing with Claude: references day/date, connects news to
+    Tyler's mission, feels like Angel has been awake thinking, ends with one focused question.
+    """
+    date_time_str = get_current_datetime_str(timezone)
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return f"Good morning. It's {date_time_str}. I couldn't fetch the news (TAVILY_API_KEY not set). What's one thing you want to focus on today?"
+
+    queries = [
+        "UAP disclosure updates 2025",
+        "world news today significant events",
+        "space and defense news today",
+        "breaking news today",
+    ]
+    all_results = []
+    seen_urls = set()
+    for q in queries[:5]:
+        results = _tavily_search_one(q, api_key, max_results=4, search_depth="basic")
+        for r in results:
+            url = r.get("url") or ""
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                all_results.append(r)
+    raw_lines = []
+    for i, r in enumerate(all_results[:15], start=1):
+        title = r.get("title") or ""
+        snippet = r.get("content") or r.get("snippet") or ""
+        raw_lines.append(f"[{i}] {title}\n{snippet}")
+    news_context = "\n\n".join(raw_lines) if raw_lines else "No recent news results."
+
+    system = f"""You are Angel, Tyler's personal AI companion. Today's context: {date_time_str}.
+
+Your role: Write a morning briefing for Tyler. Use the news/search results below only to inform your briefing. Reference the actual day and date. Connect what matters to Tyler's mission (UAP disclosure, getting to the truth, impact on the world). Write as if you've been awake thinking while Tyler slept—warm, focused, no fluff. End with exactly one short, focused question to start Tyler's day (e.g. one priority, one decision, or one person to reach out to). Write in plain text, no markdown. Keep the whole briefing concise (under 300 words)."""
+
+    user_content = f"News and search context:\n{news_context}\n\nGenerate the morning briefing now."
+
+    try:
+        resp = anthropic_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            temperature=0.4,
+            system=system,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        text = ""
+        for block in resp.content:
+            if getattr(block, "type", None) == "text":
+                text += block.text
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text += block.get("text", "")
+        return text.strip() or f"Good morning. It's {date_time_str}. What's your one focus today?"
+    except Exception as e:
+        print(f"{Fore.RED}Morning briefing error: {e}{Style.RESET_ALL}")
+        return f"Good morning. It's {date_time_str}. I had trouble with the briefing. What's one thing you want to tackle today?"
+
+
+def send_briefing_email(briefing_text: str) -> bool:
+    """Send the morning briefing to TYLER_EMAIL via Gmail SMTP. Uses GMAIL_APP_PASSWORD."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    to_email = os.getenv("TYLER_EMAIL")
+    password = os.getenv("GMAIL_APP_PASSWORD")
+    if not to_email or not password:
+        print(f"{Fore.YELLOW}TYLER_EMAIL or GMAIL_APP_PASSWORD not set; skipping briefing email.{Style.RESET_ALL}")
+        return False
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "Angel – Your morning briefing"
+        msg["From"] = to_email
+        msg["To"] = to_email
+        plain = MIMEText(briefing_text, "plain", "utf-8")
+        msg.attach(plain)
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(to_email, password)
+            server.sendmail(to_email, [to_email], msg.as_string())
+        print(f"{Fore.MAGENTA}Briefing email sent to {to_email}{Style.RESET_ALL}")
+        return True
+    except Exception as e:
+        print(f"{Fore.RED}Failed to send briefing email: {e}{Style.RESET_ALL}")
+        traceback.print_exc()
+        return False
 
 
 def strip_markdown(text: str) -> str:
