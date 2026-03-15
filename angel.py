@@ -1158,10 +1158,13 @@ def send_briefing_email(briefing_text: str) -> bool:
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
 
-    to_email = os.getenv("TYLER_EMAIL")
-    password = os.getenv("GMAIL_APP_PASSWORD")
+    to_email = (os.getenv("TYLER_EMAIL") or "").strip()
+    password = os.getenv("GMAIL_APP_PASSWORD") or ""
     if not to_email or not password:
-        print(f"{Fore.YELLOW}TYLER_EMAIL or GMAIL_APP_PASSWORD not set; skipping briefing email.{Style.RESET_ALL}")
+        print(
+            f"{Fore.YELLOW}[send_briefing_email] TYLER_EMAIL present={bool(to_email)}, "
+            f"GMAIL_APP_PASSWORD present={bool(password)}; skipping email.{Style.RESET_ALL}"
+        )
         return False
     try:
         msg = MIMEMultipart("alternative")
@@ -1177,7 +1180,7 @@ def send_briefing_email(briefing_text: str) -> bool:
         print(f"{Fore.MAGENTA}Briefing email sent to {to_email}{Style.RESET_ALL}")
         return True
     except Exception as e:
-        print(f"{Fore.RED}Failed to send briefing email: {e}{Style.RESET_ALL}")
+        print(f"{Fore.RED}[send_briefing_email] Failed: {type(e).__name__}: {e}{Style.RESET_ALL}")
         traceback.print_exc()
         return False
 

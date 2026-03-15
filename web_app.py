@@ -94,6 +94,15 @@ def create_app() -> Flask:
     # Warm up memories once on startup
     angel.load_initial_memory_summary()
 
+    # Log briefing email env at startup for debugging
+    tyler_email = (os.getenv("TYLER_EMAIL") or "").strip()
+    gmail_pass = os.getenv("GMAIL_APP_PASSWORD") or ""
+    print(
+        f"[web_app] TYLER_EMAIL present={bool(tyler_email)}, "
+        f"GMAIL_APP_PASSWORD present={bool(gmail_pass)}",
+        flush=True,
+    )
+
     # Morning briefing: run at BRIEFING_TIME (default 08:00)
     briefing_time = os.getenv("BRIEFING_TIME", "08:00").strip()
     try:
@@ -245,8 +254,8 @@ def create_app() -> Flask:
         <div id="status">Idle</div>
         <div id="input-row">
           <input id="text-input" type="text" placeholder="Type a message..." />
-          <button id="send-btn">Send</button>
-          <button id="voice-btn">🎤 Hold to speak</button>
+          <button id="send-btn" type="button">Send</button>
+          <button id="voice-btn" type="button">🎤 Hold to speak</button>
         </div>
       </footer>
       <audio id="tts-audio" style="display:none;" preload="auto"></audio>
@@ -264,24 +273,35 @@ def create_app() -> Flask:
         let voiceMode = true;
 
         function isToday(ts) {
-          if (!ts) return false;
+          if (ts == null || ts === undefined) return false;
           const d = new Date(ts * 1000);
           const today = new Date();
           return d.getDate() === today.getDate() && d.getMonth() === today.getMonth() && d.getFullYear() === today.getFullYear();
         }
+        function isWithinLast24Hours(ts) {
+          if (ts == null || ts === undefined) return false;
+          return (Date.now() / 1000) - ts < 24 * 3600;
+        }
 
         async function loadBriefingAndCheckIn() {
           try {
+            console.log("[loadBriefingAndCheckIn] Fetching /api/briefing and /api/check_in...");
             const [briefRes, checkRes] = await Promise.all([fetch("/api/briefing"), fetch("/api/check_in")]);
             const briefingData = briefRes.ok ? await briefRes.json() : {};
             const checkInData = checkRes.ok ? await checkRes.json() : {};
-            if (briefingData.briefing && isToday(briefingData.generated_at)) {
-              briefingContainer.innerHTML = '<div class="briefing-block"><h3>☀️ Morning briefing</h3><p>' + briefingData.briefing.replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>") + '</p></div>';
+            console.log("[loadBriefingAndCheckIn] /api/briefing response:", { ok: briefRes.ok, status: briefRes.status, briefing: briefingData.briefing ? "(present)" : null, generated_at: briefingData.generated_at });
+            console.log("[loadBriefingAndCheckIn] /api/check_in response:", { ok: checkRes.ok, message: checkInData.message ? "(present)" : null, generated_at: checkInData.generated_at });
+            const showBriefing = briefingData.briefing && (isToday(briefingData.generated_at) || isWithinLast24Hours(briefingData.generated_at));
+            console.log("[loadBriefingAndCheckIn] isToday=" + isToday(briefingData.generated_at) + ", within24h=" + isWithinLast24Hours(briefingData.generated_at) + ", showBriefing=" + showBriefing + ", generated_at=" + briefingData.generated_at);
+            if (showBriefing) {
+              const escaped = briefingData.briefing.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>");
+              briefingContainer.innerHTML = '<div class="briefing-block"><h3>☀️ Morning briefing</h3><p>' + escaped + '</p></div>';
             } else {
               briefingContainer.innerHTML = '';
             }
             if (checkInData.message && checkInData.generated_at) {
-              checkInContainer.innerHTML = '<div class="check-in-block">' + checkInData.message.replace(/</g, "&lt;").replace(/>/g, "&gt;") + '</div>';
+              const escapedCheckIn = checkInData.message.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+              checkInContainer.innerHTML = '<div class="check-in-block">' + escapedCheckIn + '</div>';
             } else {
               checkInContainer.innerHTML = '';
             }
@@ -297,11 +317,15 @@ def create_app() -> Flask:
           voiceToggle.classList.toggle("off", !voiceMode);
         }
 
-        voiceToggle.addEventListener("click", () => {
-          voiceMode = !voiceMode;
+        if (voiceToggle) {
+          voiceToggle.type = "button";
+          voiceToggle.addEventListener("click", function(e) {
+            e.preventDefault();
+            voiceMode = !voiceMode;
+            updateVoiceToggleLabel();
+          });
           updateVoiceToggleLabel();
-        });
-        updateVoiceToggleLabel();
+        }
 
         async function playTts(text) {
           if (!text || !voiceMode) return;
@@ -369,19 +393,35 @@ def create_app() -> Flask:
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ message: msg }),
             });
-            const data = await resp.json();
-            appendMessage("Angel", data.reply);
-            await playTts(data.reply);
+            const data = await resp.json().catch(function() { return {}; });
+            if (!resp.ok) {
+              appendMessage("Angel", data.error || "Something went wrong. Please try again.");
+              return;
+            }
+            if (data.reply != null) {
+              appendMessage("Angel", data.reply);
+              await playTts(data.reply);
+            } else {
+              appendMessage("Angel", "I didn't get a reply. Please try again.");
+            }
           } catch (e) {
+            console.error("sendText error:", e);
             appendMessage("Angel", "I ran into an error processing that.");
           } finally {
             statusEl.textContent = "Idle";
           }
         }
 
-        sendBtn.addEventListener("click", sendText);
-        textInput.addEventListener("keydown", (e) => {
+        if (sendBtn) {
+          sendBtn.type = "button";
+          sendBtn.addEventListener("click", function(e) {
+            e.preventDefault();
+            sendText();
+          });
+        }
+        textInput.addEventListener("keydown", function(e) {
           if (e.key === "Enter") {
+            e.preventDefault();
             sendText();
           }
         });
