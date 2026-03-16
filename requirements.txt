@@ -14,3 +14,5 @@ mem0ai>=0.1.0
 python-dotenv>=1.0.1
 colorama>=0.4.6
 apscheduler>=3.10.0
+pyautogui
+pillow

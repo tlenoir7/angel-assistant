@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 import anthropic
 from mem0 import Memory
 
+from angel_computer import run_computer_use_session
+
 # Desktop-only: optional so cloud (e.g. Railway) can run without them
 try:
     import pyaudio
@@ -975,6 +977,37 @@ def detect_profile_request(user_message: str) -> tuple[bool, str | None]:
     return False, None
 
 
+def detect_computer_control_request(user_message: str) -> bool:
+    """
+    True if the user is asking Angel to directly control the computer.
+    Heuristics: verbs like open, click, type, find, create a file, save this,
+    search my computer, show me (on my computer), do this on my computer.
+    """
+    lower = (user_message or "").strip().lower()
+    if not lower:
+        return False
+    keywords = [
+        "open ",
+        "click ",
+        "double click",
+        "right click",
+        "type ",
+        "press ",
+        "hit the",
+        "find ",
+        "search my computer",
+        "search on my computer",
+        "create a file",
+        "create new file",
+        "save this",
+        "save the file",
+        "show me",
+        "do this on my computer",
+        "on my computer",
+    ]
+    return any(k in lower for k in keywords)
+
+
 # ---- Communication assistance intent detection ----
 
 
@@ -1593,13 +1626,21 @@ class AngelCore:
     This is reused by both the CLI and the GUI.
     """
 
-    def __init__(self, user_id: str, use_voice: bool = False):
+    def __init__(self, user_id: str, use_voice: bool = False, allow_computer_control: bool = False):
         self.user_id = user_id or "default-user"
         self.use_voice = use_voice
+        # Computer control must be explicitly enabled by callers (e.g. GUI toggle).
+        self.computer_control_enabled = bool(allow_computer_control)
+        # Holds a pending natural-language computer request awaiting confirmation.
+        self._pending_computer_request: str | None = None
 
         self.memory_client = build_memory_client()
         self.anthropic_client = create_anthropic_client()
         self._use_mem0_cloud = bool(os.getenv("MEM0_API_KEY"))
+
+    def set_computer_control_enabled(self, enabled: bool) -> None:
+        """Toggle whether Angel is allowed to control the computer."""
+        self.computer_control_enabled = bool(enabled)
 
     def _fetch_combined_memories(self):
         try:
@@ -1640,6 +1681,8 @@ class AngelCore:
         merged_memories = self._fetch_combined_memories()
         memory_summary = build_memory_summary_with_sections(merged_memories, user_message)
 
+        computer_intent = detect_computer_control_request(user_message)
+
         comm_intent = detect_communication_intent(user_message)
 
         strategy_hint = detect_strategy_request(user_message)
@@ -1655,6 +1698,36 @@ class AngelCore:
             pattern_hint=pattern_hint,
             profile_hint=profile_hint,
         )
+
+        # Safety confirmation flow for computer control:
+        # - If a computer control request is detected and allowed, first ask
+        #   for confirmation describing the intended action.
+        # - Only after Tyler explicitly confirms do we execute via the
+        #   Anthropic computer use API in angel_computer.run_computer_use_session.
+        if self.computer_control_enabled and self._pending_computer_request:
+            # If there is a pending request, treat simple confirmations as approval.
+            lower = (user_message or "").strip().lower()
+            if lower in {"yes", "yep", "yeah", "sure", "ok", "okay", "go ahead", "do it", "please do", "confirm"}:
+                original_instruction = self._pending_computer_request
+                self._pending_computer_request = None
+                try:
+                    summary = run_computer_use_session(original_instruction)
+                except Exception as e:
+                    return f"I tried to perform that on your computer but hit an error: {e}"
+                return f"I carried out this on your computer:\n\n{original_instruction}\n\nSummary of what I did:\n{summary}"
+            # Any non-affirmative follow-up clears the pending request.
+            self._pending_computer_request = None
+
+        if self.computer_control_enabled and computer_intent and not self._pending_computer_request:
+            # Store the original natural-language request and ask for confirmation.
+            self._pending_computer_request = user_message
+            return (
+                "You asked me to do something directly on your computer.\n\n"
+                "Before I act, here is my understanding of what you want me to do:\n"
+                f"- {user_message}\n\n"
+                "If this is correct and you want me to proceed using computer control, "
+                "reply with 'yes' or 'go ahead'. If not, say 'no' or clarify what you want instead."
+            )
 
         # Communication assistance capability-specific instructions for Claude
         if comm_intent.intent == "briefing":

@@ -38,7 +38,10 @@ class AngelApp:
         self.root.configure(bg="#121212")
         self.root.minsize(640, 480)
 
-        self.core = AngelCore(user_id=user_id, use_voice=True)
+        # Computer control starts disabled and must be explicitly enabled in settings.
+        self.computer_control_enabled = False
+
+        self.core = AngelCore(user_id=user_id, use_voice=True, allow_computer_control=self.computer_control_enabled)
 
         # Conversation and audio state
         self.listening = False  # used for manual override
@@ -134,6 +137,16 @@ class AngelApp:
             font=("Segoe UI", 9),
         )
         subtitle.pack(side=tk.LEFT, padx=8, pady=8)
+
+        # Visual indicator for computer control state
+        self.computer_indicator = tk.Label(
+            header,
+            text="Computer control: OFF",
+            bg="#1E1E1E",
+            fg="#FF5252",
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.computer_indicator.pack(side=tk.LEFT, padx=8, pady=8)
 
         settings_btn = ttk.Button(
             header,
@@ -556,6 +569,36 @@ class AngelApp:
         )
         voice_help.pack(padx=12, pady=(0, 8), anchor="w")
 
+        # Computer control toggle (off by default; must be explicitly enabled)
+        self._computer_control_var = tk.BooleanVar(value=self.computer_control_enabled)
+        computer_cb = tk.Checkbutton(
+            win,
+            text="Enable computer control (Anthropic computer use)",
+            variable=self._computer_control_var,
+            bg="#1E1E1E",
+            fg="#FFCDD2",
+            selectcolor="#2E2E2E",
+            activebackground="#1E1E1E",
+            activeforeground="#FFFFFF",
+            font=("Segoe UI", 10, "bold"),
+            command=self._on_computer_control_toggle,
+        )
+        computer_cb.pack(padx=12, pady=(8, 4), anchor="w")
+
+        computer_help = tk.Label(
+            win,
+            text=(
+                "When enabled, Angel can use Anthropic's computer use tools to control your computer "
+                "(mouse, keyboard, scrolling, screenshots).\n"
+                "Before any action, she will tell you what she plans to do and ask for confirmation."
+            ),
+            bg="#1E1E1E",
+            fg="#FFAB91",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+        )
+        computer_help.pack(padx=12, pady=(0, 8), anchor="w")
+
         info_label = tk.Label(
             win,
             text="Angel remembers you via the user id and Mem0.\n"
@@ -570,6 +613,25 @@ class AngelApp:
     def _on_elevenlabs_toggle(self):
         if hasattr(self, "_elevenlabs_var"):
             self.use_elevenlabs_voice = self._elevenlabs_var.get()
+
+    def _on_computer_control_toggle(self):
+        if hasattr(self, "_computer_control_var"):
+            enabled = self._computer_control_var.get()
+            self.computer_control_enabled = enabled
+            # Propagate to core so it knows whether it may use computer control.
+            if hasattr(self, "core"):
+                self.core.set_computer_control_enabled(enabled)
+            # Update visual indicator
+            if enabled:
+                self.computer_indicator.config(
+                    text="Computer control: ON",
+                    fg="#69F0AE",
+                )
+            else:
+                self.computer_indicator.config(
+                    text="Computer control: OFF",
+                    fg="#FF5252",
+                )
 
     # ---- Window + tray helpers ----
 
