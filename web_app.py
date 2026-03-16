@@ -104,6 +104,17 @@ def create_app() -> Flask:
         flush=True,
     )
 
+    # Log all environment variable NAMES (not values) available to the process
+    try:
+        env_names = sorted(os.environ.keys())
+        print(
+            "[web_app] Environment variable names available to process:",
+            ", ".join(env_names),
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[web_app] Failed to list environment variable names: {e}", flush=True)
+
     # Morning briefing: run at BRIEFING_TIME (default 08:00)
     briefing_time = os.getenv("BRIEFING_TIME", "08:00").strip()
     try:
@@ -615,10 +626,19 @@ def create_app() -> Flask:
         except Exception:
             current_time = None
 
+        tyler_email = os.getenv("TYLER_EMAIL")
+        gmail_pass = os.getenv("GMAIL_APP_PASSWORD")
+        print(
+            "[api_status] Env check | "
+            f"TYLER_EMAIL_is_none={tyler_email is None} | "
+            f"GMAIL_APP_PASSWORD_is_none={gmail_pass is None}",
+            flush=True,
+        )
+
         return jsonify(
             {
-                "TYLER_EMAIL_set": bool(os.getenv("TYLER_EMAIL")),
-                "GMAIL_APP_PASSWORD_set": bool(os.getenv("GMAIL_APP_PASSWORD")),
+                "TYLER_EMAIL_set": bool(tyler_email),
+                "GMAIL_APP_PASSWORD_set": bool(gmail_pass),
                 "MEM0_API_KEY_set": bool(os.getenv("MEM0_API_KEY")),
                 "TAVILY_API_KEY_set": bool(os.getenv("TAVILY_API_KEY")),
                 "timezone": tz_env,
