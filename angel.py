@@ -17,7 +17,12 @@ from dotenv import load_dotenv
 import anthropic
 from mem0 import Memory
 
-from angel_computer import run_computer_use_session
+try:
+    from angel_computer import run_computer_use_session
+    COMPUTER_CONTROL_AVAILABLE = True
+except Exception:
+    run_computer_use_session = None  # type: ignore[assignment]
+    COMPUTER_CONTROL_AVAILABLE = False
 
 # Desktop-only: optional so cloud (e.g. Railway) can run without them
 try:
@@ -1704,12 +1709,14 @@ class AngelCore:
         #   for confirmation describing the intended action.
         # - Only after Tyler explicitly confirms do we execute via the
         #   Anthropic computer use API in angel_computer.run_computer_use_session.
-        if self.computer_control_enabled and self._pending_computer_request:
+        if self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE and self._pending_computer_request:
             # If there is a pending request, treat simple confirmations as approval.
             lower = (user_message or "").strip().lower()
             if lower in {"yes", "yep", "yeah", "sure", "ok", "okay", "go ahead", "do it", "please do", "confirm"}:
                 original_instruction = self._pending_computer_request
                 self._pending_computer_request = None
+                if run_computer_use_session is None:
+                    return "Computer control is not available in this environment, so I can't perform that action directly."
                 try:
                     summary = run_computer_use_session(original_instruction)
                 except Exception as e:
@@ -1718,7 +1725,7 @@ class AngelCore:
             # Any non-affirmative follow-up clears the pending request.
             self._pending_computer_request = None
 
-        if self.computer_control_enabled and computer_intent and not self._pending_computer_request:
+        if self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE and computer_intent and not self._pending_computer_request:
             # Store the original natural-language request and ask for confirmation.
             self._pending_computer_request = user_message
             return (

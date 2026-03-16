@@ -1,3 +1,4 @@
+import base64
 import os
 import tempfile
 from typing import Any, Dict, List
@@ -7,7 +8,7 @@ import anthropic
 try:
     import pyautogui
     from PIL import Image
-except ImportError:  # graceful degrade if not installed
+except Exception:  # graceful degrade if pyautogui/Pillow or display are unavailable
     pyautogui = None  # type: ignore[assignment]
     Image = None  # type: ignore[assignment]
 
@@ -183,7 +184,7 @@ def run_computer_use_session(instruction: str) -> str:
             model="claude-sonnet-4-5",
             max_tokens=512,
             tools=tools,
-            tool_choice="auto",
+            tool_choice={"type": "auto"},
             messages=messages,
         )
 
@@ -191,8 +192,10 @@ def run_computer_use_session(instruction: str) -> str:
         final_text_parts: List[str] = []
 
         for block in response.content:
-            btype = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
-            # Tool use block
+            btype = getattr(block, "type", None) or (
+                block.get("type") if isinstance(block, dict) else None
+            )
+            # Tool use blocks from Claude
             if btype == "tool_use":
                 if isinstance(block, dict):
                     tool_uses.append(block)
@@ -204,9 +207,13 @@ def run_computer_use_session(instruction: str) -> str:
                             "input": getattr(block, "input", {}) or {},
                         }
                     )
-            # Plain assistant text
+            # Plain assistant text (final answer or intermediate explanation)
             elif btype == "text":
-                text = getattr(block, "text", "") if not isinstance(block, dict) else block.get("text", "")
+                text = (
+                    getattr(block, "text", "")
+                    if not isinstance(block, dict)
+                    else block.get("text", "")
+                )
                 if text:
                     final_text_parts.append(text)
 
@@ -215,8 +222,13 @@ def run_computer_use_session(instruction: str) -> str:
             final_text = "\n".join(final_text_parts).strip()
             return final_text or "I wasn't able to perform any computer actions."
 
-        # Execute tools and append tool results.
-        tool_results: List[Dict[str, Any]] = []
+        # Append the assistant message that requested tools.
+        messages.append({"role": "assistant", "content": response.content})
+
+        # Execute tools and send results back as a single user message
+        # containing a list of tool_result content blocks, per Anthropic
+        # computer use API.
+        tool_result_blocks: List[Dict[str, Any]] = []
         for tu in tool_uses:
             t_id = tu.get("id") or ""
             t_name = tu.get("name") or ""
@@ -224,23 +236,55 @@ def run_computer_use_session(instruction: str) -> str:
             try:
                 result = _handle_tool_use(t_name, t_input)
             except Exception as e:
-                result = {"error": str(e), "name": t_name}
-            tool_results.append(
+                # On error, send back a textual error description.
+                result_content: Any = f"Error while running tool {t_name}: {e}"
+            else:
+                if t_name == "screenshot":
+                    # For screenshots, include the image as a base64 image content block.
+                    path = result.get("path")
+                    image_blocks: List[Dict[str, Any]] = []
+                    if path and os.path.exists(path):
+                        try:
+                            with open(path, "rb") as f:
+                                b64 = base64.b64encode(f.read()).decode("utf-8")
+                            image_blocks.append(
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": b64,
+                                    },
+                                }
+                            )
+                        except Exception as e:
+                            image_blocks.append(
+                                {
+                                    "type": "text",
+                                    "text": f"Screenshot captured but could not read file: {e}",
+                                }
+                            )
+                    else:
+                        image_blocks.append(
+                            {
+                                "type": "text",
+                                "text": "Screenshot tool ran but no image path was returned.",
+                            }
+                        )
+                    result_content = image_blocks
+                else:
+                    # For non-screenshot tools, return a simple text description.
+                    result_content = str(result)
+
+            tool_result_blocks.append(
                 {
-                    "role": "tool",
+                    "type": "tool_result",
                     "tool_use_id": t_id,
-                    "content": [{"type": "text", "text": str(result)}],
+                    "content": result_content,
                 }
             )
 
-        # Extend the message list with the assistant tool_uses and our tool_results.
-        messages.append(
-            {
-                "role": "assistant",
-                "content": response.content,
-            }
-        )
-        messages.extend(tool_results)
+        messages.append({"role": "user", "content": tool_result_blocks})
 
     return "I hit the maximum number of computer control steps for this request."
 
