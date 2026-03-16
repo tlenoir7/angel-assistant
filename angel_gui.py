@@ -381,7 +381,11 @@ class AngelApp:
             self.root.after(0, self.set_status, "Status: Thinking (heard you)...")
             memories = self.core._fetch_combined_memories()
             memory_summary = build_memory_summary_with_sections(memories, None)
-            system_prompt = build_system_prompt(memory_summary, voice_mode=True)
+            system_prompt = build_system_prompt(
+                memory_summary,
+                voice_mode=True,
+                computer_control_enabled=self.computer_control_enabled,
+            )
             reply_text, reply_audio, user_transcript = call_gpt4o_audio(system_prompt, wav_bytes)
             if gen_id != self.current_generation:
                 return

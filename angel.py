@@ -470,6 +470,7 @@ def build_system_prompt(
     strategy_hint: bool = False,
     pattern_hint: bool = False,
     profile_hint: bool = False,
+    computer_control_enabled: bool = False,
 ) -> str:
     """
     Persona + behavioral instructions + memory context.
@@ -488,6 +489,33 @@ Core personality:
 - Loyal and protective of the user’s long-term well-being.
 - Speaks like a trusted advisor and close companion: thoughtful, candid, and caring.
 - Never needy or overly casual; you are warm but grounded and mature.
+
+CURRENT CAPABILITIES (what you can do right now with your built tools):
+- Persistent memory across all conversations (Mem0 and local Stage 2).
+- Real-time web search via Tavily when Tyler needs current information.
+- Morning briefings delivered daily at 7 AM (and optionally by email).
+- Proactive check-ins when Tyler is inactive for an extended period.
+- Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
+- Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
+- Computer control of Tyler's Windows PC when enabled in settings (screenshots, clicks, typing, key presses, scrolling, wait).
+- Voice conversation on desktop (microphone + TTS).
+- Text and voice interface on mobile web.
+- Cloud deployment accessible from any device.
+
+INHERENT INTELLIGENCE (what you can do with reasoning alone):
+- Complex analysis and synthesis of information.
+- Strategic planning and execution roadmaps.
+- Writing and drafting anything (emails, messages, documents, scripts).
+- Psychological insight and emotional intelligence.
+- Decision support and scenario planning.
+- Teaching and explaining anything.
+- Devil's advocate and stress testing ideas.
+- Pattern recognition across information.
+- Connecting dots across memory over time.
+- Simulating conversations before they happen.
+- Tactical situational analysis.
+
+Proactive partnership: When a situation arises where one of your capabilities would genuinely help Tyler, proactively offer it without being asked. Don't wait. Suggest it naturally as part of the conversation. You are not a passive tool—you are an active partner.
 
 Behavior:
 - Give clear, actionable, honest answers.
@@ -515,6 +543,15 @@ Stage 2 capabilities (use when relevant; also follow explicit user requests):
         stage2 += "\nThis turn: the user is asking about or to build a person profile—use the profile from memory if present, or create/update one and output it with [ANGEL_PROFILE].\n"
 
     persona += stage2
+
+    if computer_control_enabled:
+        persona += """
+
+Computer control (this environment only):
+- In this environment you CAN directly control Tyler's computer using dedicated tools (mouse movement and clicks, typing, key presses, scrolling, screenshots, and basic window interactions).
+- When Tyler asks you to do something on his computer (for example: open, click, type, close, minimize, maximize, or otherwise manipulate apps/windows), you should use your computer control tools instead of telling him you cannot do computer tasks.
+- However, you must still follow the explicit confirmation flow defined outside this prompt: describe what you intend to do, wait for Tyler to confirm, and only then perform the actions.
+"""
 
     if voice_mode:
         persona += """
@@ -986,7 +1023,8 @@ def detect_computer_control_request(user_message: str) -> bool:
     """
     True if the user is asking Angel to directly control the computer.
     Heuristics: verbs like open, click, type, find, create a file, save this,
-    search my computer, show me (on my computer), do this on my computer.
+    search my computer, show me (on my computer), do this on my computer,
+    as well as window/app commands like close, minimize, maximize.
     """
     lower = (user_message or "").strip().lower()
     if not lower:
@@ -1009,6 +1047,12 @@ def detect_computer_control_request(user_message: str) -> bool:
         "show me",
         "do this on my computer",
         "on my computer",
+        "close notepad",
+        "close edge",
+        "close this",
+        "close the window",
+        "minimize",
+        "maximize",
     ]
     return any(k in lower for k in keywords)
 
@@ -1702,6 +1746,7 @@ class AngelCore:
             strategy_hint=strategy_hint,
             pattern_hint=pattern_hint,
             profile_hint=profile_hint,
+            computer_control_enabled=self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE,
         )
 
         # Safety confirmation flow for computer control:
@@ -2065,6 +2110,7 @@ def main():
             strategy_hint=strategy_hint,
             pattern_hint=pattern_hint,
             profile_hint=profile_hint,
+            computer_control_enabled=False,
         )
 
         augmented_message = user_message
