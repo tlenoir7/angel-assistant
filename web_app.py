@@ -2,6 +2,7 @@ import os
 import time
 from io import BytesIO
 import traceback
+from datetime import datetime
 
 from flask import Flask, Response, jsonify, render_template_string, request
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -597,6 +598,33 @@ def create_app() -> Flask:
             "message": check_in_message,
             "generated_at": check_in_generated_at,
         })
+
+    @app.route("/api/status", methods=["GET"])
+    def api_status():
+        tz_env = os.getenv("TIMEZONE", "America/Los_Angeles")
+        try:
+            try:
+                from zoneinfo import ZoneInfo
+
+                tzinfo = ZoneInfo(tz_env)
+            except Exception:
+                tzinfo = None
+
+            now = datetime.now(tzinfo) if tzinfo is not None else datetime.utcnow()
+            current_time = now.isoformat()
+        except Exception:
+            current_time = None
+
+        return jsonify(
+            {
+                "TYLER_EMAIL_set": bool(os.getenv("TYLER_EMAIL")),
+                "GMAIL_APP_PASSWORD_set": bool(os.getenv("GMAIL_APP_PASSWORD")),
+                "MEM0_API_KEY_set": bool(os.getenv("MEM0_API_KEY")),
+                "TAVILY_API_KEY_set": bool(os.getenv("TAVILY_API_KEY")),
+                "timezone": tz_env,
+                "current_time": current_time,
+            }
+        )
 
     @app.route("/api/tts", methods=["POST"])
     def api_tts():
