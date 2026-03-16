@@ -1411,34 +1411,29 @@ Your role: Write a morning briefing for Tyler. Use the news/search results below
 
 
 def send_briefing_email(briefing_text: str) -> bool:
-    """Send the morning briefing to TYLER_EMAIL via Gmail SMTP. Uses GMAIL_APP_PASSWORD."""
-    import smtplib
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
+    """Send the morning briefing to TYLER_EMAIL via Resend API. Uses RESEND_API_KEY."""
+    import resend
 
     to_email = (os.getenv("TYLER_EMAIL") or "").strip()
-    password = os.getenv("GMAIL_APP_PASSWORD") or ""
-    if not to_email or not password:
+    api_key = (os.getenv("RESEND_API_KEY") or "").strip()
+    if not to_email or not api_key:
         print(
             f"{Fore.YELLOW}[send_briefing_email] TYLER_EMAIL present={bool(to_email)}, "
-            f"GMAIL_APP_PASSWORD present={bool(password)}; skipping email.{Style.RESET_ALL}"
+            f"RESEND_API_KEY present={bool(api_key)}; skipping email.{Style.RESET_ALL}"
         )
         return False
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "Angel – Your morning briefing"
-        msg["From"] = to_email
-        msg["To"] = to_email
-        plain = MIMEText(briefing_text, "plain", "utf-8")
-        msg.attach(plain)
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.starttls()
-            server.login(to_email, password)
-            server.sendmail(to_email, [to_email], msg.as_string())
-        print(f"{Fore.MAGENTA}Briefing email sent to {to_email}{Style.RESET_ALL}")
+        resend.api_key = api_key
+        resend.Emails.send({
+            "from": "Angel <onboarding@resend.dev>",
+            "to": to_email,
+            "subject": "Angel Morning Briefing",
+            "text": briefing_text,
+        })
+        print(f"{Fore.MAGENTA}Briefing email sent to {to_email} via Resend{Style.RESET_ALL}")
         return True
     except Exception as e:
-        print(f"{Fore.RED}[send_briefing_email] Failed: {type(e).__name__}: {e}{Style.RESET_ALL}")
+        print(f"{Fore.RED}[send_briefing_email] Resend failed: {type(e).__name__}: {e}{Style.RESET_ALL}")
         traceback.print_exc()
         return False
 
