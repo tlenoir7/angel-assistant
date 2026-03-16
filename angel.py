@@ -975,6 +975,179 @@ def detect_profile_request(user_message: str) -> tuple[bool, str | None]:
     return False, None
 
 
+# ---- Communication assistance intent detection ----
+
+
+class CommunicationIntent:
+    """Lightweight container for communication assistance intents."""
+
+    def __init__(
+        self,
+        intent: str | None = None,
+        person_name: str | None = None,
+        topic: str | None = None,
+    ):
+        self.intent = intent  # "briefing", "draft", "debrief", "coaching", or None
+        self.person_name = person_name
+        self.topic = topic
+
+
+def _extract_person_after_phrase(lower_msg: str, phrase: str) -> str | None:
+    """
+    Heuristic: given a lowercase message and trigger phrase, try to grab
+    the next 1–3 tokens as a person's name. Returns None if not obvious.
+    """
+    try:
+        idx = lower_msg.index(phrase)
+    except ValueError:
+        return None
+    after = lower_msg[idx + len(phrase) :].strip()
+    if not after:
+        return None
+    raw_tokens = after.split()
+    if not raw_tokens:
+        return None
+    # Take up to first 3 tokens until punctuation.
+    name_tokens = []
+    for tok in raw_tokens[:3]:
+        tok_clean = tok.strip(",.?!:;")
+        if not tok_clean:
+            break
+        name_tokens.append(tok_clean)
+    if not name_tokens:
+        return None
+    name = " ".join(name_tokens)
+    # Very short or absurdly long is likely noise.
+    if len(name) < 2 or len(name) > 60:
+        return None
+    # Capitalize each part for nicer metadata.
+    return " ".join(part.capitalize() for part in name.split())
+
+
+def detect_communication_intent(user_message: str) -> "CommunicationIntent":
+    """
+    Detect four communication assistance modes from natural language:
+    1) pre-conversation briefing (meeting/conversation with someone)
+    2) message drafting (ask to write/draft a message)
+    3) conversation debrief (just talked to someone)
+    4) response coaching (share what someone said + ask how to respond)
+    """
+    msg = (user_message or "").strip()
+    lower = msg.lower()
+    if not lower:
+        return CommunicationIntent()
+
+    # 1) Pre-conversation briefing
+    briefing_triggers = [
+        "brief me before i talk to",
+        "brief me before i talk with",
+        "brief me before i meet with",
+        "i have a meeting with",
+        "i've got a meeting with",
+        "i have a conversation with",
+        "i've got a conversation with",
+        "before i talk to",
+        "before i talk with",
+        "before i meet with",
+        "prep me before i talk to",
+        "prep me before i meet with",
+        "meeting with ",
+        "conversation with ",
+    ]
+    for phrase in briefing_triggers:
+        if phrase in lower:
+            person = _extract_person_after_phrase(lower, phrase)
+            # Crude topic: rest of message after name (best-effort only)
+            topic = None
+            if person:
+                try:
+                    name_lower = person.lower()
+                    name_idx = lower.index(name_lower)
+                    topic_raw = lower[name_idx + len(name_lower) :].strip()
+                    if topic_raw.startswith("about "):
+                        topic_raw = topic_raw[len("about ") :].strip()
+                    topic = topic_raw if topic_raw else None
+                except ValueError:
+                    topic = None
+            return CommunicationIntent("briefing", person_name=person, topic=topic)
+
+    # 2) Message drafting
+    drafting_triggers = [
+        "help me write a message",
+        "help me write an email",
+        "help me write a text",
+        "help me write to",
+        "draft an email to",
+        "draft a message to",
+        "draft a text to",
+        "write an email to",
+        "write a message to",
+        "write a text to",
+        "help me respond to this",
+        "how should i respond to this",
+        "how should i reply to this",
+        "how do i respond to this",
+    ]
+    for phrase in drafting_triggers:
+        if phrase in lower:
+            # Try very rough person extraction for "to NAME"
+            person = None
+            if " to " in phrase:
+                person = _extract_person_after_phrase(lower, phrase)
+            return CommunicationIntent("draft", person_name=person)
+
+    # 3) Conversation debrief
+    debrief_triggers = [
+        "let me debrief you on a conversation",
+        "let me debrief you on",
+        "let me debrief you",
+        "i just talked to",
+        "i just talked with",
+        "we just talked to",
+        "we just talked with",
+        "i just had a call with",
+        "i just had a meeting with",
+        "we just had a call with",
+        "we just had a meeting with",
+        "i just got off a call with",
+    ]
+    for phrase in debrief_triggers:
+        if phrase in lower:
+            person = _extract_person_after_phrase(lower, phrase)
+            return CommunicationIntent("debrief", person_name=person)
+
+    # 4) Response coaching
+    coaching_question_triggers = [
+        "how should i respond",
+        "how do i respond",
+        "how should i reply",
+        "how do i reply",
+        "what should i say back",
+        "what do i say back",
+        "what should i say in response",
+        "how do i answer this",
+    ]
+    # Require both "they said" (or similar) and a response question trigger,
+    # to avoid catching generic strategy questions.
+    said_markers = [
+        "they said",
+        "she said",
+        "he said",
+        "they replied",
+        "she replied",
+        "he replied",
+        "they wrote",
+        "she wrote",
+        "he wrote",
+    ]
+    if any(t in lower for t in coaching_question_triggers) and any(
+        m in lower for m in said_markers
+    ):
+        return CommunicationIntent("coaching")
+
+    return CommunicationIntent()
+
+
 def _tavily_search_one(query: str, api_key: str, max_results: int = 5, search_depth: str = "advanced") -> list[dict]:
     """Run a single Tavily search. Returns list of result dicts."""
     try:
@@ -1467,6 +1640,8 @@ class AngelCore:
         merged_memories = self._fetch_combined_memories()
         memory_summary = build_memory_summary_with_sections(merged_memories, user_message)
 
+        comm_intent = detect_communication_intent(user_message)
+
         strategy_hint = detect_strategy_request(user_message)
         pattern_hint = detect_pattern_request(user_message)
         profile_requested, profile_person = detect_profile_request(user_message)
@@ -1481,12 +1656,97 @@ class AngelCore:
             profile_hint=profile_hint,
         )
 
+        # Communication assistance capability-specific instructions for Claude
+        if comm_intent.intent == "briefing":
+            pname = comm_intent.person_name or "this person"
+            topic = comm_intent.topic or "the upcoming conversation"
+            system_prompt += f"""
+
+This turn is a pre-conversation briefing for Tyler.
+
+Person: {pname}
+Topic or context: {topic}
+
+Use any existing "Profile for {pname}" content from memory plus any web research context provided in the user message.
+
+Respond in this exact structure, with clear labels:
+1) Who this person is
+2) What approach to take
+3) What to watch for
+4) Questions to ask
+5) What to avoid
+6) Micro-scripts (3–5 short example phrases Tyler can literally say)
+
+Be concrete, tactical, and specific to this person and situation—not generic advice.
+If you learn or infer anything meaningful about {pname}'s profile (role, relationship to Tyler, communication style, what works/doesn't), append at the very end ONE line:
+[ANGEL_PROFILE]: {pname}|<concise updated profile text>.
+"""
+        elif comm_intent.intent == "draft":
+            pname = comm_intent.person_name or "this person"
+            system_prompt += f"""
+
+This turn is for drafting an actual send-ready message for Tyler to {pname}.
+
+Use any existing "Profile for {pname}" content from memory and the full conversation context.
+
+Respond in this structure:
+1) A single meta line for Tyler in brackets, e.g. [Meta: one short sentence about intent/tone].
+2) Then the full message text exactly as Tyler should send it, with no further explanation.
+
+Match {pname}'s preferences and communication style based on their profile.
+If you learn anything new or refine your understanding of {pname}, append at the very end ONE line:
+[ANGEL_PROFILE]: {pname}|<concise updated profile text>.
+"""
+        elif comm_intent.intent == "debrief":
+            pname = comm_intent.person_name or "this person"
+            system_prompt += f"""
+
+This turn is a conversation debrief about an interaction Tyler just had with {pname}.
+
+Respond in this structure:
+1) Short recap of what happened (2–4 sentences).
+2) What worked (bullets).
+3) What didn't work or felt off (bullets).
+4) Specific recommendations for next time with {pname} (bullets with concrete behaviors/phrases).
+
+If you can improve or extend {pname}'s person profile (goals, interests, communication style, what to do/avoid, questions that work, red flags), append at the very end ONE line:
+[ANGEL_PROFILE]: {pname}|<concise updated profile text>.
+"""
+        elif comm_intent.intent == "coaching":
+            system_prompt += """
+
+This turn is response coaching: Tyler has shared what someone said and wants exact words to respond with.
+
+Respond in this structure:
+1) One short meta line in brackets for Tyler, e.g. [Meta: what this response aims to do and any risk].
+2) Then 2–3 alternative responses labeled clearly (A), (B), (C) that Tyler can paste as-is.
+
+Each option should be realistic in Tyler's voice and differ slightly in directness/length/approach.
+If the other person's profile is available in memory, match your suggestions to their style and what tends to work with them.
+If you infer anything new about that person's preferences or dynamics, append at the very end ONE line:
+[ANGEL_PROFILE]: <Person Name>|<concise updated profile text>.
+"""
+
         print(f"{Fore.BLUE}Angel is thinking...{Style.RESET_ALL}")
 
         augmented_user_message = user_message
 
         # Stage 2 Deep Research: multi-angle Tavily + synthesis when triggered
-        if research_requested:
+        if comm_intent.intent == "briefing" and os.getenv("TAVILY_API_KEY"):
+            # For pre-conversation briefings, always try to research the person/topic explicitly.
+            topic = (comm_intent.person_name or "") + " " + (comm_intent.topic or "")
+            topic = topic.strip() or user_message.strip()
+            print(f"{Fore.BLUE}Angel: researching {topic!r} for your briefing...{Style.RESET_ALL}")
+            briefing = do_deep_research(
+                topic,
+                memory_summary,
+                self.anthropic_client,
+            )
+            augmented_user_message = (
+                f"Research briefing about {topic} (use this to answer):\n{briefing}\n\n"
+                f"Original user request:\n{user_message}"
+            )
+        elif research_requested:
             topic = user_message.strip()
             for phrase in RESEARCH_TRIGGERS:
                 if phrase in topic.lower():
