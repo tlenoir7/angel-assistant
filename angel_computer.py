@@ -33,19 +33,40 @@ def run_computer_use_session(instruction: str) -> str:
         "display_height_px": 1080,
     }
 
-    messages = [
+    # Take initial screenshot so Claude sees the screen immediately (saves a round).
+    print("[angel_computer] Taking initial screenshot for first message")
+    img = pyautogui.screenshot()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        img.save(tmp.name, format="PNG")
+        with open(tmp.name, "rb") as f:
+            initial_b64 = base64.b64encode(f.read()).decode("utf-8")
+    first_content: list = [
+        {"type": "text", "text": instruction},
         {
-            "role": "user",
-            "content": instruction,
-        }
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": initial_b64,
+            },
+        },
     ]
+    messages = [{"role": "user", "content": first_content}]
+
+    system_prompt = """You are controlling a Windows PC. Act directly and efficiently.
+
+- Use keyboard shortcuts whenever possible instead of clicking through menus (e.g. Win+E for Explorer, Ctrl+C/V, Alt+Tab).
+- To open applications: use Win+R, type the app name (e.g. notepad, cmd, msedge), then press Enter. This is the fastest method—prefer it over Start menu or taskbar.
+- Minimize screenshots: only take a screenshot when you genuinely need to verify that something failed or to locate an element you cannot infer. Do not screenshot after every action.
+- Plan multi-step actions when needed; you have enough context to act in few rounds."""
 
     for round_idx in range(20):
         print(f"[angel_computer] Round {round_idx + 1}: sending {len(messages)} messages to Claude")
         response = client.messages.create(
             model="claude-sonnet-4-5",
-            max_tokens=1024,
+            max_tokens=2048,
             tools=[computer_tool],
+            system=system_prompt,
             messages=messages,
         )
 
