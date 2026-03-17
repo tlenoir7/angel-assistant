@@ -1,10 +1,13 @@
 import threading
 import time
+import traceback
 from collections import deque
 from io import BytesIO
 import math
 import os
+import struct
 import sys
+import wave
 
 import tkinter as tk
 from tkinter import scrolledtext, ttk
@@ -12,9 +15,15 @@ from tkinter import scrolledtext, ttk
 import pyaudio
 import pygame
 import webrtcvad
-import wave
 import pystray
 from PIL import Image, ImageDraw
+
+try:
+    from angel_realtime import AngelRealtimeSession
+    REALTIME_AVAILABLE = True
+except Exception:
+    REALTIME_AVAILABLE = False
+    AngelRealtimeSession = None
 
 from angel import (
     AngelCore,
@@ -29,6 +38,20 @@ from angel import (
     detect_complex_voice_request,
     generate_morning_briefing,
 )
+
+
+def pcm24k_to_wav_bytes(pcm_bytes: bytes) -> bytes:
+    """Convert raw PCM 16-bit 24kHz mono bytes to WAV file bytes that pygame can play.
+    Writes WAV header manually with struct so the file is always valid."""
+    n = len(pcm_bytes)
+    # RIFF header: "RIFF" + size (36 + data len) + "WAVE"
+    riff_size = 36 + n
+    header = struct.pack("<4sI4s", b"RIFF", riff_size, b"WAVE")
+    # fmt chunk: "fmt " + 16 + PCM=1, mono=1, 24000 Hz, byte_rate=48000, block_align=2, 16 bit
+    header += struct.pack("<4sIHHIIHH", b"fmt ", 16, 1, 1, 24000, 48000, 2, 16)
+    # data chunk: "data" + length + raw PCM
+    header += struct.pack("<4sI", b"data", n)
+    return header + pcm_bytes
 
 
 class AngelApp:
@@ -70,6 +93,23 @@ class AngelApp:
 
         # Preload memories for context (optional but nice for logs)
         self.core.load_initial_memory_summary()
+
+        # Persistent Realtime API session (one websocket for entire Angel session)
+        self.realtime_session: AngelRealtimeSession | None = None
+        if REALTIME_AVAILABLE and AngelRealtimeSession is not None:
+            try:
+                self.realtime_session = AngelRealtimeSession()
+                memories = self.core._fetch_combined_memories()
+                memory_summary = build_memory_summary_with_sections(memories, None)
+                system_prompt = build_system_prompt(
+                    memory_summary,
+                    voice_mode=True,
+                    computer_control_enabled=self.computer_control_enabled,
+                )
+                self.realtime_session.connect(system_prompt)
+            except Exception as e:
+                print(f"[Realtime] Initial connect failed: {e}")
+                self.realtime_session = None
 
         # Start continuous background listener using VAD (in standby/paused mode)
         threading.Thread(target=self._listening_loop, daemon=True).start()
@@ -377,8 +417,11 @@ class AngelApp:
                     self.root.after(0, self.set_status, "Status: Active – Angel is speaking...")
                     speak_with_elevenlabs(reply)
         else:
-            # Fast path: no Whisper — send wav directly to GPT-4o, use reply and user transcript from response
+            # Fast path: no Whisper — use persistent Realtime session or fall back to GPT-4o
             self.root.after(0, self.set_status, "Status: Thinking (heard you)...")
+            reply_text = None
+            reply_audio = None
+            user_display = "(voice)"
             memories = self.core._fetch_combined_memories()
             memory_summary = build_memory_summary_with_sections(memories, None)
             system_prompt = build_system_prompt(
@@ -386,10 +429,29 @@ class AngelApp:
                 voice_mode=True,
                 computer_control_enabled=self.computer_control_enabled,
             )
-            reply_text, reply_audio, user_transcript = call_gpt4o_audio(system_prompt, wav_bytes)
+            if self.realtime_session is not None:
+                try:
+                    transcript, audio_bytes = self.realtime_session.send_audio(wav_bytes)
+                    reply_text = transcript
+                    if gen_id != self.current_generation:
+                        return
+                    wav_response = pcm24k_to_wav_bytes(audio_bytes)
+                    if wav_response:
+                        reply_audio = wav_response
+                except Exception as e:
+                    print("Realtime send_audio failed:", e)
+                    traceback.print_exc()
+                    try:
+                        self.realtime_session.disconnect()
+                        self.realtime_session.connect(system_prompt)
+                    except Exception as recon:
+                        print("Realtime reconnect failed:", recon)
+                        self.realtime_session = None
+            if reply_text is None:
+                reply_text, reply_audio, user_transcript = call_gpt4o_audio(system_prompt, wav_bytes)
+                user_display = user_transcript.strip() if user_transcript else "(voice)"
             if gen_id != self.current_generation:
                 return
-            user_display = user_transcript.strip() if user_transcript else "(voice)"
             self.root.after(0, self.append_message, "You", user_display)
             self.root.after(0, self.append_message, "Angel", reply_text or "(no text)")
             if reply_text:
@@ -662,6 +724,11 @@ class AngelApp:
     def shutdown(self):
         """Completely stop Angel and close the app."""
         self.running = False
+        try:
+            if self.realtime_session is not None:
+                self.realtime_session.disconnect()
+        except Exception:
+            pass
         try:
             if self.tray_icon is not None:
                 self.tray_icon.stop()
