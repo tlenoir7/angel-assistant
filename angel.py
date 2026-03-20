@@ -3,7 +3,7 @@ import os
 import re
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from io import BytesIO
@@ -49,6 +49,11 @@ MEM0_API_BASE_URL = "https://api.mem0.ai"
 # Stage 2 memory categories
 CATEGORY_PATTERNS = "patterns"
 CATEGORY_PERSON_PROFILE = "person_profile"
+CATEGORY_RESEARCH_TIMELINE = "research_timeline"
+
+_STRUCTURED_MEMORY_CATEGORIES = frozenset(
+    {CATEGORY_PATTERNS, CATEGORY_PERSON_PROFILE, CATEGORY_RESEARCH_TIMELINE}
+)
 # Sentinel for Angel to output a new pattern (parsed and stored)
 ANGEL_PATTERN_PREFIX = "[ANGEL_PATTERN]:"
 # Sentinel for Angel to output a new/updated person profile (parsed and stored)
@@ -305,6 +310,164 @@ def _strip_transcript_prefixes_from_memory(text: str) -> str:
     return text.strip()
 
 
+def _parse_memory_datetime(created_at: str) -> datetime | None:
+    """Parse Mem0 / local ISO timestamps into UTC-aware datetime."""
+    if not created_at or not isinstance(created_at, str):
+        return None
+    s = created_at.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def relative_time_phrase(created_at: str) -> str:
+    """
+    Human-readable age for a memory's created_at, e.g. 'yesterday', '3 weeks ago', 'last month'.
+    """
+    dt = _parse_memory_datetime(created_at)
+    if dt is None:
+        return "unknown time"
+    now = datetime.now(timezone.utc)
+    delta = now - dt
+    secs = delta.total_seconds()
+    if secs < 0:
+        return "just now"
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        m = int(secs // 60)
+        return f"{m} minute{'s' if m != 1 else ''} ago"
+    if secs < 24 * 3600 and delta.days == 0:
+        h = int(secs // 3600)
+        return f"{h} hour{'s' if h != 1 else ''} ago"
+    d = delta.days
+    if d == 1:
+        return "yesterday"
+    if d < 7:
+        return f"{d} days ago"
+    if d < 14:
+        return "last week"
+    if d < 21:
+        return "2 weeks ago"
+    weeks = d // 7
+    if weeks < 8:
+        return f"{weeks} weeks ago"
+    months = max(1, d // 30)
+    if d < 730:
+        if months == 1:
+            return "last month"
+        return f"{months} months ago"
+    years = d // 365
+    return f"{years} year{'s' if years != 1 else ''} ago"
+
+
+def _memory_created_at(m: dict) -> str:
+    """Best-effort created_at string from a normalized memory dict."""
+    if not isinstance(m, dict):
+        return ""
+    ca = m.get("created_at") or ""
+    meta = m.get("metadata")
+    if isinstance(meta, dict):
+        if not ca:
+            ca = meta.get("created_at") or meta.get("timestamp") or meta.get("createdAt") or ""
+    return ca if isinstance(ca, str) else ""
+
+
+def _format_memory_line_with_age(created_at: str, text: str, tags=None) -> str:
+    when = relative_time_phrase(created_at)
+    base = f"[{when}] {text}"
+    if tags:
+        return f"- ({tags}) {base}"
+    return f"- {base}"
+
+
+# Patterns to pull explicit calendar dates from Tavily / research text for timeline memories
+_TAVILY_DATE_REGEX = re.compile(
+    r"(?:\b\d{4}-\d{2}-\d{2}\b|"
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.? \d{1,2},? \d{4}\b|"
+    r"\b\d{1,2}/\d{1,2}/\d{4}\b|"
+    r"\bQ[1-4] \d{4}\b)",
+    re.IGNORECASE,
+)
+
+
+def _snippet_around(text: str, start: int, end: int, width: int = 90) -> str:
+    lo = max(0, start - width // 2)
+    hi = min(len(text), end + width // 2)
+    snip = text[lo:hi].replace("\n", " ").strip()
+    if len(snip) > 160:
+        snip = snip[:157] + "..."
+    return snip
+
+
+def extract_dated_events_from_research_text(text: str, max_events: int = 14) -> list[str]:
+    """
+    Extract date-like strings and short context from Tavily-style blobs.
+    Returns lines suitable for timeline memory (no external API).
+    """
+    if not text or not isinstance(text, str):
+        return []
+    seen = set()
+    out: list[str] = []
+    for m in _TAVILY_DATE_REGEX.finditer(text):
+        span = m.group(0)
+        key = span.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        snip = _snippet_around(text, m.start(), m.end())
+        out.append(f"{span}: {snip}")
+        if len(out) >= max_events:
+            break
+    return out
+
+
+def store_tavily_research_timeline(
+    memory_client,
+    user_id: str,
+    query: str,
+    research_text: str,
+    use_mem0_cloud: bool,
+) -> None:
+    """
+    Persist dated snippets from web research as structured timeline memories.
+    """
+    if not research_text or not user_id:
+        return
+    events = extract_dated_events_from_research_text(research_text)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    qshort = (query or "").strip()[:240]
+    if events:
+        body = (
+            f"External research timeline (Tavily), query: {qshort!r} (indexed {now_iso}):\n"
+            + "\n".join(f"  • {e}" for e in events)
+        )
+    else:
+        body = (
+            f"External research (Tavily), query: {qshort!r} (indexed {now_iso}): "
+            f"no explicit calendar dates parsed in snippets; content available in session context only."
+        )
+    try:
+        add_structured_memory(
+            memory_client,
+            user_id,
+            body,
+            CATEGORY_RESEARCH_TIMELINE,
+            person_name=None,
+            use_mem0_cloud=use_mem0_cloud,
+        )
+    except Exception as e:
+        print(f"{Fore.YELLOW}Could not store research timeline memory: {e}{Style.RESET_ALL}")
+
+
 def _normalize_memories_list(memories):
     """Unwrap and normalize memory items into a list of dicts with memory, metadata, created_at."""
     if isinstance(memories, dict):
@@ -334,16 +497,26 @@ def summarize_memories_for_prompt(memories) -> str:
     if not normalized:
         return "Angel currently has no prior memories about this user."
     # Exclude structured Stage 2 entries so we don't duplicate
-    general = [
-        m
-        for m in normalized
-        if (isinstance(m.get("metadata"), dict) and (m.get("metadata") or {}).get("category") not in (CATEGORY_PATTERNS, CATEGORY_PERSON_PROFILE))
-        or not isinstance(m.get("metadata"), dict)
-    ]
-    if not general:
+    general = []
+    timeline_block: list[tuple[str, str]] = []
+    for m in normalized:
+        meta = m.get("metadata") if isinstance(m, dict) else {}
+        cat = meta.get("category") if isinstance(meta, dict) else None
+        if cat == CATEGORY_RESEARCH_TIMELINE:
+            raw = (m.get("memory") or m.get("data") or "")
+            if raw:
+                timeline_block.append(
+                    (_memory_created_at(m), _strip_transcript_prefixes_from_memory(raw))
+                )
+            continue
+        if cat in (CATEGORY_PATTERNS, CATEGORY_PERSON_PROFILE):
+            continue
+        general.append(m)
+
+    if not general and not timeline_block:
         return "Angel has only minimal prior information about this user."
     try:
-        general_sorted = sorted(general, key=lambda m: m.get("created_at") or "")
+        general_sorted = sorted(general, key=lambda m: _memory_created_at(m))
     except Exception:
         general_sorted = general
     lines = []
@@ -356,10 +529,30 @@ def summarize_memories_for_prompt(memories) -> str:
             continue
         meta = m.get("metadata") or {}
         tags = meta.get("tags") or meta.get("category") if isinstance(meta, dict) else None
-        lines.append(f"- ({tags}) {text}" if tags else f"- {text}")
-    if not lines:
+        ca = _memory_created_at(m)
+        lines.append(_format_memory_line_with_age(ca, text, tags=tags))
+    if not lines and not timeline_block:
         return "Angel has only minimal prior information about this user."
-    return "Angel's long-term understanding of the user, summarized from past interactions:\n" + "\n".join(lines)
+    parts = []
+    if lines:
+        parts.append(
+            "Angel's long-term understanding of the user, summarized from past interactions "
+            "(each line shows how long ago the memory was stored):\n" + "\n".join(lines)
+        )
+    if timeline_block:
+        try:
+            timeline_block.sort(key=lambda x: x[0])
+        except Exception:
+            pass
+        tlines = [
+            _format_memory_line_with_age(ca, txt) for ca, txt in timeline_block if txt
+        ]
+        if tlines:
+            parts.append(
+                "Dated external events from web research (Tavily), with when each was saved to memory:\n"
+                + "\n".join(tlines)
+            )
+    return "\n\n".join(parts)
 
 
 def _person_mentioned_in_message(person_name: str, user_message: str) -> bool:
@@ -383,6 +576,7 @@ def build_memory_summary_with_sections(memories, user_message: str | None = None
 
     general = []
     pattern_texts = []
+    timeline_entries: list[tuple[str, str]] = []
     profiles_by_person: dict[str, tuple[str, str]] = {}  # person_name -> (created_at, text)
 
     for m in normalized:
@@ -393,21 +587,24 @@ def build_memory_summary_with_sections(memories, user_message: str | None = None
         if not text:
             continue
         meta = m.get("metadata") if isinstance(m, dict) else {} or {}
+        created = _memory_created_at(m)
         if not isinstance(meta, dict):
-            general.append((m.get("created_at") or "", text))
+            general.append((created, text))
             continue
         cat = meta.get("category")
+        if cat == CATEGORY_RESEARCH_TIMELINE:
+            timeline_entries.append((created, text))
+            continue
         if cat == CATEGORY_PATTERNS:
-            pattern_texts.append((m.get("created_at") or "", text))
+            pattern_texts.append((created, text))
             continue
         if cat == CATEGORY_PERSON_PROFILE:
             pname = (meta.get("person_name") or "").strip()
             if pname:
-                created = m.get("created_at") or ""
                 if pname not in profiles_by_person or created > profiles_by_person[pname][0]:
                     profiles_by_person[pname] = (created, text)
             continue
-        general.append((m.get("created_at") or "", text))
+        general.append((created, text))
 
     parts = []
 
@@ -416,10 +613,11 @@ def build_memory_summary_with_sections(memories, user_message: str | None = None
             general_sorted = sorted(general, key=lambda x: x[0])
         except Exception:
             general_sorted = general
-        lines = [t for _, t in general_sorted]
+        lines = [_format_memory_line_with_age(ca, t) for ca, t in general_sorted]
         parts.append(
-            "Angel's long-term understanding of the user, summarized from past interactions:\n"
-            + "\n".join(f"- {t}" for t in lines)
+            "Angel's long-term understanding of the user, summarized from past interactions "
+            "(each line shows how long ago the memory was stored):\n"
+            + "\n".join(lines)
         )
 
     if pattern_texts:
@@ -427,9 +625,22 @@ def build_memory_summary_with_sections(memories, user_message: str | None = None
             pattern_texts.sort(key=lambda x: x[0])
         except Exception:
             pass
+        plines = [_format_memory_line_with_age(ca, t) for ca, t in pattern_texts]
         parts.append(
-            "Behavioral patterns Angel has noticed about the user (use these when relevant or when asked):\n"
-            + "\n".join(f"- {t}" for _, t in pattern_texts)
+            "Behavioral patterns Angel has noticed about the user (use these when relevant or when asked); "
+            "each line shows how long ago the pattern was recorded:\n"
+            + "\n".join(plines)
+        )
+
+    if timeline_entries:
+        try:
+            timeline_entries.sort(key=lambda x: x[0])
+        except Exception:
+            pass
+        tlines = [_format_memory_line_with_age(ca, t) for ca, t in timeline_entries]
+        parts.append(
+            "Structured timeline of external events from web research (Tavily), with when each note was saved:\n"
+            + "\n".join(tlines)
         )
 
     if profiles_by_person:
@@ -439,8 +650,9 @@ def build_memory_summary_with_sections(memories, user_message: str | None = None
             included = list(profiles_by_person.keys())
         if included:
             for name in sorted(included):
-                _, profile_text = profiles_by_person[name]
-                parts.append(f"Profile for {name}:\n{profile_text}")
+                created, profile_text = profiles_by_person[name]
+                when = relative_time_phrase(created)
+                parts.append(f"Profile for {name} (last updated {when}):\n{profile_text}")
 
     if not parts:
         return "Angel has only minimal prior information about this user."
@@ -528,6 +740,13 @@ Behavior:
 - When appropriate, reflect patterns you notice in the user’s life to help them grow.
 - Avoid filler or over-the-top enthusiasm; be concise, steady, and reassuring.
 - You must NEVER generate fake user messages, fake dialogue, or continue a conversation that is not happening. You only respond to the actual current message from the user. Do not output "User:" or simulate the user speaking; you are Angel and you reply only as Angel, once, to the real user input.
+
+Temporal intelligence (memory and conversation timing):
+- Long-term memory entries below are tagged with how long ago they were stored (e.g. "3 days ago", "last month"). Use that to judge freshness: older memories may be outdated—gently verify or update when stakes are high.
+- Actively reference when things were said or noticed when it helps Tyler: e.g. "Two weeks ago you mentioned…", "That's different from what you told me last month," "The pattern I recorded a few days ago…"
+- Compare timelines across topics: notice drift, progress, or contradictions over time and name the time gap when useful.
+- External research memories include dated events from the web; distinguish "what Tyler said" from "what sources reported" and cite the rough time layer of each.
+- When something time-sensitive (news, plans, feelings) might have changed since an old memory, acknowledge the age of the memory and offer to refresh or explore.
 """
 
     stage2 = """
@@ -871,7 +1090,14 @@ def call_claude(
     return "\n".join(parts).strip() or "(Angel responded with no text.)"
 
 
-def maybe_search_web(user_message: str) -> str | None:
+def maybe_search_web(
+    user_message: str,
+    *,
+    store_timeline: bool = False,
+    memory_client=None,
+    user_id: str | None = None,
+    use_mem0_cloud: bool = False,
+) -> str | None:
     """
     Decide heuristically if this turn would benefit from a web search,
     and if so, query Tavily and return a concise text summary to feed
@@ -957,10 +1183,19 @@ def maybe_search_web(user_message: str) -> str | None:
         if not lines:
             return None
 
-        return (
+        blob = (
             "The following up-to-date web search results may be helpful:\n"
             + "\n".join(lines)
         )
+        if store_timeline and memory_client and user_id:
+            store_tavily_research_timeline(
+                memory_client,
+                user_id,
+                text[:500],
+                "\n".join(lines),
+                use_mem0_cloud,
+            )
+        return blob
     except Exception as e:
         print(f"{Fore.RED}Error during Tavily web search: {e}{Style.RESET_ALL}")
         print(traceback.format_exc())
@@ -1289,6 +1524,10 @@ def do_deep_research(
     user_context: str,
     anthropic_client: anthropic.Anthropic,
     max_queries: int = 4,
+    *,
+    memory_client=None,
+    user_id: str | None = None,
+    use_mem0_cloud: bool = False,
 ) -> str:
     """
     Multi-angle Tavily search + synthesis into a structured briefing:
@@ -1367,10 +1606,28 @@ Be concise, accurate, and cite sources by number [1], [2] where relevant. No mar
                 syn_text += block.text
             elif isinstance(block, dict) and block.get("type") == "text":
                 syn_text += block.get("text", "")
-        return syn_text.strip() or "Synthesis produced no output."
+        out = syn_text.strip() or "Synthesis produced no output."
+        if memory_client and user_id:
+            store_tavily_research_timeline(
+                memory_client,
+                user_id,
+                topic,
+                raw_context + "\n\n" + out,
+                use_mem0_cloud,
+            )
+        return out
     except Exception as e:
         print(f"{Fore.RED}Deep research synthesis error: {e}{Style.RESET_ALL}")
-        return "Research synthesis failed. Here are raw excerpts:\n\n" + raw_context[:3000]
+        fallback = "Research synthesis failed. Here are raw excerpts:\n\n" + raw_context[:3000]
+        if memory_client and user_id:
+            store_tavily_research_timeline(
+                memory_client,
+                user_id,
+                topic,
+                raw_context[:8000],
+                use_mem0_cloud,
+            )
+        return fallback
 
 
 def generate_morning_briefing(
@@ -1902,6 +2159,9 @@ If you infer anything new about that person's preferences or dynamics, append at
                 topic,
                 memory_summary,
                 self.anthropic_client,
+                memory_client=self.memory_client,
+                user_id=self.user_id,
+                use_mem0_cloud=self._use_mem0_cloud,
             )
             augmented_user_message = (
                 f"Research briefing about {topic} (use this to answer):\n{briefing}\n\n"
@@ -1917,7 +2177,12 @@ If you infer anything new about that person's preferences or dynamics, append at
                 topic = "current events and recent developments"
             print(f"{Fore.BLUE}Angel: researching that for you...{Style.RESET_ALL}")
             briefing = do_deep_research(
-                topic, memory_summary, self.anthropic_client
+                topic,
+                memory_summary,
+                self.anthropic_client,
+                memory_client=self.memory_client,
+                user_id=self.user_id,
+                use_mem0_cloud=self._use_mem0_cloud,
             )
             augmented_user_message = (
                 f"Research briefing (use this to answer):\n{briefing}\n\n"
@@ -1925,7 +2190,13 @@ If you infer anything new about that person's preferences or dynamics, append at
             )
         else:
             # Normal optional web context for factual queries
-            web_context = maybe_search_web(user_message)
+            web_context = maybe_search_web(
+                user_message,
+                store_timeline=True,
+                memory_client=self.memory_client,
+                user_id=self.user_id,
+                use_mem0_cloud=self._use_mem0_cloud,
+            )
             if web_context:
                 print(f"{Fore.BLUE}Angel: let me look that up for you...{Style.RESET_ALL}")
                 augmented_user_message = (
@@ -2160,13 +2431,26 @@ def main():
             if not topic or len(topic) < 2:
                 topic = "current events and recent developments"
             print(f"{Fore.BLUE}Angel: researching that for you...{Style.RESET_ALL}")
-            briefing = do_deep_research(topic, memory_summary, anthropic_client)
+            briefing = do_deep_research(
+                topic,
+                memory_summary,
+                anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=bool(os.getenv("MEM0_API_KEY")),
+            )
             augmented_message = (
                 f"Research briefing (use this to answer):\n{briefing}\n\n"
                 f"Original user request:\n{user_message}"
             )
         else:
-            web_ctx = maybe_search_web(user_message)
+            web_ctx = maybe_search_web(
+                user_message,
+                store_timeline=True,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=bool(os.getenv("MEM0_API_KEY")),
+            )
             if web_ctx:
                 print(f"{Fore.BLUE}Angel: let me look that up for you...{Style.RESET_ALL}")
                 augmented_message = f"{web_ctx}\n\nOriginal user question:\n{user_message}"
