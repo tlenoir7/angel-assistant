@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import time
@@ -8,6 +9,7 @@ from datetime import datetime
 
 import requests
 from flask import Flask, Response, jsonify, render_template_string, request
+from flask_socketio import SocketIO, emit
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
@@ -25,6 +27,7 @@ from angel import (
     summarize_briefing_for_history,
     add_structured_memory,
     CATEGORY_BRIEFING_HISTORY,
+    strip_markdown,
 )
 
 # Module-level storage for morning briefing and check-in
@@ -34,6 +37,11 @@ check_in_message = None
 check_in_generated_at = None
 last_activity_at = time.time()
 angel = None
+
+# Flask-SocketIO (initialized in create_app; eventlet worker required in production — see Procfile)
+socketio: SocketIO | None = None
+# sid -> {"device": str, "turns": list[tuple[str, str]]} for multi-turn Claude context
+SOCKET_SESSIONS: dict[str, dict] = {}
 
 # Expo push: in-memory + push_tokens.json (same directory as this module)
 PUSH_TOKENS_PATH = Path(__file__).resolve().parent / "push_tokens.json"
@@ -276,8 +284,9 @@ def _run_check_in_job():
 
 
 def create_app() -> Flask:
-    global angel
+    global angel, socketio
     app = Flask(__name__)
+    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "angel-dev-secret-set-in-production")
 
     user_id = os.getenv("ANGEL_USER_ID", "railway-user")
     angel = AngelCore(user_id=user_id, use_voice=True)
@@ -324,6 +333,129 @@ def create_app() -> Flask:
     )
     scheduler.add_job(_run_check_in_job, "interval", minutes=15)
     scheduler.start()
+
+    # --- WebSocket (Socket.IO) for persistent iOS / low-latency clients ---
+    async_mode = os.getenv("SOCKETIO_ASYNC_MODE", "eventlet")
+    socketio = SocketIO(
+        app,
+        cors_allowed_origins=os.getenv("SOCKETIO_CORS", "*"),
+        async_mode=async_mode,
+        logger=os.getenv("SOCKETIO_DEBUG", "").lower() in ("1", "true", "yes"),
+        engineio_logger=os.getenv("SOCKETIO_DEBUG", "").lower() in ("1", "true", "yes"),
+    )
+
+    @socketio.on("connect")
+    def _ws_connect(auth):
+        global last_activity_at
+        last_activity_at = time.time()
+        device = "ios"
+        if isinstance(auth, dict):
+            d = (auth.get("device") or "").strip().lower()
+            if d in _VALID_CLIENT_DEVICES:
+                device = d
+        qd = (request.args.get("device") or "").strip().lower()
+        if qd in _VALID_CLIENT_DEVICES:
+            device = qd
+        sid = request.sid
+        SOCKET_SESSIONS[sid] = {"device": device, "turns": []}
+        print(f"[socket] connect sid={sid!s} device={device}", flush=True)
+
+    @socketio.on("disconnect")
+    def _ws_disconnect():
+        SOCKET_SESSIONS.pop(request.sid, None)
+
+    def _session_turns_for(sid: str) -> list[tuple[str, str]]:
+        sess = SOCKET_SESSIONS.get(sid)
+        if not sess:
+            return []
+        return list(sess.get("turns") or [])
+
+    def _append_turn(sid: str, user_text: str, assistant_text: str) -> None:
+        sess = SOCKET_SESSIONS.get(sid)
+        if not sess:
+            return
+        turns: list = sess["turns"]
+        turns.append((user_text, assistant_text))
+        while len(turns) > 25:
+            turns.pop(0)
+
+    @socketio.on("user_text")
+    def _ws_user_text(data):
+        global last_activity_at, check_in_message, check_in_generated_at
+        last_activity_at = time.time()
+        check_in_message = None
+        check_in_generated_at = None
+        sid = request.sid
+        sess = SOCKET_SESSIONS.get(sid)
+        if not sess:
+            emit("angel_error", {"message": "No session; reconnect."})
+            return
+        payload = data if isinstance(data, dict) else {}
+        text = (payload.get("message") or payload.get("text") or "").strip()
+        if not text:
+            emit("angel_error", {"message": "Empty message."})
+            return
+        emit("angel_thinking", {})
+        try:
+            turns = _session_turns_for(sid)
+            reply = angel.generate_reply(
+                text,
+                device=sess["device"],
+                session_turns=turns or None,
+            )
+            clean_a = strip_markdown(reply) if angel.use_voice else reply
+            _append_turn(sid, text, clean_a)
+            emit("angel_response", {"reply": _sanitize_text(reply)})
+        except Exception as e:
+            traceback.print_exc()
+            emit("angel_error", {"message": str(e)})
+
+    @socketio.on("user_audio")
+    def _ws_user_audio(data):
+        global last_activity_at, check_in_message, check_in_generated_at
+        last_activity_at = time.time()
+        check_in_message = None
+        check_in_generated_at = None
+        sid = request.sid
+        sess = SOCKET_SESSIONS.get(sid)
+        if not sess:
+            emit("angel_error", {"message": "No session; reconnect."})
+            return
+        payload = data if isinstance(data, dict) else {}
+        b64 = payload.get("audio_base64") or payload.get("audio") or ""
+        if not b64:
+            emit("angel_error", {"message": "Missing audio_base64."})
+            return
+        emit("angel_thinking", {})
+        try:
+            raw = base64.b64decode(b64)
+        except Exception as e:
+            emit("angel_error", {"message": f"Invalid base64 audio: {e}"})
+            return
+        filename = (payload.get("filename") or "recording.m4a").strip() or "recording.m4a"
+        try:
+            transcript = transcribe_with_whisper(raw, filename=filename).strip()
+        except Exception as e:
+            traceback.print_exc()
+            emit("angel_error", {"message": f"Transcription failed: {e}"})
+            return
+        emit("angel_transcript", {"transcript": _sanitize_text(transcript)})
+        if not transcript:
+            emit("angel_response", {"reply": "I couldn't make out what you said."})
+            return
+        try:
+            turns = _session_turns_for(sid)
+            reply = angel.generate_reply(
+                transcript,
+                device=sess["device"],
+                session_turns=turns or None,
+            )
+            clean_a = strip_markdown(reply) if angel.use_voice else reply
+            _append_turn(sid, transcript, clean_a)
+            emit("angel_response", {"reply": _sanitize_text(reply)})
+        except Exception as e:
+            traceback.print_exc()
+            emit("angel_error", {"message": str(e)})
 
     INDEX_HTML = """
     <!doctype html>
@@ -965,6 +1097,10 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    # For local testing; Railway will use the Procfile/gunicorn command.
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=False)
+    # Local dev: Socket.IO + Flask (use eventlet async mode to match production).
+    port = int(os.getenv("PORT", "8000"))
+    if socketio is not None:
+        socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
+    else:
+        app.run(host="0.0.0.0", port=port, debug=False)
 

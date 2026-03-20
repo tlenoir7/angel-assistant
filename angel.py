@@ -1339,22 +1339,31 @@ def call_claude(
     system_prompt: str,
     user_message: str,
     model: str = "claude-sonnet-4-5",
+    *,
+    prior_turns: list[tuple[str, str]] | None = None,
 ) -> str:
     """
     Call Claude with the Angel persona, returning plain text.
+    ``prior_turns`` is optional (user_text, assistant_text) pairs from the current
+    session, in order, inserted before the final user message for multi-turn context.
     """
+    messages: list[dict] = []
+    if prior_turns:
+        for u, a in prior_turns[-20:]:
+            u = (u or "").strip()
+            a = (a or "").strip()
+            if not u:
+                continue
+            messages.append({"role": "user", "content": u})
+            messages.append({"role": "assistant", "content": a if a else "."})
+    messages.append({"role": "user", "content": user_message})
     try:
         response = client.messages.create(
             model=model,
             max_tokens=2048,
             temperature=0.5,
             system=system_prompt,
-            messages=[
-                {
-                    "role": "user",
-                    "content": user_message,
-                }
-            ],
+            messages=messages,
         )
     except Exception as e:
         return f"(Angel encountered an error talking to Claude: {e})"
@@ -2152,7 +2161,7 @@ def _record_microphone(duration_seconds: int = 8, rate: int = 16000) -> bytes:
     return buffer.getvalue()
 
 
-def transcribe_with_whisper(audio_wav_bytes: bytes) -> str:
+def transcribe_with_whisper(audio_wav_bytes: bytes, filename: str = "speech.wav") -> str:
     """
     Transcribe audio using a local faster-whisper model if available,
     falling back to the OpenAI Whisper API if not.
@@ -2163,8 +2172,21 @@ def transcribe_with_whisper(audio_wav_bytes: bytes) -> str:
     api_key = get_env_var("OPENAI_API_KEY")
     url = "https://api.openai.com/v1/audio/transcriptions"
 
+    fname = (filename or "speech.wav").strip() or "speech.wav"
+    if "." not in fname:
+        fname = fname + ".wav"
+    ext = fname.lower().rsplit(".", 1)[-1]
+    mime = {
+        "wav": "audio/wav",
+        "webm": "audio/webm",
+        "mp3": "audio/mpeg",
+        "m4a": "audio/mp4",
+        "mp4": "audio/mp4",
+        "ogg": "audio/ogg",
+        "flac": "audio/flac",
+    }.get(ext, "application/octet-stream")
     files = {
-        "file": ("speech.wav", audio_wav_bytes, "audio/wav"),
+        "file": (fname, audio_wav_bytes, mime),
     }
     data = {
         "model": "whisper-1",
@@ -2339,7 +2361,13 @@ class AngelCore:
             print(traceback.format_exc())
         return summarize_memories_for_prompt(memories)
 
-    def generate_reply(self, user_message: str, device: str | None = None) -> str:
+    def generate_reply(
+        self,
+        user_message: str,
+        device: str | None = None,
+        *,
+        session_turns: list[tuple[str, str]] | None = None,
+    ) -> str:
         merged_memories = self._fetch_combined_memories()
         memory_summary = build_memory_summary_with_sections(merged_memories, user_message)
 
@@ -2536,7 +2564,11 @@ If you infer anything new about that person's preferences or dynamics, append at
 
         model = "claude-haiku-4-5" if self.use_voice else "claude-sonnet-4-5"
         reply = call_claude(
-            self.anthropic_client, system_prompt, augmented_user_message, model=model
+            self.anthropic_client,
+            system_prompt,
+            augmented_user_message,
+            model=model,
+            prior_turns=session_turns,
         )
 
         # Parse and store Stage 2 outputs; strip from reply
