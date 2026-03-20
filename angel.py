@@ -471,11 +471,13 @@ def build_system_prompt(
     pattern_hint: bool = False,
     profile_hint: bool = False,
     computer_control_enabled: bool = False,
+    device: str | None = None,
 ) -> str:
     """
     Persona + behavioral instructions + memory context.
     When voice_mode is True, optimize for conversational spoken responses.
     Stage 2 hints add explicit instructions for strategy, patterns, or profile.
+    device: 'desktop' (Windows GUI), 'ios' (iPhone app), 'mobile_web' (browser), or None to omit device context.
     Injects current date/time/timezone so Angel is always time-aware.
     """
     date_time_str = get_current_datetime_str()
@@ -554,6 +556,31 @@ Computer control (this environment only):
 - In this environment you CAN directly control Tyler's computer using dedicated tools (mouse movement and clicks, typing, key presses, scrolling, screenshots, and basic window interactions).
 - When Tyler asks you to do something on his computer (for example: open, click, type, close, minimize, maximize, or otherwise manipulate apps/windows), you should use your computer control tools instead of telling him you cannot do computer tasks.
 - However, you must still follow the explicit confirmation flow defined outside this prompt: describe what you intend to do, wait for Tyler to confirm, and only then perform the actions.
+"""
+
+    if device == "desktop":
+        persona += """
+
+Current device context — Tyler is on the DESKTOP Angel app (Windows GUI):
+- Full capabilities apply, including computer control when it is enabled in settings.
+- Longer, more detailed answers are fine when they help; you can use structure (short paragraphs) when useful.
+- Tyler has a keyboard, mouse, and large screen—references to "on this machine" or local files/apps are appropriate.
+"""
+    elif device == "ios":
+        persona += """
+
+Current device context — Tyler is on the iOS (iPhone) app:
+- Assume a small screen, touch UI, and intermittent attention; keep replies concise and conversational.
+- Do not offer or assume computer control of Tyler's PC; that is not available from this device. If he needs desktop actions, suggest he use the desktop app or ask when he is back at his computer.
+- Prefer short paragraphs; avoid long lists unless he asks for detail.
+"""
+    elif device == "mobile_web":
+        persona += """
+
+Current device context — Tyler is on the MOBILE WEB interface (browser):
+- Optimize for text: clear, scannable answers; avoid walls of text unless he asks for depth.
+- Do not offer or assume Windows computer control from this context.
+- Shorter paragraphs and plain language work best on a phone browser.
 """
 
     if voice_mode:
@@ -1724,7 +1751,7 @@ class AngelCore:
             print(traceback.format_exc())
         return summarize_memories_for_prompt(memories)
 
-    def generate_reply(self, user_message: str) -> str:
+    def generate_reply(self, user_message: str, device: str | None = None) -> str:
         merged_memories = self._fetch_combined_memories()
         memory_summary = build_memory_summary_with_sections(merged_memories, user_message)
 
@@ -1738,13 +1765,24 @@ class AngelCore:
         profile_hint = profile_requested
         research_requested = detect_research_request(user_message)
 
+        cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
+        if device in ("ios", "mobile_web"):
+            cc_for_prompt = False
+
         system_prompt = build_system_prompt(
             memory_summary,
             voice_mode=self.use_voice,
             strategy_hint=strategy_hint,
             pattern_hint=pattern_hint,
             profile_hint=profile_hint,
-            computer_control_enabled=self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE,
+            computer_control_enabled=cc_for_prompt,
+            device=device,
+        )
+
+        cc_runtime = (
+            self.computer_control_enabled
+            and COMPUTER_CONTROL_AVAILABLE
+            and device not in ("ios", "mobile_web")
         )
 
         # Safety confirmation flow for computer control:
@@ -1752,7 +1790,7 @@ class AngelCore:
         #   for confirmation describing the intended action.
         # - Only after Tyler explicitly confirms do we execute via the
         #   Anthropic computer use API in angel_computer.run_computer_use_session.
-        if self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE and self._pending_computer_request:
+        if cc_runtime and self._pending_computer_request:
             # If there is a pending request, treat simple confirmations as approval.
             lower = (user_message or "").strip().lower()
             if lower in {"yes", "yep", "yeah", "sure", "ok", "okay", "go ahead", "do it", "please do", "confirm"}:
@@ -1768,7 +1806,7 @@ class AngelCore:
             # Any non-affirmative follow-up clears the pending request.
             self._pending_computer_request = None
 
-        if self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE and computer_intent and not self._pending_computer_request:
+        if cc_runtime and computer_intent and not self._pending_computer_request:
             # Store the original natural-language request and ask for confirmation.
             self._pending_computer_request = user_message
             return (
@@ -2109,6 +2147,7 @@ def main():
             pattern_hint=pattern_hint,
             profile_hint=profile_hint,
             computer_control_enabled=False,
+            device="desktop",
         )
 
         augmented_message = user_message

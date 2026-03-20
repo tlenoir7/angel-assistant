@@ -65,6 +65,8 @@ class AngelApp:
         self.computer_control_enabled = False
 
         self.core = AngelCore(user_id=user_id, use_voice=True, allow_computer_control=self.computer_control_enabled)
+        # Client identity for prompts and generate_reply (desktop Windows GUI)
+        self.client_device = "desktop"
 
         # Conversation and audio state
         self.listening = False  # used for manual override
@@ -105,6 +107,7 @@ class AngelApp:
                     memory_summary,
                     voice_mode=True,
                     computer_control_enabled=self.computer_control_enabled,
+                    device=self.client_device,
                 )
                 self.realtime_session.connect(system_prompt)
             except Exception as e:
@@ -311,7 +314,7 @@ class AngelApp:
         self.set_status("Status: Thinking...")
 
         def do_reply():
-            reply = self.core.generate_reply(msg)
+            reply = self.core.generate_reply(msg, device=self.client_device)
             self.root.after(0, self.append_message, "Angel", reply)
             if self.voice_output_enabled:
                 self.root.after(0, self.set_status, "Status: Angel is speaking...")
@@ -395,7 +398,7 @@ class AngelApp:
                 return
             self.root.after(0, self.set_status, "Status: Thinking (heard you)...")
             if detect_complex_voice_request(transcript):
-                reply = self.core.generate_reply(transcript)
+                reply = self.core.generate_reply(transcript, device=self.client_device)
                 if gen_id != self.current_generation:
                     return
                 self.root.after(0, self.append_message, "You", transcript)
@@ -408,7 +411,7 @@ class AngelApp:
                     else:
                         speak_with_elevenlabs(reply)
             else:
-                reply = self.core.generate_reply(transcript)
+                reply = self.core.generate_reply(transcript, device=self.client_device)
                 if gen_id != self.current_generation:
                     return
                 self.root.after(0, self.append_message, "You", transcript)
@@ -428,6 +431,7 @@ class AngelApp:
                 memory_summary,
                 voice_mode=True,
                 computer_control_enabled=self.computer_control_enabled,
+                device=self.client_device,
             )
             if self.realtime_session is not None:
                 try:

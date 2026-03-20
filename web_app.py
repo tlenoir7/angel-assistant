@@ -27,6 +27,29 @@ last_activity_at = time.time()
 angel = None
 
 
+_VALID_CLIENT_DEVICES = frozenset({"ios", "desktop", "mobile_web"})
+
+
+def _request_device() -> str:
+    """
+    Identify client: ios (native app), desktop (Windows GUI), mobile_web (browser).
+    Prefer X-Angel-Device or Device header, then JSON body or form field 'device'.
+    Defaults to mobile_web when unset (hosted web UI).
+    """
+    for key in ("X-Angel-Device", "Device"):
+        v = (request.headers.get(key) or "").strip().lower()
+        if v in _VALID_CLIENT_DEVICES:
+            return v
+    data = request.get_json(silent=True) or {}
+    v = (data.get("device") or "").strip().lower()
+    if v in _VALID_CLIENT_DEVICES:
+        return v
+    v = (request.form.get("device") or "").strip().lower()
+    if v in _VALID_CLIENT_DEVICES:
+        return v
+    return "mobile_web"
+
+
 def _sanitize_text(s: str) -> str:
     """
     Strip/replace any invalid Unicode (including surrogate characters)
@@ -418,7 +441,7 @@ def create_app() -> Flask:
             const resp = await fetch("/api/message", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: msg }),
+              body: JSON.stringify({ message: msg, device: "mobile_web" }),
             });
             const data = await resp.json().catch(function() { return {}; });
             if (!resp.ok) {
@@ -476,6 +499,7 @@ def create_app() -> Flask:
               appendMessage("You", "(voice message)");
               const formData = new FormData();
               formData.append("audio", blob, "audio.webm");
+              formData.append("device", "mobile_web");
               try {
                 const resp = await fetch("/api/voice", {
                   method: "POST",
@@ -550,7 +574,8 @@ def create_app() -> Flask:
         message = (data.get("message") or "").strip()
         if not message:
             return jsonify({"error": "Empty message"}), 400
-        reply = angel.generate_reply(message)
+        device = _request_device()
+        reply = angel.generate_reply(message, device=device)
         reply = _sanitize_text(reply)
         return jsonify({"reply": reply})
 
@@ -571,7 +596,8 @@ def create_app() -> Flask:
         if not transcript:
             reply = "I couldn't clearly hear what you said."
             return jsonify({"transcript": "", "reply": reply})
-        reply = angel.generate_reply(transcript)
+        device = _request_device()
+        reply = angel.generate_reply(transcript, device=device)
         return jsonify(
             {
                 "transcript": _sanitize_text(transcript),
