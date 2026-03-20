@@ -18,6 +18,10 @@ from angel import (
     build_memory_summary_with_sections,
     run_memory_reflection,
     get_latest_reflection_text,
+    get_recent_briefing_history_for_prompt,
+    summarize_briefing_for_history,
+    add_structured_memory,
+    CATEGORY_BRIEFING_HISTORY,
 )
 
 # Module-level storage for morning briefing and check-in
@@ -72,6 +76,7 @@ def _run_morning_briefing_job():
             memories, None, omit_reflection_section=True
         )
         latest_reflection = get_latest_reflection_text(memories)
+        recent_briefing_history = get_recent_briefing_history_for_prompt(memories, days=7)
         tz = os.getenv("TIMEZONE", "America/Los_Angeles")
         morning_briefing = generate_morning_briefing(
             client,
@@ -79,9 +84,21 @@ def _run_morning_briefing_job():
             memory_summary,
             timezone=tz,
             latest_reflection=latest_reflection,
+            recent_briefing_history=recent_briefing_history or None,
         )
         briefing_generated_at = time.time()
         send_briefing_email(morning_briefing)
+        if morning_briefing and "Briefing unavailable" not in morning_briefing:
+            topics = summarize_briefing_for_history(client, morning_briefing)
+            if topics:
+                add_structured_memory(
+                    angel.memory_client,
+                    user_id,
+                    topics,
+                    CATEGORY_BRIEFING_HISTORY,
+                    person_name=None,
+                    use_mem0_cloud=angel._use_mem0_cloud,
+                )
     except Exception as e:
         traceback.print_exc()
         morning_briefing = f"Briefing unavailable: {e}"

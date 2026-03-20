@@ -38,6 +38,10 @@ from angel import (
     detect_complex_voice_request,
     generate_morning_briefing,
     get_latest_reflection_text,
+    get_recent_briefing_history_for_prompt,
+    summarize_briefing_for_history,
+    add_structured_memory,
+    CATEGORY_BRIEFING_HISTORY,
 )
 
 
@@ -814,6 +818,7 @@ def main():
                 memories, None, omit_reflection_section=True
             )
             latest_reflection = get_latest_reflection_text(memories)
+            recent_briefing_history = get_recent_briefing_history_for_prompt(memories, days=7)
             tz = os.getenv("TIMEZONE", "America/Los_Angeles")
             briefing = generate_morning_briefing(
                 app.core.anthropic_client,
@@ -821,7 +826,21 @@ def main():
                 memory_summary,
                 timezone=tz,
                 latest_reflection=latest_reflection,
+                recent_briefing_history=recent_briefing_history or None,
             )
+            if briefing and "Briefing unavailable" not in briefing:
+                topics = summarize_briefing_for_history(
+                    app.core.anthropic_client, briefing
+                )
+                if topics:
+                    add_structured_memory(
+                        app.core.memory_client,
+                        app.core.user_id,
+                        topics,
+                        CATEGORY_BRIEFING_HISTORY,
+                        person_name=None,
+                        use_mem0_cloud=app.core._use_mem0_cloud,
+                    )
             root.after(0, app.append_message, "Angel", "[Morning briefing]\n\n" + briefing)
             if app.voice_output_enabled:
                 root.after(0, app.set_status, "Status: Angel is speaking (briefing)...")

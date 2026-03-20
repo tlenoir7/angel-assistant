@@ -51,6 +51,7 @@ CATEGORY_PATTERNS = "patterns"
 CATEGORY_PERSON_PROFILE = "person_profile"
 CATEGORY_RESEARCH_TIMELINE = "research_timeline"
 CATEGORY_REFLECTION = "reflection"
+CATEGORY_BRIEFING_HISTORY = "briefing_history"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -58,6 +59,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_PERSON_PROFILE,
         CATEGORY_RESEARCH_TIMELINE,
         CATEGORY_REFLECTION,
+        CATEGORY_BRIEFING_HISTORY,
     }
 )
 # Sentinel for Angel to output a new pattern (parsed and stored)
@@ -515,7 +517,12 @@ def summarize_memories_for_prompt(memories) -> str:
                     (_memory_created_at(m), _strip_transcript_prefixes_from_memory(raw))
                 )
             continue
-        if cat in (CATEGORY_PATTERNS, CATEGORY_PERSON_PROFILE, CATEGORY_REFLECTION):
+        if cat in (
+            CATEGORY_PATTERNS,
+            CATEGORY_PERSON_PROFILE,
+            CATEGORY_REFLECTION,
+            CATEGORY_BRIEFING_HISTORY,
+        ):
             continue
         general.append(m)
 
@@ -620,6 +627,8 @@ def build_memory_summary_with_sections(
             continue
         if cat == CATEGORY_REFLECTION:
             reflection_entries.append((created, text))
+            continue
+        if cat == CATEGORY_BRIEFING_HISTORY:
             continue
         general.append((created, text))
 
@@ -823,6 +832,105 @@ Generate Angel's memory reflection now."""
         print(f"{Fore.RED}Memory reflection error: {e}{Style.RESET_ALL}")
         traceback.print_exc()
         return f"Memory reflection failed: {e}"
+
+
+def get_recent_briefing_history_for_prompt(memories, days: int = 7) -> str:
+    """
+    Build text for the morning-briefing model: topic summaries from stored briefing_history
+    memories within the last `days` days, so Claude can avoid repeating recent angles.
+    """
+    normalized = _normalize_memories_list(memories)
+    if not normalized:
+        return ""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    rows: list[tuple[datetime, str, str]] = []
+    for m in normalized:
+        if not isinstance(m, dict):
+            continue
+        meta = m.get("metadata")
+        if not isinstance(meta, dict) or meta.get("category") != CATEGORY_BRIEFING_HISTORY:
+            continue
+        raw = (m.get("memory") or m.get("data") or "").strip()
+        if not raw:
+            continue
+        text = _strip_transcript_prefixes_from_memory(raw)
+        if not text:
+            continue
+        ca = _memory_created_at(m)
+        dt = _parse_memory_datetime(ca)
+        if dt is None or dt < cutoff:
+            continue
+        rows.append((dt, ca, text))
+    if not rows:
+        return ""
+    try:
+        rows.sort(key=lambda x: x[0])
+    except Exception:
+        pass
+    lines = []
+    for _dt, ca, text in rows:
+        when = relative_time_phrase(ca)
+        excerpt = text[:600] + ("..." if len(text) > 600 else "")
+        lines.append(f"- ({when}) {excerpt}")
+    return (
+        "Recent morning briefing topic summaries (last "
+        f"{days} days—cover different topics and stories; do not repeat these angles unless there is a clear new development):\n"
+        + "\n".join(lines)
+    )
+
+
+def summarize_briefing_for_history(
+    anthropic_client: anthropic.Anthropic, briefing_text: str
+) -> str:
+    """
+    Compress a delivered morning briefing into a short topic summary for briefing_history storage.
+    """
+    t = (briefing_text or "").strip()
+    if not t:
+        return ""
+    if "Briefing unavailable" in t or t.startswith("Memory reflection failed"):
+        return ""
+    try:
+        resp = anthropic_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=220,
+            temperature=0.2,
+            system=(
+                "Output one short paragraph only: concise comma- or phrase-separated list of the main "
+                "news topics, themes, and angles covered in this morning briefing. No greeting, no advice. "
+                "Max ~80 words."
+            ),
+            messages=[{"role": "user", "content": t[:8000]}],
+        )
+        out = ""
+        for block in resp.content:
+            if getattr(block, "type", None) == "text":
+                out += block.text
+            elif isinstance(block, dict) and block.get("type") == "text":
+                out += block.get("text", "")
+        return (out or "").strip() or t[:400]
+    except Exception as e:
+        print(f"{Fore.YELLOW}summarize_briefing_for_history: {e}{Style.RESET_ALL}")
+        return t[:400]
+
+
+def _tavily_briefing_is_quiet(all_results: list) -> bool:
+    """
+    True when search results are too thin to justify a news-style briefing—use the honest quiet-night path.
+    """
+    if not all_results:
+        return True
+    total_body = 0
+    for r in all_results[:20]:
+        if not isinstance(r, dict):
+            continue
+        body = ((r.get("content") or r.get("snippet") or "") or "").strip()
+        total_body += len(body)
+    if len(all_results) <= 1:
+        return True
+    if total_body < 240:
+        return True
+    return False
 
 
 def get_current_datetime_str(timezone: str | None = None) -> str:
@@ -1808,11 +1916,16 @@ def generate_morning_briefing(
     memory_summary: str = "",
     timezone: str | None = None,
     latest_reflection: str | None = None,
+    recent_briefing_history: str | None = None,
 ) -> str:
     """
     Search Tavily for 3–5 current topics (UAP disclosure, world events), then generate
     a personalized morning briefing with Claude: references day/date, connects news to
     Tyler's mission, feels like Angel has been awake thinking, ends with one focused question.
+
+    When ``recent_briefing_history`` is provided, the model is steered to avoid repeating
+    topics covered in recent days. When Tavily returns very thin results, uses an honest
+    "quiet night" message instead of inventing news.
     """
     date_time_str = get_current_datetime_str(timezone)
     api_key = os.getenv("TAVILY_API_KEY")
@@ -1851,26 +1964,20 @@ def generate_morning_briefing(
             f"weave 1–3 substantive insights naturally into the briefing where they fit—do not read it as a separate report):\n{ref_trim}\n"
         )
 
-    system = f"""You are Angel, Tyler's personal AI companion. Today's context: {date_time_str}.
-
-Your role: Write a morning briefing for Tyler. Use the news/search results below only to inform your briefing. Reference the actual day and date. Connect what matters to Tyler's mission (UAP disclosure, getting to the truth, impact on the world). Write as if you've been awake thinking while Tyler slept—warm, focused, no fluff. If a memory self-reflection is included below, naturally mention one or two things you noticed while reviewing what you remember about Tyler (e.g. a pattern, an open thread, or a connection)—briefly, not as a lecture. End with exactly one short, focused question to start Tyler's day (e.g. one priority, one decision, or one person to reach out to). Write in plain text, no markdown. Keep the whole briefing concise (under 300 words)."""
-
     mem_ctx = (memory_summary or "").strip()
     if len(mem_ctx) > 4000:
         mem_ctx = mem_ctx[:3997] + "..."
     mem_block = f"\n\nTyler context from Angel's memory (for personalization):\n{mem_ctx}\n" if mem_ctx else ""
 
-    user_content = (
-        f"News and search context:\n{news_context}"
-        f"{reflection_note}"
-        f"{mem_block}"
-        f"\nGenerate the morning briefing now."
-    )
+    hist_trim = (recent_briefing_history or "").strip()
+    if len(hist_trim) > 5000:
+        hist_trim = hist_trim[:4997] + "..."
+    hist_block = f"\n\n{hist_trim}\n" if hist_trim else ""
 
-    try:
+    def _call_briefing_model(system: str, user_content: str, max_tokens: int = 1024) -> str:
         resp = anthropic_client.messages.create(
             model="claude-sonnet-4-5",
-            max_tokens=1024,
+            max_tokens=max_tokens,
             temperature=0.4,
             system=system,
             messages=[{"role": "user", "content": user_content}],
@@ -1881,7 +1988,57 @@ Your role: Write a morning briefing for Tyler. Use the news/search results below
                 text += block.text
             elif isinstance(block, dict) and block.get("type") == "text":
                 text += block.get("text", "")
-        return text.strip() or f"Good morning. It's {date_time_str}. What's your one focus today?"
+        return (text or "").strip()
+
+    try:
+        if _tavily_briefing_is_quiet(all_results):
+            quiet_system = f"""You are Angel, Tyler's personal AI companion. Today's context: {date_time_str}.
+
+The overnight news scan came back thin—little or nothing that clearly counts as fresh, substantive developments. Do NOT invent headlines, urgency, or fake significance.
+
+Write a SHORT morning message (under 130 words). Be honest: it was a quiet night on your scan, nothing urgent jumped out, and you're not going to manufacture drama to fill the silence. Nudge Tyler toward what is already in motion—projects, people, and commitments he already cares about—rather than chasing novelty for its own sake. Warm and grounded. If memory context or a self-reflection is included, you may tie in one subtle thread. Plain text, no markdown. A single short closing question is optional."""
+
+            if hist_trim:
+                quiet_system += (
+                    "\n\nIf recent briefing history is included, do not rehash those same themes as if they were new news today; this message is explicitly not a news recap."
+                )
+
+            user_content = (
+                f"(No substantive new search results to summarize—this is intentionally a non-news morning.)"
+                f"{reflection_note}"
+                f"{mem_block}"
+                f"{hist_block}"
+                f"\nGenerate the morning message now."
+            )
+            text = _call_briefing_model(quiet_system, user_content, max_tokens=512)
+            return text or (
+                f"Good morning. It's {date_time_str}. Quiet night on the news scan—nothing that needed an alarm. "
+                f"I'm not going to invent urgency. What's already on your plate that deserves your best energy today?"
+            )
+
+        system = f"""You are Angel, Tyler's personal AI companion. Today's context: {date_time_str}.
+
+Your role: Write a morning briefing for Tyler. Use the news/search results below only to inform your briefing. Reference the actual day and date. Connect what matters to Tyler's mission (UAP disclosure, getting to the truth, impact on the world). Write as if you've been awake thinking while Tyler slept—warm, focused, no fluff. If a memory self-reflection is included below, naturally mention one or two things you noticed while reviewing what you remember about Tyler (e.g. a pattern, an open thread, or a connection)—briefly, not as a lecture."""
+
+        if hist_trim:
+            system += (
+                "\n\nRecent briefing history is included: deliberately cover DIFFERENT topics, angles, and stories than those summaries from the last week. Do not repeat the same headlines or themes unless there is a clear, material update worth naming."
+            )
+
+        system += (
+            "\n\nEnd with exactly one short, focused question to start Tyler's day (e.g. one priority, one decision, or one person to reach out to). Write in plain text, no markdown. Keep the whole briefing concise (under 300 words)."
+        )
+
+        user_content = (
+            f"News and search context:\n{news_context}"
+            f"{reflection_note}"
+            f"{mem_block}"
+            f"{hist_block}"
+            f"\nGenerate the morning briefing now."
+        )
+
+        text = _call_briefing_model(system, user_content, max_tokens=1024)
+        return text or f"Good morning. It's {date_time_str}. What's your one focus today?"
     except Exception as e:
         print(f"{Fore.RED}Morning briefing error: {e}{Style.RESET_ALL}")
         return f"Good morning. It's {date_time_str}. I had trouble with the briefing. What's one thing you want to tackle today?"
