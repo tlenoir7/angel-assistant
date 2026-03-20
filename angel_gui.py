@@ -37,6 +37,7 @@ from angel import (
     play_mp3_bytes,
     detect_complex_voice_request,
     generate_morning_briefing,
+    get_latest_reflection_text,
 )
 
 
@@ -809,13 +810,17 @@ def main():
     def _desktop_briefing_job():
         try:
             memories = app.core._fetch_combined_memories()
-            memory_summary = build_memory_summary_with_sections(memories, None)
+            memory_summary = build_memory_summary_with_sections(
+                memories, None, omit_reflection_section=True
+            )
+            latest_reflection = get_latest_reflection_text(memories)
             tz = os.getenv("TIMEZONE", "America/Los_Angeles")
             briefing = generate_morning_briefing(
                 app.core.anthropic_client,
                 app.core.user_id,
                 memory_summary,
                 timezone=tz,
+                latest_reflection=latest_reflection,
             )
             root.after(0, app.append_message, "Angel", "[Morning briefing]\n\n" + briefing)
             if app.voice_output_enabled:

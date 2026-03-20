@@ -16,6 +16,8 @@ from angel import (
     send_briefing_email,
     create_anthropic_client,
     build_memory_summary_with_sections,
+    run_memory_reflection,
+    get_latest_reflection_text,
 )
 
 # Module-level storage for morning briefing and check-in
@@ -66,15 +68,41 @@ def _run_morning_briefing_job():
         user_id = os.getenv("ANGEL_USER_ID", "railway-user")
         client = create_anthropic_client()
         memories = angel._fetch_combined_memories()
-        memory_summary = build_memory_summary_with_sections(memories, None)
+        memory_summary = build_memory_summary_with_sections(
+            memories, None, omit_reflection_section=True
+        )
+        latest_reflection = get_latest_reflection_text(memories)
         tz = os.getenv("TIMEZONE", "America/Los_Angeles")
-        morning_briefing = generate_morning_briefing(client, user_id, memory_summary, timezone=tz)
+        morning_briefing = generate_morning_briefing(
+            client,
+            user_id,
+            memory_summary,
+            timezone=tz,
+            latest_reflection=latest_reflection,
+        )
         briefing_generated_at = time.time()
         send_briefing_email(morning_briefing)
     except Exception as e:
         traceback.print_exc()
         morning_briefing = f"Briefing unavailable: {e}"
         briefing_generated_at = time.time()
+
+
+def _run_weekly_reflection_job():
+    """Sunday 6 AM (TIMEZONE): Angel reviews stored memories and saves a reflection."""
+    try:
+        user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+        client = create_anthropic_client()
+        text = run_memory_reflection(
+            angel.memory_client,
+            user_id,
+            client,
+            use_mem0_cloud=angel._use_mem0_cloud,
+        )
+        print(f"[web_app] Weekly memory reflection completed: {len(text)} chars", flush=True)
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[web_app] Weekly memory reflection failed: {e}", flush=True)
 
 
 def _run_check_in_job():
@@ -144,8 +172,17 @@ def create_app() -> Flask:
         hour, minute = map(int, briefing_time.split(":")[:2])
     except Exception:
         hour, minute = 8, 0
+    sched_tz = os.getenv("TIMEZONE", "America/Los_Angeles").strip()
     scheduler = BackgroundScheduler()
     scheduler.add_job(_run_morning_briefing_job, "cron", hour=hour, minute=minute)
+    scheduler.add_job(
+        _run_weekly_reflection_job,
+        "cron",
+        day_of_week="sun",
+        hour=6,
+        minute=0,
+        timezone=sched_tz,
+    )
     scheduler.add_job(_run_check_in_job, "interval", minutes=15)
     scheduler.start()
 
@@ -624,6 +661,29 @@ def create_app() -> Flask:
                 "briefing": morning_briefing,
                 "generated_at": briefing_generated_at,
             })
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/reflect", methods=["GET"])
+    def api_reflect():
+        """Manual trigger: run memory reflection now and store as category 'reflection'."""
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            client = create_anthropic_client()
+            text = run_memory_reflection(
+                angel.memory_client,
+                user_id,
+                client,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(
+                {
+                    "status": "ok",
+                    "reflection": _sanitize_text(text),
+                    "chars": len(text),
+                }
+            )
         except Exception as e:
             traceback.print_exc()
             return jsonify({"status": "error", "error": str(e)}), 500

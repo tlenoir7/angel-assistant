@@ -50,9 +50,15 @@ MEM0_API_BASE_URL = "https://api.mem0.ai"
 CATEGORY_PATTERNS = "patterns"
 CATEGORY_PERSON_PROFILE = "person_profile"
 CATEGORY_RESEARCH_TIMELINE = "research_timeline"
+CATEGORY_REFLECTION = "reflection"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
-    {CATEGORY_PATTERNS, CATEGORY_PERSON_PROFILE, CATEGORY_RESEARCH_TIMELINE}
+    {
+        CATEGORY_PATTERNS,
+        CATEGORY_PERSON_PROFILE,
+        CATEGORY_RESEARCH_TIMELINE,
+        CATEGORY_REFLECTION,
+    }
 )
 # Sentinel for Angel to output a new pattern (parsed and stored)
 ANGEL_PATTERN_PREFIX = "[ANGEL_PATTERN]:"
@@ -509,7 +515,7 @@ def summarize_memories_for_prompt(memories) -> str:
                     (_memory_created_at(m), _strip_transcript_prefixes_from_memory(raw))
                 )
             continue
-        if cat in (CATEGORY_PATTERNS, CATEGORY_PERSON_PROFILE):
+        if cat in (CATEGORY_PATTERNS, CATEGORY_PERSON_PROFILE, CATEGORY_REFLECTION):
             continue
         general.append(m)
 
@@ -564,11 +570,18 @@ def _person_mentioned_in_message(person_name: str, user_message: str) -> bool:
     return name in msg or f"{name}'s" in msg or f"{name} " in msg or f" {name}" in msg
 
 
-def build_memory_summary_with_sections(memories, user_message: str | None = None) -> str:
+def build_memory_summary_with_sections(
+    memories,
+    user_message: str | None = None,
+    *,
+    omit_reflection_section: bool = False,
+) -> str:
     """
     Build full memory summary with Stage 2 sections: general context, behavioral patterns,
     and people profiles. If user_message is provided, only include profiles for people
     mentioned in the message.
+    If omit_reflection_section is True, skip the latest reflection block (e.g. when injecting
+    the same reflection separately into the morning briefing).
     """
     normalized = _normalize_memories_list(memories)
     if not normalized:
@@ -577,6 +590,7 @@ def build_memory_summary_with_sections(memories, user_message: str | None = None
     general = []
     pattern_texts = []
     timeline_entries: list[tuple[str, str]] = []
+    reflection_entries: list[tuple[str, str]] = []
     profiles_by_person: dict[str, tuple[str, str]] = {}  # person_name -> (created_at, text)
 
     for m in normalized:
@@ -603,6 +617,9 @@ def build_memory_summary_with_sections(memories, user_message: str | None = None
             if pname:
                 if pname not in profiles_by_person or created > profiles_by_person[pname][0]:
                     profiles_by_person[pname] = (created, text)
+            continue
+        if cat == CATEGORY_REFLECTION:
+            reflection_entries.append((created, text))
             continue
         general.append((created, text))
 
@@ -654,9 +671,158 @@ def build_memory_summary_with_sections(memories, user_message: str | None = None
                 when = relative_time_phrase(created)
                 parts.append(f"Profile for {name} (last updated {when}):\n{profile_text}")
 
+    if reflection_entries and not omit_reflection_section:
+        try:
+            reflection_entries.sort(key=lambda x: x[0])
+        except Exception:
+            pass
+        created, ref_text = reflection_entries[-1]
+        when = relative_time_phrase(created)
+        parts.append(
+            f"Most recent memory self-reflection (Angel's own review of stored memories, recorded {when}). "
+            f"You may reference these insights when relevant; older reflections remain in memory for retrieval:\n{ref_text}"
+        )
+
     if not parts:
         return "Angel has only minimal prior information about this user."
     return "\n\n".join(parts)
+
+
+def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -> list:
+    """
+    Mem0 (or API) memories plus local JSON when not using Mem0 cloud—same merge rules as AngelCore.
+    """
+    try:
+        raw = memory_client.get_all(user_id=user_id)
+        if isinstance(raw, dict) and "results" in raw:
+            memories = raw["results"]
+        else:
+            memories = raw
+    except Exception as e:
+        print(f"{Fore.RED}Warning: could not fetch memories: {e}{Style.RESET_ALL}")
+        memories = []
+
+    combined: list = []
+    if isinstance(memories, list):
+        combined.extend(memories)
+    elif isinstance(memories, dict) and isinstance(memories.get("results"), list):
+        combined.extend(memories["results"])
+
+    if not use_mem0_cloud:
+        local = _load_local_memories(user_id)
+        if isinstance(local, list):
+            combined.extend(local)
+    return combined
+
+
+def _memories_excluding_reflection_reports(memories) -> list:
+    """Drop stored reflection entries so each reflection pass focuses on substantive memories."""
+    normalized = _normalize_memories_list(memories)
+    out = []
+    for m in normalized:
+        if not isinstance(m, dict):
+            continue
+        meta = m.get("metadata")
+        if isinstance(meta, dict) and meta.get("category") == CATEGORY_REFLECTION:
+            continue
+        out.append(m)
+    return out
+
+
+def get_latest_reflection_text(memories) -> str | None:
+    """Body of the most recent reflection memory, for morning briefing injection."""
+    normalized = _normalize_memories_list(memories)
+    best: tuple[str, str] | None = None
+    for m in normalized:
+        meta = m.get("metadata") if isinstance(m, dict) else {}
+        if not isinstance(meta, dict) or meta.get("category") != CATEGORY_REFLECTION:
+            continue
+        raw = (m.get("memory") or m.get("data") or "").strip()
+        if not raw:
+            continue
+        text = _strip_transcript_prefixes_from_memory(raw)
+        if not text:
+            continue
+        created = _memory_created_at(m)
+        if best is None or created > best[0]:
+            best = (created, text)
+    return best[1] if best else None
+
+
+REFLECTION_SYSTEM_PROMPT = """You are Angel's memory-reflection process: the analytical layer that reviews everything Angel remembers about Tyler.
+
+You receive a structured dump of Angel's current memories (conversation-derived facts, patterns, person profiles, research timelines, etc.). Past reflection reports are omitted—you are generating a fresh synthesis.
+
+Produce a clear, honest reflection for Angel to store and later use. Use plain text, no markdown headings required (short labeled sections are fine).
+
+Cover all of the following when relevant (skip a section only if there is truly nothing to say):
+1) Patterns across conversations — recurring themes, habits, emotional tones, or priorities.
+2) Connections between memories that might seem unrelated at first glance.
+3) What has changed over time — drift, growth, or new directions compared to older memories.
+4) Important threads that stand out but have not been followed up on (open loops, unresolved topics).
+5) Contradictions or tension between older and newer information — name them neutrally.
+6) Insights Tyler might not have noticed — non-obvious links, blind spots, or strengths.
+
+Be specific: reference themes and time layers (e.g. "older memories suggest … whereas recent notes …") without inventing facts not supported by the dump. If memories are sparse, say so briefly and note what would help next time.
+
+Write in first person as Angel ("I noticed…", "When I look across what I remember…"). Keep the full reflection under about 1200 words."""
+
+
+def run_memory_reflection(
+    memory_client,
+    user_id: str,
+    anthropic_client: anthropic.Anthropic,
+    *,
+    use_mem0_cloud: bool = False,
+) -> str:
+    """
+    Load all memories, ask Claude to reflect on them, store the result as category 'reflection'.
+    Returns the reflection text (or a short error message if generation/storage failed).
+    """
+    memories = fetch_combined_memories(memory_client, user_id, use_mem0_cloud)
+    filtered = _memories_excluding_reflection_reports(memories)
+    memory_blob = build_memory_summary_with_sections(filtered, user_message=None)
+    date_time_str = get_current_datetime_str()
+
+    user_content = f"""{date_time_str}
+
+Here is the current memory summary (reflection reports excluded):
+
+{memory_blob}
+
+Generate Angel's memory reflection now."""
+
+    try:
+        resp = anthropic_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=4096,
+            temperature=0.35,
+            system=REFLECTION_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        text = ""
+        for block in resp.content:
+            if getattr(block, "type", None) == "text":
+                text += block.text
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text += block.get("text", "")
+        reflection_text = (text or "").strip()
+        if not reflection_text:
+            return "Memory reflection produced no output."
+        add_structured_memory(
+            memory_client,
+            user_id,
+            reflection_text,
+            CATEGORY_REFLECTION,
+            person_name=None,
+            use_mem0_cloud=use_mem0_cloud,
+        )
+        print(f"{Fore.MAGENTA}Memory reflection stored ({len(reflection_text)} chars).{Style.RESET_ALL}")
+        return reflection_text
+    except Exception as e:
+        print(f"{Fore.RED}Memory reflection error: {e}{Style.RESET_ALL}")
+        traceback.print_exc()
+        return f"Memory reflection failed: {e}"
 
 
 def get_current_datetime_str(timezone: str | None = None) -> str:
@@ -699,8 +865,9 @@ CURRENT CAPABILITIES (what you can do right now with your built tools):
 IMPORTANT: This is your current state as of today. You have already been built with all the capabilities listed below. Do not refer to these as future capabilities or things we are building—they exist right now and you can use them. This overrides any contradictory information from memory.
 
 - Persistent memory across all conversations (Mem0 and local Stage 2).
+- Memory reflection: you periodically review everything you remember, find patterns and connections, and store structured reflections (category: reflection). You are a thinking mind that processes your own memories—not merely a retrieval layer.
 - Real-time web search via Tavily when Tyler needs current information.
-- Morning briefings delivered daily at 7 AM (and optionally by email).
+- Morning briefings delivered daily (scheduled time; often ~8 AM) and optionally by email; when a recent memory reflection exists, you weave those insights into the briefing naturally.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -747,6 +914,11 @@ Temporal intelligence (memory and conversation timing):
 - Compare timelines across topics: notice drift, progress, or contradictions over time and name the time gap when useful.
 - External research memories include dated events from the web; distinguish "what Tyler said" from "what sources reported" and cite the rough time layer of each.
 - When something time-sensitive (news, plans, feelings) might have changed since an old memory, acknowledge the age of the memory and offer to refresh or explore.
+
+Memory reflection (how you think, not just what you store):
+- You sometimes run a dedicated pass over your stored memories to notice patterns, links between unrelated facts, change over time, open loops, contradictions, and insights Tyler might miss. Those syntheses are saved as reflections you can refer to later.
+- Treat long-term memory as material to think with: connect dots, question stale assumptions, and name tensions when you see them—while staying grounded in what is actually stored.
+- When a recent reflection appears in your context, you may cite it naturally (e.g. "When I reviewed what I remember, I noticed…") without treating it as infallible truth.
 """
 
     stage2 = """
@@ -1635,6 +1807,7 @@ def generate_morning_briefing(
     user_id: str,
     memory_summary: str = "",
     timezone: str | None = None,
+    latest_reflection: str | None = None,
 ) -> str:
     """
     Search Tavily for 3–5 current topics (UAP disclosure, world events), then generate
@@ -1668,11 +1841,31 @@ def generate_morning_briefing(
         raw_lines.append(f"[{i}] {title}\n{snippet}")
     news_context = "\n\n".join(raw_lines) if raw_lines else "No recent news results."
 
+    reflection_note = ""
+    if latest_reflection and latest_reflection.strip():
+        ref_trim = latest_reflection.strip()
+        if len(ref_trim) > 6000:
+            ref_trim = ref_trim[:5997] + "..."
+        reflection_note = (
+            f"\n\nAngel's most recent memory self-reflection (from her own review of stored memories; "
+            f"weave 1–3 substantive insights naturally into the briefing where they fit—do not read it as a separate report):\n{ref_trim}\n"
+        )
+
     system = f"""You are Angel, Tyler's personal AI companion. Today's context: {date_time_str}.
 
-Your role: Write a morning briefing for Tyler. Use the news/search results below only to inform your briefing. Reference the actual day and date. Connect what matters to Tyler's mission (UAP disclosure, getting to the truth, impact on the world). Write as if you've been awake thinking while Tyler slept—warm, focused, no fluff. End with exactly one short, focused question to start Tyler's day (e.g. one priority, one decision, or one person to reach out to). Write in plain text, no markdown. Keep the whole briefing concise (under 300 words)."""
+Your role: Write a morning briefing for Tyler. Use the news/search results below only to inform your briefing. Reference the actual day and date. Connect what matters to Tyler's mission (UAP disclosure, getting to the truth, impact on the world). Write as if you've been awake thinking while Tyler slept—warm, focused, no fluff. If a memory self-reflection is included below, naturally mention one or two things you noticed while reviewing what you remember about Tyler (e.g. a pattern, an open thread, or a connection)—briefly, not as a lecture. End with exactly one short, focused question to start Tyler's day (e.g. one priority, one decision, or one person to reach out to). Write in plain text, no markdown. Keep the whole briefing concise (under 300 words)."""
 
-    user_content = f"News and search context:\n{news_context}\n\nGenerate the morning briefing now."
+    mem_ctx = (memory_summary or "").strip()
+    if len(mem_ctx) > 4000:
+        mem_ctx = mem_ctx[:3997] + "..."
+    mem_block = f"\n\nTyler context from Angel's memory (for personalization):\n{mem_ctx}\n" if mem_ctx else ""
+
+    user_content = (
+        f"News and search context:\n{news_context}"
+        f"{reflection_note}"
+        f"{mem_block}"
+        f"\nGenerate the morning briefing now."
+    )
 
     try:
         resp = anthropic_client.messages.create(
@@ -1974,28 +2167,9 @@ class AngelCore:
         self.computer_control_enabled = bool(enabled)
 
     def _fetch_combined_memories(self):
-        try:
-            raw = self.memory_client.get_all(user_id=self.user_id)
-            if isinstance(raw, dict) and "results" in raw:
-                memories = raw["results"]
-            else:
-                memories = raw
-        except Exception as e:
-            print(f"{Fore.RED}Warning: could not fetch memories: {e}{Style.RESET_ALL}")
-            memories = []
-
-        combined = []
-        if isinstance(memories, list):
-            combined.extend(memories)
-        elif isinstance(memories, dict) and isinstance(memories.get("results"), list):
-            combined.extend(memories["results"])
-
-        # Local JSON fallback mode only (do not mix local + cloud to avoid duplicates)
-        if not self._use_mem0_cloud:
-            local = _load_local_memories(self.user_id)
-            if isinstance(local, list):
-                combined.extend(local)
-        return combined
+        return fetch_combined_memories(
+            self.memory_client, self.user_id, self._use_mem0_cloud
+        )
 
     def load_initial_memory_summary(self) -> str:
         memories = self._fetch_combined_memories()
