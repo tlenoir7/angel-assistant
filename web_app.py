@@ -1,9 +1,12 @@
+import json
 import os
 import time
 from io import BytesIO
+from pathlib import Path
 import traceback
 from datetime import datetime
 
+import requests
 from flask import Flask, Response, jsonify, render_template_string, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -31,6 +34,11 @@ check_in_message = None
 check_in_generated_at = None
 last_activity_at = time.time()
 angel = None
+
+# Expo push: in-memory + push_tokens.json (same directory as this module)
+PUSH_TOKENS_PATH = Path(__file__).resolve().parent / "push_tokens.json"
+EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+expo_push_tokens: list[str] = []
 
 
 _VALID_CLIENT_DEVICES = frozenset({"ios", "desktop", "mobile_web"})
@@ -66,6 +74,117 @@ def _sanitize_text(s: str) -> str:
     return s.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
 
 
+def _load_expo_push_tokens_from_disk() -> None:
+    """Populate module-level expo_push_tokens from push_tokens.json if present."""
+    global expo_push_tokens
+    try:
+        if not PUSH_TOKENS_PATH.is_file():
+            expo_push_tokens = []
+            return
+        raw = PUSH_TOKENS_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        tokens: list[str] = []
+        if isinstance(data, list):
+            tokens = [str(t).strip() for t in data if str(t).strip()]
+        elif isinstance(data, dict):
+            arr = data.get("tokens") or data.get("expo_push_tokens")
+            if isinstance(arr, list):
+                tokens = [str(t).strip() for t in arr if str(t).strip()]
+        # de-dupe, preserve order
+        seen = set()
+        out: list[str] = []
+        for t in tokens:
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+        expo_push_tokens = out
+        print(f"[web_app] Loaded {len(expo_push_tokens)} Expo push token(s) from disk.", flush=True)
+    except Exception as e:
+        print(f"[web_app] Could not load push_tokens.json: {e}", flush=True)
+        expo_push_tokens = []
+
+
+def _save_expo_push_tokens_to_disk() -> None:
+    """Persist expo_push_tokens to push_tokens.json."""
+    try:
+        payload = {"tokens": list(expo_push_tokens)}
+        PUSH_TOKENS_PATH.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"[web_app] Could not save push_tokens.json: {e}", flush=True)
+
+
+def register_expo_push_token(token: str) -> bool:
+    """Add token to module list and disk; returns True if token was new."""
+    global expo_push_tokens
+    t = (token or "").strip()
+    if not t:
+        return False
+    if t not in expo_push_tokens:
+        expo_push_tokens.append(t)
+        _save_expo_push_tokens_to_disk()
+        return True
+    return False
+
+
+def send_expo_push_notifications(
+    title: str,
+    body: str,
+    *,
+    tokens: list[str] | None = None,
+) -> dict:
+    """
+    POST to Expo push API. ``tokens`` defaults to module-level expo_push_tokens.
+    Returns a small result dict for logging / API responses.
+    """
+    use = tokens if tokens is not None else expo_push_tokens
+    use = [str(t).strip() for t in use if str(t).strip()]
+    if not use:
+        return {"ok": False, "error": "no_tokens", "status": None, "expo_response": None}
+
+    payload = [
+        {
+            "to": t,
+            "title": (title or "")[:200],
+            "body": (body or "")[:400],
+            "sound": "default",
+        }
+        for t in use
+    ]
+    try:
+        resp = requests.post(
+            EXPO_PUSH_URL,
+            json=payload,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+        text_preview = (resp.text or "")[:2000]
+        try:
+            expo_json = resp.json()
+        except Exception:
+            expo_json = None
+        ok = resp.status_code == 200
+        if not ok:
+            print(
+                f"[web_app] Expo push HTTP {resp.status_code}: {text_preview}",
+                flush=True,
+            )
+        return {
+            "ok": ok,
+            "status": resp.status_code,
+            "expo_response": expo_json,
+            "recipients": len(use),
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {"ok": False, "error": str(e), "status": None, "expo_response": None}
+
+
 def _run_morning_briefing_job():
     global morning_briefing, briefing_generated_at
     try:
@@ -89,6 +208,8 @@ def _run_morning_briefing_job():
         briefing_generated_at = time.time()
         send_briefing_email(morning_briefing)
         if morning_briefing and "Briefing unavailable" not in morning_briefing:
+            preview = _sanitize_text((morning_briefing or "")[:100])
+            send_expo_push_notifications("Angel Morning Briefing", preview)
             topics = summarize_briefing_for_history(client, morning_briefing)
             if topics:
                 add_structured_memory(
@@ -162,6 +283,7 @@ def create_app() -> Flask:
     angel = AngelCore(user_id=user_id, use_voice=True)
     # Warm up memories once on startup
     angel.load_initial_memory_summary()
+    _load_expo_push_tokens_from_disk()
 
     # Log briefing email env at startup for debugging
     tyler_email = (os.getenv("TYLER_EMAIL") or "").strip()
@@ -681,6 +803,47 @@ def create_app() -> Flask:
         except Exception as e:
             traceback.print_exc()
             return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/register_push_token", methods=["POST"])
+    def api_register_push_token():
+        """Register an Expo push token (JSON body: token or expoPushToken)."""
+        data = request.get_json(silent=True) or {}
+        token = (
+            data.get("token")
+            or data.get("expoPushToken")
+            or data.get("push_token")
+            or ""
+        )
+        token = str(token).strip()
+        if not token:
+            return jsonify({"status": "error", "error": "missing token"}), 400
+        is_new = register_expo_push_token(token)
+        return jsonify(
+            {
+                "status": "ok",
+                "registered": True,
+                "new_token": is_new,
+                "total_tokens": len(expo_push_tokens),
+            }
+        )
+
+    @app.route("/api/test_push", methods=["GET"])
+    def api_test_push():
+        """Send a test push immediately to all registered Expo tokens."""
+        if not expo_push_tokens:
+            return jsonify(
+                {
+                    "status": "error",
+                    "error": "no push tokens registered",
+                    "hint": "POST /api/register_push_token first",
+                }
+            ), 400
+        result = send_expo_push_notifications(
+            "Angel test",
+            "Push notifications are working.",
+        )
+        code = 200 if result.get("ok") else 502
+        return jsonify({"status": "ok" if result.get("ok") else "error", **result}), code
 
     @app.route("/api/reflect", methods=["GET"])
     def api_reflect():
