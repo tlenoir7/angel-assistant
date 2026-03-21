@@ -17,6 +17,7 @@ import angel_predictions
 import angel_proactive
 import angel_translation
 import angel_file_reading
+import angel_threat_actors
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -604,6 +605,34 @@ def _schedule_foreign_watch_seed() -> None:
         pass
 
 
+def _schedule_threat_actor_seed() -> None:
+    """Batcomputer: seed default Threat Actor (opposition) profiles if DB empty."""
+
+    def _job() -> None:
+        try:
+            time.sleep(36)
+        except Exception:
+            return
+        global angel
+        if angel is None:
+            return
+        try:
+            r = angel_threat_actors.ensure_threat_actor_seeds(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            print(f"[web_app] Threat actor seed: {r}", flush=True)
+        except Exception:
+            traceback.print_exc()
+
+    try:
+        threading.Thread(target=_job, daemon=True).start()
+    except Exception:
+        pass
+
+
 def _run_proactive_intelligence_job():
     """Every 4 hours: background Tavily monitoring for watch list (Item 16)."""
     global angel
@@ -676,6 +705,7 @@ def create_app() -> Flask:
     _schedule_predictions_initial_seed()
     _schedule_proactive_watch_seed()
     _schedule_foreign_watch_seed()
+    _schedule_threat_actor_seed()
     _load_expo_push_tokens_from_disk()
 
     # Log briefing email env at startup for debugging
@@ -1887,6 +1917,158 @@ def create_app() -> Flask:
                     "default_count": len(THREAT_WATCH_DEFAULT_CATEGORIES),
                 }
             )
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Threat Actor database (Batcomputer opposition network) ---
+
+    @app.route("/api/threat-actors", methods=["GET"])
+    def api_threat_actors_list():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            angel_threat_actors.maybe_ensure_threat_actor_seeds(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            tl = (request.args.get("threat_level") or "").strip().upper()
+            level = tl if tl in ("LOW", "MEDIUM", "HIGH", "CRITICAL") else None
+            rows = angel_threat_actors.list_threat_actors(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+                threat_level=level,
+            )
+            return jsonify({"ok": True, "actors": rows, "count": len(rows)})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/threat-actors/summary", methods=["GET"])
+    def api_threat_actors_summary():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            angel_threat_actors.maybe_ensure_threat_actor_seeds(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            s = angel_threat_actors.get_threat_actor_summary(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, **s})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/threat-actors/search", methods=["GET"])
+    def api_threat_actors_search():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        q = (request.args.get("q") or "").strip()
+        if not q:
+            return jsonify({"ok": False, "error": "Missing query parameter q"}), 400
+        try:
+            angel_threat_actors.maybe_ensure_threat_actor_seeds(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            rows = angel_threat_actors.search_threat_actors(
+                q,
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "actors": rows, "count": len(rows)})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/threat-actors/<path:actor_id>", methods=["GET"])
+    def api_threat_actors_get(actor_id):
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            angel_threat_actors.maybe_ensure_threat_actor_seeds(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            a = angel_threat_actors.get_threat_actor(
+                actor_id,
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+            )
+            if not a:
+                return jsonify({"ok": False, "error": "not found"}), 404
+            return jsonify({"ok": True, "actor": a})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/threat-actors/add", methods=["POST"])
+    def api_threat_actors_add():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "name required"}), 400
+        try:
+            actor = angel_threat_actors.add_threat_actor(
+                name,
+                str(data.get("actor_type") or "organization"),
+                str(data.get("role") or ""),
+                str(data.get("affiliation") or ""),
+                str(data.get("threat_type") or "unknown"),
+                str(data.get("threat_level") or "MEDIUM"),
+                data.get("known_actions") if isinstance(data.get("known_actions"), list) else [],
+                data.get("evidence") if isinstance(data.get("evidence"), list) else [],
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                files_cabinet=angel.files_cabinet,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                notes=str(data.get("notes") or ""),
+                status=str(data.get("status") or "active"),
+                actor_id=(data.get("actor_id") or "").strip() or None,
+                sync_network=bool(data.get("sync_network", True)),
+            )
+            return jsonify({"ok": True, "actor": actor})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/threat-actors/assess", methods=["POST"])
+    def api_threat_actors_assess():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "name required"}), 400
+        context = str(data.get("context") or "")
+        try:
+            r = angel_threat_actors.assess_new_threat_actor(
+                angel.anthropic_client,
+                name,
+                context,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                files_cabinet=angel.files_cabinet,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500

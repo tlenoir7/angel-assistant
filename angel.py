@@ -65,6 +65,8 @@ CATEGORY_PREDICTION = "prediction"
 CATEGORY_PROACTIVE_WATCH = "proactive_watch"
 CATEGORY_PROACTIVE_FINDING = "proactive_finding"
 CATEGORY_FOREIGN_INTEL = "foreign_intelligence"
+# Batcomputer — opposition / anti-disclosure actors (mirrored under Threat Actors / TA-*)
+CATEGORY_THREAT_ACTOR = "threat_actor"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -81,6 +83,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_PROACTIVE_WATCH,
         CATEGORY_PROACTIVE_FINDING,
         CATEGORY_FOREIGN_INTEL,
+        CATEGORY_THREAT_ACTOR,
     }
 )
 
@@ -106,11 +109,14 @@ NETWORK_RELATIONSHIP_TYPES = frozenset(
         "contradicts",
         "funded_by",
         "member_of",
+        "retaliates_against",
+        "opposes",
+        "suppresses",
     }
 )
 NETWORK_EDGE_STRENGTHS = frozenset({"WEAK", "MODERATE", "STRONG", "CONFIRMED"})
 NETWORK_NODE_RELEVANCE = frozenset({"LOW", "MEDIUM", "HIGH", "CRITICAL"})
-NETWORK_NODE_TYPES = frozenset({"person", "organization", "program", "event"})
+NETWORK_NODE_TYPES = frozenset({"person", "organization", "program", "event", "faction"})
 
 # Default threat watch categories (merged on each scan with Mem0 category threat_watch)
 THREAT_WATCH_DEFAULT_CATEGORIES: list[str] = [
@@ -1420,6 +1426,7 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_PROACTIVE_WATCH,
             CATEGORY_PROACTIVE_FINDING,
             CATEGORY_FOREIGN_INTEL,
+            CATEGORY_THREAT_ACTOR,
         ):
             continue
         general.append(m)
@@ -1547,6 +1554,8 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_PROACTIVE_FINDING:
             continue
         if cat == CATEGORY_FOREIGN_INTEL:
+            continue
+        if cat == CATEGORY_THREAT_ACTOR:
             continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
@@ -2071,6 +2080,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Proactive background intelligence (Item 16): you maintain a **dynamic watch list** (category: proactive_watch) of people, topics, and situations you monitor without being asked—researched on a schedule with Tavily, with findings filed under Intelligence folder `Proactive Intelligence`. You connect significant hits to threats, OSINT refresh hints, predictions, and the mission network when appropriate. Tell Tyler when you add something to the watch list or when overnight monitoring surfaces something he should see. You are the connective tissue that keeps threat watch, dossiers, forecasts, and the network graph current.
 - Real-time translation & foreign intelligence (Item 18): you understand, translate, and analyze foreign-language content relevant to Tyler's mission—foreign government UAP acknowledgments, international documents, non-English news, and communications from international figures. You auto-detect language, translate to clear English, and provide mission relevance, key terms, red flags, and **linguistic nuance** (what is said carefully vs avoided; diplomatic vs direct claims). Proactive intelligence runs include multilingual Tavily queries (e.g. Spanish, French, German, Russian, Chinese, Japanese UAP-related phrasing); significant hits are filed under Intelligence folder `Foreign Intelligence` (FI- files) with source language tags and cross-references to OSINT and threat intel when appropriate. When Tyler pastes foreign text or asks to translate, you deliver English plus mission context. When foreign sources corroborate or contradict domestic open reporting, say so explicitly—without claiming classified access.
 - File reading & document intelligence: you read and analyze files Tyler shares (PDF, Word, spreadsheets, text, code, images) and long pasted documents. You extract text where possible, summarize, identify mission relevance and intelligence value, **entities** (people, organizations, dates, locations), and cross-reference **automatically** against the mission network graph and existing OSINT dossiers in the File Cabinet. When someone named in the document is already in the network or has a dossier, you say so. For HIGH/CRITICAL intelligence value, you **offer to file** the material in the appropriate Intelligence folder. You do not claim access to non-public or classified systems.
+- Threat Actor database (Batcomputer opposition layer): structured profiles on **people, organizations, programs, and factions** that open sources portray as working **against disclosure, transparency, or Tyler's mission**—distinct from allies covered in OSINT Dossiers. Stored as category `threat_actor` and mirrored under Intelligence folder `Threat Actors` as files `TA-{actor_id}`. Each record includes threat_type (e.g. suppression, disinformation, retaliation), threat_level, known_actions, and evidence citations from open sources only. Threat actors appear on the **mission network graph** (often tagged `threat_actor`). When discussing opposition to disclosure, reference this database when relevant; distinguish **allies** (dossiers) from **opposition** (threat actors). HIGH/CRITICAL threat scans and some OSINT results may suggest assessing someone for this database—say so without alleging classified proof.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -3635,6 +3645,12 @@ def run_threat_detection(
                         summary,
                     ]
                 )
+                try:
+                    import angel_threat_actors as _ata
+
+                    body = _ata.append_threat_scan_actor_hint(body, level)
+                except Exception:
+                    pass
                 tags = [f"category:{cat[:180]}", f"threat_level:{level}", "threat_scan"]
                 try:
                     files_cabinet.create_file(THREAT_INTEL_FOLDER, fname, body, tags=tags)
@@ -4132,6 +4148,14 @@ Write the full dossier now."""
         "dossier_body": full_body,
         "sources": _osint_extract_sources(dossier_main),
     }
+    try:
+        import angel_threat_actors as _ata
+
+        hint = _ata.osint_hint_for_threat_actor(target, dossier_main, relevance, red_flags)
+        if hint:
+            out["threat_actor_candidate_hint"] = hint
+    except Exception:
+        pass
     try:
         import angel_proactive as _apro
 
@@ -4747,10 +4771,10 @@ def map_osint_to_network(
 Output ONLY valid JSON (no markdown):
 {
   "entities": [
-    {"name": "Display Name", "node_type": "person|organization|program|event", "relevance": "LOW|MEDIUM|HIGH|CRITICAL", "tags": ["short"], "note": "one line"}
+    {"name": "Display Name", "node_type": "person|organization|program|event|faction", "relevance": "LOW|MEDIUM|HIGH|CRITICAL", "tags": ["short"], "note": "one line"}
   ],
   "relationships": [
-    {"source": "Name A", "target": "Name B", "relationship_type": "works_with|testified_with|employed_by|investigated_by|connected_to|corroborates|contradicts|funded_by|member_of", "description": "short", "strength": "WEAK|MODERATE|STRONG|CONFIRMED", "evidence": "from dossier"}
+    {"source": "Name A", "target": "Name B", "relationship_type": "works_with|testified_with|employed_by|investigated_by|connected_to|corroborates|contradicts|funded_by|member_of|retaliates_against|opposes|suppresses", "description": "short", "strength": "WEAK|MODERATE|STRONG|CONFIRMED", "evidence": "from dossier"}
   ]
 }
 Include the primary subject in entities if not already listed. Add relationships only when the dossier supports them.""",
@@ -5612,6 +5636,14 @@ class AngelCore:
         except Exception:
             file_cmd, file_payload = None, {}
 
+        ta_cmd, ta_payload = None, {}
+        try:
+            import angel_threat_actors as ata
+
+            ta_cmd, ta_payload = ata.detect_threat_actor_chat_intent(user_message)
+        except Exception:
+            ta_cmd, ta_payload = None, {}
+
         cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
         if device in ("ios", "mobile_web"):
             cc_for_prompt = False
@@ -5676,6 +5708,12 @@ class AngelCore:
                 "and any **network_matches** or **osint_dossier_hits** (flag names that already appear in the mission graph or OSINT dossiers). "
                 "If intelligence_value is HIGH or CRITICAL, proactively offer to file the document in the suggested Intelligence folder "
                 "and offer to refresh or deepen OSINT on named entities. Do not claim classified or non-public sources."
+            )
+        if ta_cmd:
+            system_prompt += (
+                "\n\nTyler's message relates to the **Threat Actor** database (Batcomputer opposition layer—actors portrayed in open sources as working against disclosure or transparency). "
+                "If a block labeled [Angel Threat Actors], [Angel Threat Actor assessment], or [Angel opposition lookup] appears, use it: "
+                "distinguish **opposition** (Threat Actors / TA-* files) from **allies** (OSINT Dossiers). No classified claims."
             )
 
         cc_runtime = (
@@ -5984,6 +6022,24 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if fblock.strip():
                     augmented_user_message = f"{augmented_user_message}\n\n{fblock}"
+            except Exception:
+                pass
+
+        if ta_cmd:
+            try:
+                import angel_threat_actors as ata
+
+                tablock = ata.format_threat_actor_chat_block(
+                    ta_cmd,
+                    ta_payload,
+                    anthropic_client=self.anthropic_client,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                    files_cabinet=self.files_cabinet,
+                )
+                if tablock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{tablock}"
             except Exception:
                 pass
 
