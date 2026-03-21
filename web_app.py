@@ -21,6 +21,7 @@ import angel_threat_actors
 import angel_forensic
 import angel_surveillance
 import angel_environmental_map
+import angel_communication_patterns
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -527,6 +528,21 @@ def _run_morning_briefing_job():
         except Exception as e:
             print(f"[web_app] Environmental map briefing appendix: {e}", flush=True)
 
+        try:
+            comm_brief = angel_communication_patterns.format_communication_patterns_for_briefing(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            if (
+                comm_brief
+                and morning_briefing
+                and "Briefing unavailable" not in morning_briefing
+            ):
+                morning_briefing = (morning_briefing or "").rstrip() + "\n\n" + comm_brief
+        except Exception as e:
+            print(f"[web_app] Communication patterns briefing appendix: {e}", flush=True)
+
         briefing_generated_at = time.time()
         send_briefing_email(morning_briefing)
         if morning_briefing and "Briefing unavailable" not in morning_briefing:
@@ -750,6 +766,32 @@ def _schedule_environmental_map_seed() -> None:
         pass
 
 
+def _run_communication_patterns_job() -> None:
+    """Every 48h: open-source communication cadence / coordination analysis for watched figures."""
+
+    global angel
+    if angel is None:
+        return
+    try:
+        user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+        r = angel_communication_patterns.run_scheduled_analysis(
+            angel.anthropic_client,
+            angel.memory_client,
+            user_id,
+            angel.files_cabinet,
+            angel._use_mem0_cloud,
+        )
+        print(
+            f"[web_app] Communication patterns: ok={r.get('ok')} "
+            f"entities={len(r.get('entities_analyzed') or [])} "
+            f"coordination={len(r.get('coordination_signals') or [])}",
+            flush=True,
+        )
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[web_app] Communication patterns job failed: {e}", flush=True)
+
+
 def _run_proactive_intelligence_job():
     """Every 4 hours: background Tavily monitoring for watch list (Item 16)."""
     global angel
@@ -884,6 +926,7 @@ def create_app() -> Flask:
     scheduler.add_job(_run_check_in_job, "interval", minutes=15)
     scheduler.add_job(_run_threat_detection_job, "interval", hours=6)
     scheduler.add_job(_run_surveillance_job, "interval", hours=8)
+    scheduler.add_job(_run_communication_patterns_job, "interval", hours=48)
     scheduler.start()
 
     # --- WebSocket (Socket.IO) for persistent iOS / low-latency clients ---
@@ -3161,6 +3204,93 @@ def create_app() -> Flask:
             )
         except ValueError:
             return jsonify({"ok": False, "error": "invalid lat, lon, or radius"}), 400
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Communication pattern analysis (cadence / coordination) ---
+    @app.route("/api/comms/patterns", methods=["GET"])
+    def api_comms_patterns():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            rows = angel_communication_patterns.list_entity_patterns(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "patterns": rows})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/comms/run", methods=["GET"])
+    def api_comms_run():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            r = angel_communication_patterns.run_scheduled_analysis(
+                angel.anthropic_client,
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            code = 200 if r.get("ok") else 400
+            return jsonify(r), code
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/comms/entity/<path:name>", methods=["GET"])
+    def api_comms_entity(name):
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            p = angel_communication_patterns.get_pattern_for_entity_name(
+                name,
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            if not p:
+                return jsonify({"ok": False, "error": "not found"}), 404
+            return jsonify({"ok": True, "pattern": p})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/comms/anomalies", methods=["GET"])
+    def api_comms_anomalies():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            rows = angel_communication_patterns.list_current_anomalies(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "anomalies": rows})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/comms/coordination", methods=["GET"])
+    def api_comms_coordination():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            rows = angel_communication_patterns.list_coordination_signals(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "coordination_signals": rows})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500

@@ -71,6 +71,8 @@ CATEGORY_THREAT_ACTOR = "threat_actor"
 CATEGORY_SURVEILLANCE_INTEL = "surveillance_intelligence"
 # Batcomputer — environmental / mission geography map
 CATEGORY_ENV_LOCATION = "env_location"
+# Batcomputer — communication pattern / cadence analysis (when/how public figures communicate)
+CATEGORY_COMM_PATTERN = "comm_pattern"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -90,6 +92,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_THREAT_ACTOR,
         CATEGORY_SURVEILLANCE_INTEL,
         CATEGORY_ENV_LOCATION,
+        CATEGORY_COMM_PATTERN,
     }
 )
 
@@ -1435,6 +1438,7 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_THREAT_ACTOR,
             CATEGORY_SURVEILLANCE_INTEL,
             CATEGORY_ENV_LOCATION,
+            CATEGORY_COMM_PATTERN,
         ):
             continue
         general.append(m)
@@ -1568,6 +1572,8 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_SURVEILLANCE_INTEL:
             continue
         if cat == CATEGORY_ENV_LOCATION:
+            continue
+        if cat == CATEGORY_COMM_PATTERN:
             continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
@@ -2096,6 +2102,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Forensic visual analysis (Batcomputer): you perform **multi-layer** assessment of images Tyler shares—content, **authenticity / manipulation** (including AI-generation cues), intelligence extraction (OCR-style text, markings, equipment), and **mission relevance** (UAP, network entities). Outputs can be filed automatically under Intelligence folder `Forensic Analysis` as `FA-*` when intelligence value is HIGH/CRITICAL; UNKNOWN/ANOMALOUS UAP assessments may cross-reference folder `UAP Incidents`. Use POST `/api/forensic/analyze`, `/api/forensic/uap`, or `/api/forensic/document` for structured JSON (iOS can use these instead of `/api/vision` when Tyler wants forensic mode). Apply forensic skepticism to leaked UAP photos and document screenshots; never claim digital forensics lab certification—be clear about limits.
 - Open-source surveillance monitoring (Batcomputer): you run **scheduled multi-category** scans over **legal public** sources (Tavily news/search) — aerial, ground, maritime, public records, anomalous events, social signals — evaluate signals as NOISE / WEAK / MODERATE / STRONG; **STRONG** findings file to Intelligence folder `Surveillance Intelligence` as `SI-*`; **correlated** cluster signals (multiple categories reinforcing same geography/timeframe) are flagged **HIGH** priority. Cross-check themes against **Threat Intelligence** when possible; **active predictions** may be noted when aligned. Surveillance summaries appear in the **morning briefing**; manual run via GET `/api/surveillance/run`. This is not classified collection or illegal surveillance.
 - **Environmental map** (Batcomputer geography layer): mission-relevant physical locations — UAP hotspots, installations, restricted airspace, incident sites, facilities, and person-associated places — are stored as structured memories (category `env_location`) and mirrored under Intelligence folder `Environmental Map` as files `LOC-{location_id}`. The map is **excluded from routine memory digests** but you should **reference it naturally** when geography, incidents, programs, or travel matter. Open-source surveillance runs **cross-reference** headlines/summaries against this map; when Tyler's device reports GPS near a **HIGH/CRITICAL** point, you may note it briefly. APIs: GET `/api/map/locations`, `/api/map/summary`, `/api/map/near`, POST `/api/map/research`. Do not claim classified facility details—only what the map and open sources support.
+- **Communication pattern analysis** (Batcomputer): tracks **when and how** key public figures communicate (cadence, silence, escalation, venue shifts) — distinct from **what** they say in proactive news scans. Patterns are stored as category `comm_pattern` and mirrored under Intelligence folder `Communication Intelligence` as `CI-{entity_slug}-pattern`; **coordinated timing** across multiple figures may be filed as `CI-{YYYYMMDD}-{hash}`. You distinguish **content** (substance) from **pattern** (timing, frequency, coordination). Flag unusual **silence** for mission-critical voices, **escalation** spikes, and **coordinated** public messaging clusters. Cross-references may note alignment with **active predictions**. Scheduled scan ~48h; APIs under `/api/comms/`. Open sources only — not private communications.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -5696,6 +5703,14 @@ class AngelCore:
         except Exception:
             map_cmd, map_payload = None, {}
 
+        comms_cmd, comms_payload = None, {}
+        try:
+            import angel_communication_patterns as acomm
+
+            comms_cmd, comms_payload = acomm.detect_comms_chat_intent(user_message)
+        except Exception:
+            comms_cmd, comms_payload = None, {}
+
         ta_cmd, ta_payload = None, {}
         try:
             import angel_threat_actors as ata
@@ -5794,6 +5809,12 @@ class AngelCore:
                 "If a block labeled [Angel environmental map] or [Angel environmental map — research] or [Angel environmental map — nearby] appears, "
                 "answer in plain language: summarize the JSON profile, significance, incident/program links, and mission relevance. "
                 "For research results, confirm the location was added or updated and the `LOC-*` file under Environmental Map when successful."
+            )
+        if comms_cmd:
+            system_prompt += (
+                "\n\nTyler's message relates to **communication pattern intelligence** (when/how figures communicate in open sources — cadence, silence, escalation, coordination). "
+                "If a block labeled [Angel communication patterns] appears, interpret the JSON: name the figure(s), last-activity hints, anomalies (SILENCE, ESCALATION, etc.), and any coordination signals. "
+                "Stress this is **pattern** analysis from public material, not wiretaps or private messages."
             )
 
         cc_runtime = (
@@ -6153,6 +6174,22 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if mblock.strip():
                     augmented_user_message = f"{augmented_user_message}\n\n{mblock}"
+            except Exception:
+                pass
+
+        if comms_cmd:
+            try:
+                import angel_communication_patterns as acomm
+
+                cblock = acomm.format_comms_chat_block(
+                    comms_cmd,
+                    comms_payload,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                )
+                if cblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{cblock}"
             except Exception:
                 pass
 
