@@ -1036,14 +1036,19 @@ def execute_python_sandbox(
 
 def append_executed_python_results_to_reply(reply: str) -> str:
     """
-    Find ```python ... ``` fences in Angel's reply, run each block in the sandbox,
-    and append stdout/stderr sections so Tyler sees execution output.
+    Find ```python ... ``` fences, run each block in the sandbox, remove those fences
+    entirely from the text Tyler sees, then append stdout/stderr so only Angel's prose
+    (interpretation) plus computed output remain.
     """
     if not reply or "```python" not in reply.lower():
         return reply
     matches = list(_PYTHON_CODE_BLOCK_RE.finditer(reply))
     if not matches:
         return reply
+    # Remove code blocks from the visible reply (silent execution channel).
+    stripped = _PYTHON_CODE_BLOCK_RE.sub("\n\n", reply)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+
     sections: list[str] = []
     for i, m in enumerate(matches, start=1):
         raw = m.group(1)
@@ -1054,18 +1059,20 @@ def append_executed_python_results_to_reply(reply: str) -> str:
         out = (ex.get("output") or "").rstrip() or "(no stdout)"
         err = (ex.get("error") or "").rstrip()
         if ex.get("success"):
-            block = f"**Python execution {i}** (success)\n```text\n{out}\n```"
+            hdr = "**Computed output:**\n" if len(matches) == 1 else f"**Computed output ({i}):**\n"
+            block = f"{hdr}```\n{out}\n```"
             if err:
-                block += f"\n```text\n(stderr)\n{err}\n```"
+                block += f"\n```\n(stderr)\n{err}\n```"
         else:
             block = (
-                f"**Python execution {i}** (failed)\nstdout:\n```text\n{out}\n```\n"
-                f"stderr / error:\n```text\n{err or '(none)'}\n```"
+                f"**Computation issue ({i}):**\nstdout:\n```\n{out}\n```\n"
+                f"stderr / error:\n```\n{err or '(none)'}\n```"
             )
         sections.append(block)
     if not sections:
-        return reply
-    return reply.rstrip() + "\n\n---\n" + "\n\n".join(sections) + "\n"
+        return stripped
+    appendix = "\n\n---\n" + "\n\n".join(sections) + "\n"
+    return stripped + appendix if stripped else appendix.strip()
 
 
 def build_system_prompt(
@@ -1103,7 +1110,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Voice conversation on desktop (microphone + TTS).
 - Text and voice interface on mobile web.
 - Cloud deployment accessible from any device.
-- Sandboxed Python execution for computation and science: numpy, scipy, pandas, matplotlib (headless), sympy. When you include ```python fenced blocks in your reply, the server runs them (30s limit) and appends stdout/stderr so Tyler sees numerical or analytical results.
+- Sandboxed Python execution for computation and science: numpy, scipy, pandas, matplotlib (headless), sympy. You may embed a hidden ```python block for the server to run (30s limit); Tyler never sees that code—only your written answer plus the appended computed output.
 
 {date_time_str}
 """
@@ -1164,10 +1171,11 @@ Memory reflection (how you think, not just what you store):
 - When a recent reflection appears in your context, you may cite it naturally (e.g. "When I reviewed what I remember, I noticed…") without treating it as infallible truth.
 
 Python code execution (server sandbox):
-- When a question benefits from exact computation, statistics, data shaping, simulation, numerical or symbolic math, or quick exploratory analysis—and prose alone is weaker than runnable code—write self-contained ```python blocks. Use print() for results, tables, and summaries.
-- Available libraries include numpy, scipy, pandas, matplotlib (set Agg backend is automatic; prefer printing numeric summaries or text descriptions over expecting an image UI), and sympy.
-- Your ```python blocks are executed automatically after you respond; stdout and stderr are appended under your message. If something fails, briefly acknowledge and offer a corrected block if Tyler wants to retry.
-- Keep scripts short and safe: avoid unnecessary network calls, file writes outside temp unless Tyler asked, or destructive operations.
+- Write Python code to compute the answer when computation, statistics, data shaping, simulation, numerical or symbolic math, or modeling would help—but do not show the code in your response. In your visible reply, give only your final answer, reasoning, and interpretation in natural language.
+- Put the runnable code alone inside a single fenced block tagged python (triple-backtick python) at the end of your model output. That block is stripped before Tyler sees your message and is executed silently; only stdout/stderr from the run are appended under your prose so Tyler sees computed results alongside your interpretation.
+- Use print() inside the hidden block for numbers, tables, and summaries. Libraries: numpy, scipy, pandas, matplotlib (Agg backend is automatic; prefer printed summaries over expecting images), sympy.
+- If execution fails, Tyler still will not see your code—briefly explain in prose what went wrong and, if useful, supply a corrected hidden block on the next turn.
+- Keep hidden scripts short and safe: avoid unnecessary network calls, file writes outside temp unless Tyler asked, or destructive operations.
 """
 
     stage2 = """
