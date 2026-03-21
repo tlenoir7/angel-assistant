@@ -82,11 +82,19 @@ def _parse_location_dict(loc) -> dict | None:
     return out
 
 
+def normalize_location(loc) -> dict | None:
+    """
+    Public name for the same rules as HTTP JSON ``location`` (and Socket.IO payload ``location``).
+    Accepts a dict with latitude/longitude or lat/lng, optional place_name / place / name.
+    """
+    return _parse_location_dict(loc)
+
+
 def _parse_location_from_json_body(data: dict | None) -> dict | None:
     """Read optional top-level ``location`` key from a JSON body."""
     if not isinstance(data, dict):
         return None
-    return _parse_location_dict(data.get("location"))
+    return normalize_location(data.get("location"))
 
 
 def _vision_device_from_body(device_raw: str) -> str:
@@ -448,6 +456,8 @@ def create_app() -> Flask:
         if not text:
             emit("angel_error", {"message": "Empty message."})
             return
+        location = normalize_location(payload.get("location"))
+        print(f"[socket] location received: {location!r}", flush=True)
         emit("angel_thinking", {})
         try:
             turns = _session_turns_for(sid)
@@ -455,6 +465,7 @@ def create_app() -> Flask:
                 text,
                 device=sess["device"],
                 session_turns=turns or None,
+                location=location,
             )
             clean_a = strip_markdown(reply) if angel.use_voice else reply
             _append_turn(sid, text, clean_a)
@@ -496,12 +507,15 @@ def create_app() -> Flask:
         if not transcript:
             emit("angel_response", {"reply": "I couldn't make out what you said."})
             return
+        location = normalize_location(payload.get("location"))
+        print(f"[socket] location received: {location!r}", flush=True)
         try:
             turns = _session_turns_for(sid)
             reply = angel.generate_reply(
                 transcript,
                 device=sess["device"],
                 session_turns=turns or None,
+                location=location,
             )
             clean_a = strip_markdown(reply) if angel.use_voice else reply
             _append_turn(sid, transcript, clean_a)
@@ -1146,7 +1160,7 @@ def create_app() -> Flask:
         raw_loc = request.form.get("location")
         if raw_loc:
             try:
-                location = _parse_location_dict(json.loads(raw_loc))
+                location = normalize_location(json.loads(raw_loc))
             except (json.JSONDecodeError, TypeError, ValueError) as e:
                 print(f"[api_voice] Ignoring invalid location JSON: {e}", flush=True)
         reply = angel.generate_reply(transcript, device=device, location=location)
