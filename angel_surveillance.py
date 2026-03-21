@@ -65,6 +65,13 @@ SURVEILLANCE_CATEGORY_QUERIES: dict[str, dict[str, Any]] = {
             "military personnel UAP incident report news",
         ],
     },
+    "bio_medical_watch": {
+        "label": "Biological / medical (UAP-adjacent)",
+        "queries": [
+            "UAP witness medical symptoms unexplained illness news cluster",
+            "radiation illness symptoms military UAP encounter reporting open source",
+        ],
+    },
 }
 
 
@@ -405,6 +412,20 @@ Rules: Be conservative. STRONG = clearly unusual, well-sourced pattern relevant 
                 row["near_mapped_locations"] = nm
         except Exception:
             pass
+        try:
+            import angel_biological_intelligence as abio
+
+            abio.ensure_seed_bio_cases(memory_client, user_id, files_cabinet, use_mem0_cloud)
+            bh = abio.keyword_pattern_match(
+                f"{row.get('headline', '')} {row.get('summary', '')}",
+                memory_client,
+                user_id,
+                use_mem0_cloud,
+            )
+            if bh:
+                row["bio_pattern_hits"] = bh[:5]
+        except Exception:
+            pass
         _finding_upsert(memory_client, user_id, row, use_mem0_cloud)
         out["signals"].append(row)
         summaries_for_pred.append(row.get("summary") or row.get("headline") or "")
@@ -498,6 +519,15 @@ Correlated = multiple independent open-source signals in the same rough timefram
             "Surveillance run may intersect active prediction topics: "
             + "; ".join(out["prediction_alignment"][:5])
         )
+
+    try:
+        import angel_biological_intelligence as abio
+
+        bnotes = abio.cluster_bio_signals_from_run(out.get("signals") or [])
+        if bnotes:
+            out["bio_cluster_notes"] = bnotes
+    except Exception:
+        pass
 
     global _LAST_SURVEILLANCE_RUN
     _LAST_SURVEILLANCE_RUN = {"at": out.get("at"), "result": dict(out)}

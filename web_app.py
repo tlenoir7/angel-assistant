@@ -22,6 +22,7 @@ import angel_forensic
 import angel_surveillance
 import angel_environmental_map
 import angel_communication_patterns
+import angel_biological_intelligence
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -766,6 +767,34 @@ def _schedule_environmental_map_seed() -> None:
         pass
 
 
+def _schedule_biological_intelligence_seed() -> None:
+    """Batcomputer: seed UAP medical reference cases + black-eyed profile."""
+
+    def _job() -> None:
+        try:
+            time.sleep(44)
+        except Exception:
+            return
+        global angel
+        if angel is None:
+            return
+        try:
+            r = angel_biological_intelligence.ensure_seed_bio_cases(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            print(f"[web_app] Biological intelligence seed: {r}", flush=True)
+        except Exception:
+            traceback.print_exc()
+
+    try:
+        threading.Thread(target=_job, daemon=True).start()
+    except Exception:
+        pass
+
+
 def _run_communication_patterns_job() -> None:
     """Every 48h: open-source communication cadence / coordination analysis for watched figures."""
 
@@ -866,6 +895,7 @@ def create_app() -> Flask:
     _schedule_foreign_watch_seed()
     _schedule_threat_actor_seed()
     _schedule_environmental_map_seed()
+    _schedule_biological_intelligence_seed()
     _load_expo_push_tokens_from_disk()
 
     # Log briefing email env at startup for debugging
@@ -3291,6 +3321,118 @@ def create_app() -> Flask:
                 angel._use_mem0_cloud,
             )
             return jsonify({"ok": True, "coordination_signals": rows})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Biological / medical intelligence ---
+    @app.route("/api/bio/analyze", methods=["POST"])
+    def api_bio_analyze():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        content = (data.get("content") or "").strip()
+        context = (data.get("context") or "").strip()
+        source = (data.get("source") or "").strip()
+        if not content:
+            return jsonify({"ok": False, "error": "content required"}), 400
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            r = angel_biological_intelligence.analyze_biological_report(
+                content,
+                context,
+                source,
+                angel.anthropic_client,
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            code = 200 if r.get("ok") else 400
+            return jsonify(r), code
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/bio/cases", methods=["GET"])
+    def api_bio_cases():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            angel_biological_intelligence.ensure_seed_bio_cases(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            rows = angel_biological_intelligence.list_known_cases(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "cases": rows})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/bio/patterns", methods=["GET"])
+    def api_bio_patterns():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            angel_biological_intelligence.ensure_seed_bio_cases(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            agg = angel_biological_intelligence.aggregate_medical_patterns(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "patterns": agg})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/bio/case/add", methods=["POST"])
+    def api_bio_case_add():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "JSON body required"}), 400
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            r = angel_biological_intelligence.add_bio_case(
+                data,
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            code = 200 if r.get("ok") else 400
+            return jsonify(r), code
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/bio/profile/black-eyed", methods=["GET"])
+    def api_bio_profile_black_eyed():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            angel_biological_intelligence.ensure_seed_bio_cases(
+                angel.memory_client,
+                os.getenv("ANGEL_USER_ID", "railway-user"),
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            p = angel_biological_intelligence.get_black_eyed_profile()
+            return jsonify({"ok": True, "profile": p})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500

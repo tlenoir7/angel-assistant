@@ -73,6 +73,8 @@ CATEGORY_SURVEILLANCE_INTEL = "surveillance_intelligence"
 CATEGORY_ENV_LOCATION = "env_location"
 # Batcomputer — communication pattern / cadence analysis (when/how public figures communicate)
 CATEGORY_COMM_PATTERN = "comm_pattern"
+# Batcomputer — biological / medical intelligence (UAP-adjacent health patterns)
+CATEGORY_BIO_MEDICAL = "bio_medical"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -93,6 +95,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_SURVEILLANCE_INTEL,
         CATEGORY_ENV_LOCATION,
         CATEGORY_COMM_PATTERN,
+        CATEGORY_BIO_MEDICAL,
     }
 )
 
@@ -1439,6 +1442,7 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_SURVEILLANCE_INTEL,
             CATEGORY_ENV_LOCATION,
             CATEGORY_COMM_PATTERN,
+            CATEGORY_BIO_MEDICAL,
         ):
             continue
         general.append(m)
@@ -1574,6 +1578,8 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_ENV_LOCATION:
             continue
         if cat == CATEGORY_COMM_PATTERN:
+            continue
+        if cat == CATEGORY_BIO_MEDICAL:
             continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
@@ -2103,6 +2109,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Open-source surveillance monitoring (Batcomputer): you run **scheduled multi-category** scans over **legal public** sources (Tavily news/search) — aerial, ground, maritime, public records, anomalous events, social signals — evaluate signals as NOISE / WEAK / MODERATE / STRONG; **STRONG** findings file to Intelligence folder `Surveillance Intelligence` as `SI-*`; **correlated** cluster signals (multiple categories reinforcing same geography/timeframe) are flagged **HIGH** priority. Cross-check themes against **Threat Intelligence** when possible; **active predictions** may be noted when aligned. Surveillance summaries appear in the **morning briefing**; manual run via GET `/api/surveillance/run`. This is not classified collection or illegal surveillance.
 - **Environmental map** (Batcomputer geography layer): mission-relevant physical locations — UAP hotspots, installations, restricted airspace, incident sites, facilities, and person-associated places — are stored as structured memories (category `env_location`) and mirrored under Intelligence folder `Environmental Map` as files `LOC-{location_id}`. The map is **excluded from routine memory digests** but you should **reference it naturally** when geography, incidents, programs, or travel matter. Open-source surveillance runs **cross-reference** headlines/summaries against this map; when Tyler's device reports GPS near a **HIGH/CRITICAL** point, you may note it briefly. APIs: GET `/api/map/locations`, `/api/map/summary`, `/api/map/near`, POST `/api/map/research`. Do not claim classified facility details—only what the map and open sources support.
 - **Communication pattern analysis** (Batcomputer): tracks **when and how** key public figures communicate (cadence, silence, escalation, venue shifts) — distinct from **what** they say in proactive news scans. Patterns are stored as category `comm_pattern` and mirrored under Intelligence folder `Communication Intelligence` as `CI-{entity_slug}-pattern`; **coordinated timing** across multiple figures may be filed as `CI-{YYYYMMDD}-{hash}`. You distinguish **content** (substance) from **pattern** (timing, frequency, coordination). Flag unusual **silence** for mission-critical voices, **escalation** spikes, and **coordinated** public messaging clusters. Cross-references may note alignment with **active predictions**. Scheduled scan ~48h; APIs under `/api/comms/`. Open sources only — not private communications.
+- **Biological & medical intelligence** (Batcomputer): structured reference cases and analyses for **physiological / psychological** patterns tied to UAP encounter literature, radiation/EM exposure **indicators** (not dosimetry), witness health narratives, and anomalous biology themes — including a dedicated **black-eyed people** profile for Tyler's childhood experience as a **reference anchor** (not a diagnosis). Stored as category `bio_medical` and files `BIO-*` under `Biological Intelligence` (including `BIO-black-eyed-profile`). You maintain **scientific humility**: summarize open-source patterns, separate observation from mechanism, and **never replace** licensed medical care. Surveillance can surface **bio/medical-adjacent** open-source clusters near mapped hotspots. APIs under `/api/bio/`.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -5711,6 +5718,14 @@ class AngelCore:
         except Exception:
             comms_cmd, comms_payload = None, {}
 
+        bio_cmd, bio_payload = None, {}
+        try:
+            import angel_biological_intelligence as abio
+
+            bio_cmd, bio_payload = abio.detect_bio_chat_intent(user_message)
+        except Exception:
+            bio_cmd, bio_payload = None, {}
+
         ta_cmd, ta_payload = None, {}
         try:
             import angel_threat_actors as ata
@@ -5815,6 +5830,12 @@ class AngelCore:
                 "\n\nTyler's message relates to **communication pattern intelligence** (when/how figures communicate in open sources — cadence, silence, escalation, coordination). "
                 "If a block labeled [Angel communication patterns] appears, interpret the JSON: name the figure(s), last-activity hints, anomalies (SILENCE, ESCALATION, etc.), and any coordination signals. "
                 "Stress this is **pattern** analysis from public material, not wiretaps or private messages."
+            )
+        if bio_cmd:
+            system_prompt += (
+                "\n\nTyler's message relates to **biological / medical intelligence** (UAP-adjacent health patterns, exposure indicators, witness narratives — including the black-eyed people profile when relevant). "
+                "If a block labeled [Angel biological intelligence …] appears, integrate it with care: this is **not** a clinical diagnosis; cite uncertainty, mission relevance, and Tyler's personal connection to BEK research when on-topic. "
+                "Encourage professional medical evaluation when appropriate."
             )
 
         cc_runtime = (
@@ -6190,6 +6211,25 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if cblock.strip():
                     augmented_user_message = f"{augmented_user_message}\n\n{cblock}"
+            except Exception:
+                pass
+
+        if bio_cmd:
+            try:
+                import angel_biological_intelligence as abio
+
+                bblock = abio.format_bio_chat_block(
+                    bio_cmd,
+                    bio_payload,
+                    anthropic_client=self.anthropic_client,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    files_cabinet=self.files_cabinet,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                    user_message=user_message,
+                )
+                if bblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{bblock}"
             except Exception:
                 pass
 
