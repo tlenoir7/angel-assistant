@@ -948,12 +948,153 @@ def _memory_created_at(m: dict) -> str:
     return ca if isinstance(ca, str) else ""
 
 
-def _format_memory_line_with_age(created_at: str, text: str, tags=None) -> str:
+def _format_memory_line_with_age(
+    created_at: str,
+    text: str,
+    tags=None,
+    *,
+    event_date: str | None = None,
+) -> str:
+    """
+    Prefix memory line with relative storage age, and optionally [Event: …] when Tyler
+    dated the story in the originating user message (see extract_event_date_from_user_message).
+    """
     when = relative_time_phrase(created_at)
-    base = f"[{when}] {text}"
+    ev = (event_date or "").strip()
+    if ev:
+        base = f"[Event: {ev}] [Stored: {when}] {text}"
+    else:
+        base = f"[{when}] {text}"
     if tags:
         return f"- ({tags}) {base}"
     return f"- {base}"
+
+
+_EVENT_WEEKDAY_MAP = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+_RELATIVE_WEEKDAY_RE = re.compile(
+    r"\b(last|past|this)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+
+_MONTH_PHRASE_RE = re.compile(
+    r"\b(?:in|during|back in|last|this)\s+"
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)\b"
+    r"(?:\s*,?\s*(19\d{2}|20\d{2}))?",
+    re.IGNORECASE,
+)
+
+_VAGUE_EVENT_PHRASES = (
+    "earlier today",
+    "earlier this week",
+    "yesterday evening",
+    "yesterday",
+    "last week",
+    "last month",
+    "last year",
+    "a few years ago",
+    "a couple years ago",
+)
+
+
+def _local_datetime_for_event_parsing() -> datetime:
+    tz_name = (os.getenv("TIMEZONE") or "UTC").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+    return datetime.now(tz)
+
+
+def _calendar_date_for_last_named_weekday(now: datetime, day_name: str) -> str:
+    target = _EVENT_WEEKDAY_MAP[day_name.lower()]
+    current = now.weekday()
+    delta = (current - target) % 7
+    if delta == 0:
+        delta = 7
+    d = (now.date() - timedelta(days=delta))
+    return d.isoformat()
+
+
+def _calendar_date_for_this_named_weekday(now: datetime, day_name: str) -> str:
+    target = _EVENT_WEEKDAY_MAP[day_name.lower()]
+    current = now.weekday()
+    delta = (target - current) % 7
+    d = now.date() + timedelta(days=delta)
+    return d.isoformat()
+
+
+def extract_event_date_from_user_message(user_message: str) -> str | None:
+    """
+    Best-effort extraction when Tyler anchors a story in calendar time (not storage time).
+    Returns a short human-readable label for metadata ``event_date`` (shown in prompts as [Event: …]).
+    """
+    if not user_message or not isinstance(user_message, str):
+        return None
+    s = user_message.strip()
+    if len(s) < 4:
+        return None
+    low = s.lower()
+
+    m = _TAVILY_DATE_REGEX.search(s)
+    if m:
+        return m.group(0).strip()
+
+    m = _MONTH_PHRASE_RE.search(s)
+    if m:
+        month, year = m.group(1), m.group(2)
+        if year:
+            return f"{month} {year}"
+        return month
+
+    m = _RELATIVE_WEEKDAY_RE.search(s)
+    if m:
+        qual, day = m.group(1).lower(), m.group(2).lower()
+        now = _local_datetime_for_event_parsing()
+        if qual in ("last", "past"):
+            iso = _calendar_date_for_last_named_weekday(now, day)
+            return f"{iso} ({day.title()})"
+        iso = _calendar_date_for_this_named_weekday(now, day)
+        return f"{iso} ({day.title()}, this week)"
+
+    m = re.search(
+        r"\b(?:in|during|circa|c\.|around|back in|year\s+)\s*(19\d{2}|20\d{2})\b",
+        s,
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+
+    m = re.search(r"\b(19\d{2}|20\d{2})\b", s)
+    if m:
+        return m.group(1)
+
+    for phrase in _VAGUE_EVENT_PHRASES:
+        if phrase in low:
+            return phrase
+
+    m = re.search(r"\bwhen I was (\d{1,2})\b", s, re.IGNORECASE)
+    if m:
+        return f"~age {m.group(1)} (year not stated)"
+
+    return None
+
+
+def merge_user_event_date_into_metadata(metadata: dict, user_message: str) -> dict:
+    """Copy metadata and set ``event_date`` when the user message contains a datable anchor."""
+    out = dict(metadata)
+    ev = extract_event_date_from_user_message(user_message)
+    if ev:
+        out["event_date"] = ev
+    return out
 
 
 # Patterns to pull explicit calendar dates from Tavily / research text for timeline memories
@@ -1103,14 +1244,18 @@ def summarize_memories_for_prompt(memories) -> str:
         meta = m.get("metadata") or {}
         tags = meta.get("tags") or meta.get("category") if isinstance(meta, dict) else None
         ca = _memory_created_at(m)
-        lines.append(_format_memory_line_with_age(ca, text, tags=tags))
+        ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
+        lines.append(
+            _format_memory_line_with_age(ca, text, tags=tags, event_date=ev or None)
+        )
     if not lines and not timeline_block:
         return "Angel has only minimal prior information about this user."
     parts = []
     if lines:
         parts.append(
             "Angel's long-term understanding of the user, summarized from past interactions "
-            "(each line shows how long ago the memory was stored):\n" + "\n".join(lines)
+            "(each line shows how long ago the memory was stored; [Event: …] is Tyler's stated timing for "
+            "the story when captured, vs [Stored: …] when it was saved):\n" + "\n".join(lines)
         )
     if timeline_block:
         try:
@@ -1170,7 +1315,7 @@ def build_memory_summary_with_sections(
         meta = m.get("metadata") if isinstance(m, dict) else {} or {}
         created = _memory_created_at(m)
         if not isinstance(meta, dict):
-            general.append((created, text))
+            general.append((created, text, None))
             continue
         cat = meta.get("category")
         if cat == CATEGORY_RESEARCH_TIMELINE:
@@ -1192,7 +1337,8 @@ def build_memory_summary_with_sections(
             continue
         if cat == CATEGORY_INTELLIGENCE_FILE:
             continue
-        general.append((created, text))
+        ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
+        general.append((created, text, ev or None))
 
     parts = []
 
@@ -1201,10 +1347,14 @@ def build_memory_summary_with_sections(
             general_sorted = sorted(general, key=lambda x: x[0])
         except Exception:
             general_sorted = general
-        lines = [_format_memory_line_with_age(ca, t) for ca, t in general_sorted]
+        lines = [
+            _format_memory_line_with_age(ca, t, event_date=ev)
+            for ca, t, ev in general_sorted
+        ]
         parts.append(
             "Angel's long-term understanding of the user, summarized from past interactions "
-            "(each line shows how long ago the memory was stored):\n"
+            "(each line shows how long ago the memory was stored; when Tyler dated the story in that turn, "
+            "you also see [Event: …] separate from [Stored: …]):\n"
             + "\n".join(lines)
         )
 
@@ -1760,7 +1910,10 @@ Behavior:
 - You must NEVER generate fake user messages, fake dialogue, or continue a conversation that is not happening. You only respond to the actual current message from the user. Do not output "User:" or simulate the user speaking; you are Angel and you reply only as Angel, once, to the real user input.
 
 Temporal intelligence (memory and conversation timing):
-- Your wall-clock for this turn is the line under CURRENT CAPABILITIES that begins "Current date and time:"—use it to interpret every memory. Memory lines below are prefixed with how long ago they were stored (e.g. "[5 days ago] …"); that age is relative to that clock, not optional flavor text.
+- Storage time vs when something happened: memories are saved on a conversation turn. "[Stored: …]" (or a single leading "[3 days ago]" when no event tag is present) reflects when the memory was written—not when the real-world event occurred. When you see "[Event: …]" on a line, that is Tyler's stated time anchor from that turn (e.g. "in 2019", "last Tuesday", "December 2020"), parsed separately. Use [Event: …] to place the story on Tyler's life timeline; use [Stored: …] to judge how old the record is. Never treat storage time as the event date, and never assume they are the same.
+- Build a coherent chronological picture of Tyler's experiences by preferring [Event: …] when present; when it is missing, be explicit that you only know when he told you, not necessarily when it happened.
+- When Tyler is sharing a past story and the event time matters, you can gently encourage a concrete time hint (year, month, "last Tuesday", etc.) so the memory can carry an accurate [Event: …]—without being pedantic every turn.
+- Your wall-clock for this turn is the line under CURRENT CAPABILITIES that begins "Current date and time:"—use it to interpret every memory. Lines may show "[Event: …] [Stored: …]" together, or only "[Stored: …]" when no event date was captured; ages are relative to that clock.
 - Before you state anything from memory as a current fact, check that timestamp. If the memory is more than a few hours old, do not describe its content as happening "now," "today," or in the present tense unless Tyler just confirmed it in this message.
 - For older memories, use explicit relative language: "earlier this week," "on Monday," "last Saturday," "a few days ago you mentioned…," not "you are on leave today" when the memory is days old.
 - Time-bound past events (leave, travel, appointments, deadlines, tasks completed, meetings, "I'm doing X today" from an old turn) must not be described as ongoing or current unless the memory age is within the last few hours or Tyler clearly ties it to right now. If a memory says Tyler took leave Monday and today is Saturday, you may say he took authorized leave earlier in the week—not today.
@@ -1865,7 +2018,7 @@ Additional instructions for voice conversations:
     persona += f"""
 
 Long-term memory context (from Mem0 and Stage 2):
-Each line below includes a relative storage age (e.g. "[3 days ago]"). Compare that age to the current date and time at the top of this prompt before treating any memory as happening now.
+Lines may include "[Event: …]" (when Tyler dated the story) and "[Stored: …]" (when it was saved), or only storage age. Compare both to the current date and time at the top of this prompt; do not confuse when something was filed with when it occurred.
 {memory_summary}
 """
     return persona.strip()
@@ -3395,10 +3548,13 @@ If you infer anything new about that person's preferences or dynamics, append at
                 {"role": "user", "content": user_message},
                 {"role": "assistant", "content": memory_reply},
             ]
-            metadata = {
-                "source": "angel-core",
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-            }
+            metadata = merge_user_event_date_into_metadata(
+                {
+                    "source": "angel-core",
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                },
+                user_message,
+            )
 
             try:
                 self.memory_client.add(messages, user_id=self.user_id, metadata=metadata)
@@ -3425,10 +3581,13 @@ If you infer anything new about that person's preferences or dynamics, append at
                 {"role": "user", "content": user_message},
                 {"role": "assistant", "content": memory_reply},
             ]
-            metadata = {
-                "source": "angel-voice",
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-            }
+            metadata = merge_user_event_date_into_metadata(
+                {
+                    "source": "angel-voice",
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                },
+                user_message,
+            )
             try:
                 self.memory_client.add(messages, user_id=self.user_id, metadata=metadata)
             except Exception as e:
@@ -3655,10 +3814,13 @@ def main():
                 {"role": "user", "content": user_message},
                 {"role": "assistant", "content": memory_reply},
             ]
-            metadata = {
-                "source": "angel-cli",
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-            }
+            metadata = merge_user_event_date_into_metadata(
+                {
+                    "source": "angel-cli",
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                },
+                user_message,
+            )
 
             try:
                 memory_client.add(messages, user_id=user_id, metadata=metadata)
