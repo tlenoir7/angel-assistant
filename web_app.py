@@ -61,6 +61,33 @@ expo_push_tokens: list[str] = []
 _VALID_CLIENT_DEVICES = frozenset({"ios", "desktop", "mobile_web"})
 
 
+def _parse_location_dict(loc) -> dict | None:
+    """Normalize location object: latitude/longitude (or lat/lng), optional place_name."""
+    if not isinstance(loc, dict):
+        return None
+    lat = loc.get("latitude", loc.get("lat"))
+    lng = loc.get("longitude", loc.get("lng"))
+    if lat is None or lng is None:
+        return None
+    try:
+        lat_f = float(lat)
+        lng_f = float(lng)
+    except (TypeError, ValueError):
+        return None
+    out: dict = {"latitude": lat_f, "longitude": lng_f}
+    place = (loc.get("place_name") or loc.get("place") or loc.get("name") or "").strip()
+    if place:
+        out["place_name"] = place
+    return out
+
+
+def _parse_location_from_json_body(data: dict | None) -> dict | None:
+    """Read optional top-level ``location`` key from a JSON body."""
+    if not isinstance(data, dict):
+        return None
+    return _parse_location_dict(data.get("location"))
+
+
 def _vision_device_from_body(device_raw: str) -> str:
     d = (device_raw or "").strip().lower()
     if d in _VALID_CLIENT_DEVICES:
@@ -1090,7 +1117,8 @@ def create_app() -> Flask:
         if not message:
             return jsonify({"error": "Empty message"}), 400
         device = _request_device()
-        reply = angel.generate_reply(message, device=device)
+        location = _parse_location_from_json_body(data)
+        reply = angel.generate_reply(message, device=device, location=location)
         reply = _sanitize_text(reply)
         return jsonify({"reply": reply})
 
@@ -1112,7 +1140,14 @@ def create_app() -> Flask:
             reply = "I couldn't clearly hear what you said."
             return jsonify({"transcript": "", "reply": reply})
         device = _request_device()
-        reply = angel.generate_reply(transcript, device=device)
+        location = None
+        raw_loc = request.form.get("location")
+        if raw_loc:
+            try:
+                location = _parse_location_dict(json.loads(raw_loc))
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                print(f"[api_voice] Ignoring invalid location JSON: {e}", flush=True)
+        reply = angel.generate_reply(transcript, device=device, location=location)
         return jsonify(
             {
                 "transcript": _sanitize_text(transcript),

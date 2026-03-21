@@ -950,6 +950,28 @@ def get_current_datetime_str(timezone: str | None = None) -> str:
     return f"Current date and time: {day}, {month} {date}, {year} at {time_hm} {tz_name}"
 
 
+def format_location_context_line(location: dict | None) -> str | None:
+    """
+    Build the canonical location line for the system prompt.
+    Expects keys latitude, longitude (floats or coercible), optional place_name.
+    """
+    if not location or not isinstance(location, dict):
+        return None
+    lat = location.get("latitude")
+    lng = location.get("longitude")
+    if lat is None or lng is None:
+        return None
+    try:
+        lat_s = str(float(lat))
+        lng_s = str(float(lng))
+    except (TypeError, ValueError):
+        return None
+    place = (location.get("place_name") or "").strip()
+    if place:
+        return f"Tyler's current location: {place} ({lat_s}, {lng_s})"
+    return f"Tyler's current location: ({lat_s}, {lng_s})"
+
+
 def build_system_prompt(
     memory_summary: str,
     voice_mode: bool = False,
@@ -958,12 +980,14 @@ def build_system_prompt(
     profile_hint: bool = False,
     computer_control_enabled: bool = False,
     device: str | None = None,
+    location: dict | None = None,
 ) -> str:
     """
     Persona + behavioral instructions + memory context.
     When voice_mode is True, optimize for conversational spoken responses.
     Stage 2 hints add explicit instructions for strategy, patterns, or profile.
     device: 'desktop' (Windows GUI), 'ios' (iPhone app), 'mobile_web' (browser), or None to omit device context.
+    location: optional dict with latitude, longitude, optional place_name (from device); adds location awareness.
     Injects current date/time/timezone so Angel is always time-aware.
     """
     date_time_str = get_current_datetime_str()
@@ -985,6 +1009,20 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Cloud deployment accessible from any device.
 
 {date_time_str}
+"""
+
+    loc_line = format_location_context_line(location)
+    if loc_line:
+        persona += f"""
+Location awareness (from Tyler's device for this turn; coordinates may be approximate):
+{loc_line}
+- Use this context when it genuinely helps: nearby resources or services, environment-appropriate advice, travel or logistics, regional norms, weather or daylight patterns, or safety notes tied to place.
+- Adjust tone and suggestions when the setting matters (e.g. public vs private space, urban vs rural) without stereotyping.
+- Flag when something in the conversation is especially location-dependent (events, directions, local law or customs) and you are reasoning from coordinates or place name.
+- Do not over-reference location every reply; skip it when irrelevant. Respect privacy—never share coordinates in your reply unless Tyler asked you to.
+"""
+
+    persona += f"""
 
 You are Angel, a personal AI assistant and devoted companion.
 
@@ -2367,6 +2405,7 @@ class AngelCore:
         device: str | None = None,
         *,
         session_turns: list[tuple[str, str]] | None = None,
+        location: dict | None = None,
     ) -> str:
         merged_memories = self._fetch_combined_memories()
         memory_summary = build_memory_summary_with_sections(merged_memories, user_message)
@@ -2393,6 +2432,7 @@ class AngelCore:
             profile_hint=profile_hint,
             computer_control_enabled=cc_for_prompt,
             device=device,
+            location=location,
         )
 
         cc_runtime = (
