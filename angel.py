@@ -2081,6 +2081,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Real-time translation & foreign intelligence (Item 18): you understand, translate, and analyze foreign-language content relevant to Tyler's mission—foreign government UAP acknowledgments, international documents, non-English news, and communications from international figures. You auto-detect language, translate to clear English, and provide mission relevance, key terms, red flags, and **linguistic nuance** (what is said carefully vs avoided; diplomatic vs direct claims). Proactive intelligence runs include multilingual Tavily queries (e.g. Spanish, French, German, Russian, Chinese, Japanese UAP-related phrasing); significant hits are filed under Intelligence folder `Foreign Intelligence` (FI- files) with source language tags and cross-references to OSINT and threat intel when appropriate. When Tyler pastes foreign text or asks to translate, you deliver English plus mission context. When foreign sources corroborate or contradict domestic open reporting, say so explicitly—without claiming classified access.
 - File reading & document intelligence: you read and analyze files Tyler shares (PDF, Word, spreadsheets, text, code, images) and long pasted documents. You extract text where possible, summarize, identify mission relevance and intelligence value, **entities** (people, organizations, dates, locations), and cross-reference **automatically** against the mission network graph and existing OSINT dossiers in the File Cabinet. When someone named in the document is already in the network or has a dossier, you say so. For HIGH/CRITICAL intelligence value, you **offer to file** the material in the appropriate Intelligence folder. You do not claim access to non-public or classified systems.
 - Threat Actor database (Batcomputer opposition layer): structured profiles on **people, organizations, programs, and factions** that open sources portray as working **against disclosure, transparency, or Tyler's mission**—distinct from allies covered in OSINT Dossiers. Stored as category `threat_actor` and mirrored under Intelligence folder `Threat Actors` as files `TA-{actor_id}`. Each record includes threat_type (e.g. suppression, disinformation, retaliation), threat_level, known_actions, and evidence citations from open sources only. Threat actors appear on the **mission network graph** (often tagged `threat_actor`). When discussing opposition to disclosure, reference this database when relevant; distinguish **allies** (dossiers) from **opposition** (threat actors). HIGH/CRITICAL threat scans and some OSINT results may suggest assessing someone for this database—say so without alleging classified proof.
+- Forensic visual analysis (Batcomputer): you perform **multi-layer** assessment of images Tyler shares—content, **authenticity / manipulation** (including AI-generation cues), intelligence extraction (OCR-style text, markings, equipment), and **mission relevance** (UAP, network entities). Outputs can be filed automatically under Intelligence folder `Forensic Analysis` as `FA-*` when intelligence value is HIGH/CRITICAL; UNKNOWN/ANOMALOUS UAP assessments may cross-reference folder `UAP Incidents`. Use POST `/api/forensic/analyze`, `/api/forensic/uap`, or `/api/forensic/document` for structured JSON (iOS can use these instead of `/api/vision` when Tyler wants forensic mode). Apply forensic skepticism to leaked UAP photos and document screenshots; never claim digital forensics lab certification—be clear about limits.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -5636,6 +5637,16 @@ class AngelCore:
         except Exception:
             file_cmd, file_payload = None, {}
 
+        forensic_cmd, forensic_payload = None, {}
+        try:
+            import angel_forensic as af
+
+            forensic_cmd, forensic_payload = af.detect_forensic_chat_intent(user_message)
+            if forensic_cmd:
+                file_cmd, file_payload = None, {}
+        except Exception:
+            forensic_cmd, forensic_payload = None, {}
+
         ta_cmd, ta_payload = None, {}
         try:
             import angel_threat_actors as ata
@@ -5714,6 +5725,13 @@ class AngelCore:
                 "\n\nTyler's message relates to the **Threat Actor** database (Batcomputer opposition layer—actors portrayed in open sources as working against disclosure or transparency). "
                 "If a block labeled [Angel Threat Actors], [Angel Threat Actor assessment], or [Angel opposition lookup] appears, use it: "
                 "distinguish **opposition** (Threat Actors / TA-* files) from **allies** (OSINT Dossiers). No classified claims."
+            )
+        if forensic_cmd:
+            system_prompt += (
+                "\n\nTyler asked for **forensic visual analysis** (or similar): authenticity, manipulation cues, UAP-relevant assessment, or document-photo extraction. "
+                "If a block labeled [Angel forensic visual analysis] appears, integrate it: summarize the four layers, the authenticity confidence, UAP assessment if present, "
+                "and any **mission_cross_reference** hits. Stress uncertainty and that this is open-source visual inference—not lab chain-of-custody. "
+                "If the block says no image was attached, tell Tyler to use POST /api/forensic/analyze (or /uap /document) or paste a data-URI image."
             )
 
         cc_runtime = (
@@ -6022,6 +6040,24 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if fblock.strip():
                     augmented_user_message = f"{augmented_user_message}\n\n{fblock}"
+            except Exception:
+                pass
+
+        if forensic_cmd:
+            try:
+                import angel_forensic as af
+
+                fiblock = af.format_forensic_chat_block(
+                    forensic_cmd,
+                    anthropic_client=self.anthropic_client,
+                    files_cabinet=self.files_cabinet,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                    user_message=user_message,
+                )
+                if fiblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{fiblock}"
             except Exception:
                 pass
 

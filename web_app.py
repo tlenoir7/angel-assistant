@@ -18,6 +18,7 @@ import angel_proactive
 import angel_translation
 import angel_file_reading
 import angel_threat_actors
+import angel_forensic
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -1581,6 +1582,7 @@ def create_app() -> Flask:
         """
         Camera vision: JPEG (base64) + question, using Claude vision with Angel's full system prompt and memory.
         JSON body: image (base64 JPEG), question (str), device (ios | desktop | mobile_web).
+        For authenticity / manipulation / UAP forensics, use POST /api/forensic/analyze (or /uap /document) instead.
         """
         global last_activity_at, check_in_message, check_in_generated_at
         last_activity_at = time.time()
@@ -1665,6 +1667,85 @@ def create_app() -> Flask:
             print(f"[api_vision] Claude vision error: {e}", flush=True)
             traceback.print_exc()
             return jsonify({"error": "Vision analysis failed.", "details": str(e)}), 500
+
+    # --- Forensic visual analysis (Batcomputer): authenticity, UAP imagery, document photos ---
+    # iPhone / iOS: keep using /api/vision for default chat+camera; call /api/forensic/* when Tyler
+    # enables "forensic mode" or needs manipulation/authenticity assessment (see system prompt).
+
+    @app.route("/api/forensic/analyze", methods=["POST"])
+    def api_forensic_analyze():
+        """Full four-layer forensic JSON. Body: { image_b64, file_name?, context? }."""
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        image_b64 = data.get("image_b64") or data.get("image") or ""
+        fn = (data.get("file_name") or data.get("name") or "image.jpg").strip()
+        ctx = (data.get("context") or "").strip()
+        try:
+            r = angel_forensic.forensic_analyze_image(
+                str(image_b64),
+                fn,
+                ctx,
+                angel.anthropic_client,
+                angel.files_cabinet,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/forensic/uap", methods=["POST"])
+    def api_forensic_uap():
+        """UAP-focused forensic pass. Body: { image_b64, file_name?, context? }."""
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        image_b64 = data.get("image_b64") or data.get("image") or ""
+        fn = (data.get("file_name") or data.get("name") or "uap.jpg").strip()
+        ctx = (data.get("context") or "").strip()
+        try:
+            r = angel_forensic.forensic_analyze_uap(
+                str(image_b64),
+                fn,
+                ctx,
+                angel.anthropic_client,
+                angel.files_cabinet,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/forensic/document", methods=["POST"])
+    def api_forensic_document():
+        """Document-image forensics. Body: { image_b64, file_name?, context? }."""
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        image_b64 = data.get("image_b64") or data.get("image") or ""
+        fn = (data.get("file_name") or data.get("name") or "document.jpg").strip()
+        ctx = (data.get("context") or "").strip()
+        try:
+            r = angel_forensic.forensic_analyze_document(
+                str(image_b64),
+                fn,
+                ctx,
+                angel.anthropic_client,
+                angel.files_cabinet,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     # --- Intelligence File Cabinet (dynamic folders; Mem0 category intelligence_file) ---
     @app.route("/api/files/create", methods=["POST"])
