@@ -67,6 +67,8 @@ CATEGORY_PROACTIVE_FINDING = "proactive_finding"
 CATEGORY_FOREIGN_INTEL = "foreign_intelligence"
 # Batcomputer — opposition / anti-disclosure actors (mirrored under Threat Actors / TA-*)
 CATEGORY_THREAT_ACTOR = "threat_actor"
+# Batcomputer — open-source surveillance monitoring (legal OSINT)
+CATEGORY_SURVEILLANCE_INTEL = "surveillance_intelligence"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -84,6 +86,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_PROACTIVE_FINDING,
         CATEGORY_FOREIGN_INTEL,
         CATEGORY_THREAT_ACTOR,
+        CATEGORY_SURVEILLANCE_INTEL,
     }
 )
 
@@ -1427,6 +1430,7 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_PROACTIVE_FINDING,
             CATEGORY_FOREIGN_INTEL,
             CATEGORY_THREAT_ACTOR,
+            CATEGORY_SURVEILLANCE_INTEL,
         ):
             continue
         general.append(m)
@@ -1556,6 +1560,8 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_FOREIGN_INTEL:
             continue
         if cat == CATEGORY_THREAT_ACTOR:
+            continue
+        if cat == CATEGORY_SURVEILLANCE_INTEL:
             continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
@@ -2082,6 +2088,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - File reading & document intelligence: you read and analyze files Tyler shares (PDF, Word, spreadsheets, text, code, images) and long pasted documents. You extract text where possible, summarize, identify mission relevance and intelligence value, **entities** (people, organizations, dates, locations), and cross-reference **automatically** against the mission network graph and existing OSINT dossiers in the File Cabinet. When someone named in the document is already in the network or has a dossier, you say so. For HIGH/CRITICAL intelligence value, you **offer to file** the material in the appropriate Intelligence folder. You do not claim access to non-public or classified systems.
 - Threat Actor database (Batcomputer opposition layer): structured profiles on **people, organizations, programs, and factions** that open sources portray as working **against disclosure, transparency, or Tyler's mission**—distinct from allies covered in OSINT Dossiers. Stored as category `threat_actor` and mirrored under Intelligence folder `Threat Actors` as files `TA-{actor_id}`. Each record includes threat_type (e.g. suppression, disinformation, retaliation), threat_level, known_actions, and evidence citations from open sources only. Threat actors appear on the **mission network graph** (often tagged `threat_actor`). When discussing opposition to disclosure, reference this database when relevant; distinguish **allies** (dossiers) from **opposition** (threat actors). HIGH/CRITICAL threat scans and some OSINT results may suggest assessing someone for this database—say so without alleging classified proof.
 - Forensic visual analysis (Batcomputer): you perform **multi-layer** assessment of images Tyler shares—content, **authenticity / manipulation** (including AI-generation cues), intelligence extraction (OCR-style text, markings, equipment), and **mission relevance** (UAP, network entities). Outputs can be filed automatically under Intelligence folder `Forensic Analysis` as `FA-*` when intelligence value is HIGH/CRITICAL; UNKNOWN/ANOMALOUS UAP assessments may cross-reference folder `UAP Incidents`. Use POST `/api/forensic/analyze`, `/api/forensic/uap`, or `/api/forensic/document` for structured JSON (iOS can use these instead of `/api/vision` when Tyler wants forensic mode). Apply forensic skepticism to leaked UAP photos and document screenshots; never claim digital forensics lab certification—be clear about limits.
+- Open-source surveillance monitoring (Batcomputer): you run **scheduled multi-category** scans over **legal public** sources (Tavily news/search) — aerial, ground, maritime, public records, anomalous events, social signals — evaluate signals as NOISE / WEAK / MODERATE / STRONG; **STRONG** findings file to Intelligence folder `Surveillance Intelligence` as `SI-*`; **correlated** cluster signals (multiple categories reinforcing same geography/timeframe) are flagged **HIGH** priority. Cross-check themes against **Threat Intelligence** when possible; **active predictions** may be noted when aligned. Surveillance summaries appear in the **morning briefing**; manual run via GET `/api/surveillance/run`. This is not classified collection or illegal surveillance.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -3137,6 +3144,7 @@ def generate_morning_briefing(
     recent_briefing_history: str | None = None,
     threat_appendix: str | None = None,
     proactive_intelligence_appendix: str | None = None,
+    surveillance_appendix: str | None = None,
 ) -> str:
     """
     Search Tavily for 3–5 current topics (UAP disclosure, world events), then generate
@@ -3149,6 +3157,7 @@ def generate_morning_briefing(
 
     When ``threat_appendix`` is non-empty, it is appended after the main briefing text (THREAT INTELLIGENCE block).
     When ``proactive_intelligence_appendix`` is non-empty, it is appended after threat (PROACTIVE INTELLIGENCE block).
+    When ``surveillance_appendix`` is non-empty, it is appended after proactive (SURVEILLANCE INTELLIGENCE block).
     """
     def _append_tail_blocks(base: str) -> str:
         out = (base or "").rstrip()
@@ -3158,6 +3167,9 @@ def generate_morning_briefing(
         px = (proactive_intelligence_appendix or "").strip()
         if px:
             out = f"{out}\n\n{px}".strip()
+        sx = (surveillance_appendix or "").strip()
+        if sx:
+            out = f"{out}\n\n{sx}".strip()
         return out
 
     date_time_str = get_current_datetime_str(timezone)
@@ -5647,6 +5659,14 @@ class AngelCore:
         except Exception:
             forensic_cmd, forensic_payload = None, {}
 
+        surv_cmd, surv_payload = None, {}
+        try:
+            import angel_surveillance as asurv
+
+            surv_cmd, surv_payload = asurv.detect_surveillance_chat_intent(user_message)
+        except Exception:
+            surv_cmd, surv_payload = None, {}
+
         ta_cmd, ta_payload = None, {}
         try:
             import angel_threat_actors as ata
@@ -5732,6 +5752,12 @@ class AngelCore:
                 "If a block labeled [Angel forensic visual analysis] appears, integrate it: summarize the four layers, the authenticity confidence, UAP assessment if present, "
                 "and any **mission_cross_reference** hits. Stress uncertainty and that this is open-source visual inference—not lab chain-of-custody. "
                 "If the block says no image was attached, tell Tyler to use POST /api/forensic/analyze (or /uap /document) or paste a data-URI image."
+            )
+        if surv_cmd:
+            system_prompt += (
+                "\n\nTyler asked about **open-source surveillance monitoring** (legal public OSINT: flight/maritime/news/records patterns). "
+                "If a block labeled [Angel surveillance monitoring] appears, summarize recent signals by category, highlight STRONG or **correlated** clusters, "
+                "and connect to mission context without implying classified collection."
             )
 
         cc_runtime = (
@@ -6058,6 +6084,21 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if fiblock.strip():
                     augmented_user_message = f"{augmented_user_message}\n\n{fiblock}"
+            except Exception:
+                pass
+
+        if surv_cmd:
+            try:
+                import angel_surveillance as asurv
+
+                sblock = asurv.format_surveillance_chat_block(
+                    surv_cmd,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                )
+                if sblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{sblock}"
             except Exception:
                 pass
 

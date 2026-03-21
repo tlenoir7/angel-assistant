@@ -19,6 +19,7 @@ import angel_translation
 import angel_file_reading
 import angel_threat_actors
 import angel_forensic
+import angel_surveillance
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -350,6 +351,30 @@ def _flush_high_threat_push() -> None:
     send_expo_push_notifications("Angel: elevated threat intel", body[:200])
 
 
+def _run_surveillance_job() -> None:
+    """Every 8 hours: open-source surveillance OSINT scan (legal public sources)."""
+    global angel
+    if angel is None:
+        return
+    try:
+        r = angel_surveillance.run_osint_surveillance(
+            angel.anthropic_client,
+            angel.memory_client,
+            angel.user_id,
+            angel.files_cabinet,
+            angel._use_mem0_cloud,
+        )
+        print(
+            f"[web_app] Surveillance: categories={r.get('categories_scanned')} "
+            f"signals={len(r.get('signals') or [])} filed_si={len(r.get('filed_si') or [])} "
+            f"correlated={bool(r.get('correlated'))}",
+            flush=True,
+        )
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[web_app] Surveillance job failed: {e}", flush=True)
+
+
 def _run_threat_detection_job() -> None:
     """Scheduled Tavily + Claude threat scan; CRITICAL push now, HIGH push batched within ~1 hour."""
     global angel, HIGH_THREAT_PUSH_BUFFER, angel_scheduler
@@ -429,6 +454,19 @@ def _run_morning_briefing_job():
             angel._use_mem0_cloud,
             last_run_summary=pro_run,
         )
+        surv_run = angel_surveillance.run_osint_surveillance(
+            client,
+            angel.memory_client,
+            user_id,
+            angel.files_cabinet,
+            angel._use_mem0_cloud,
+        )
+        surveillance_appendix = angel_surveillance.format_surveillance_for_briefing(
+            angel.memory_client,
+            user_id,
+            angel._use_mem0_cloud,
+            last_run=surv_run,
+        )
         morning_briefing = generate_morning_briefing(
             client,
             user_id,
@@ -438,6 +476,7 @@ def _run_morning_briefing_job():
             recent_briefing_history=recent_briefing_history or None,
             threat_appendix=threat_appendix or None,
             proactive_intelligence_appendix=proactive_appendix or None,
+            surveillance_appendix=surveillance_appendix or None,
         )
         briefing_generated_at = time.time()
         send_briefing_email(morning_briefing)
@@ -766,6 +805,7 @@ def create_app() -> Flask:
     )
     scheduler.add_job(_run_check_in_job, "interval", minutes=15)
     scheduler.add_job(_run_threat_detection_job, "interval", hours=6)
+    scheduler.add_job(_run_surveillance_job, "interval", hours=8)
     scheduler.start()
 
     # --- WebSocket (Socket.IO) for persistent iOS / low-latency clients ---
@@ -1743,6 +1783,63 @@ def create_app() -> Flask:
                 use_mem0_cloud=angel._use_mem0_cloud,
             )
             return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Open-source surveillance monitoring (Batcomputer; legal OSINT) ---
+
+    @app.route("/api/surveillance/run", methods=["GET"])
+    def api_surveillance_run():
+        """Manual trigger: full multi-category Tavily surveillance scan."""
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            r = angel_surveillance.run_osint_surveillance(
+                angel.anthropic_client,
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/surveillance/findings", methods=["GET"])
+    def api_surveillance_findings():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            lim = request.args.get("limit", "40")
+            try:
+                n = max(1, min(100, int(lim)))
+            except ValueError:
+                n = 40
+            rows = angel_surveillance.fetch_recent_surveillance_findings(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+                limit=n,
+            )
+            return jsonify({"ok": True, "findings": rows, "count": len(rows)})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/surveillance/signals", methods=["GET"])
+    def api_surveillance_signals():
+        """Active signals grouped by surveillance category."""
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            by_cat = angel_surveillance.get_signals_by_category(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "by_category": by_cat})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
