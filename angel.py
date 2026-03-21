@@ -764,6 +764,7 @@ def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet
     if not reply or not isinstance(reply, str):
         return reply
     text = reply
+    filed_success: list[tuple[str, str]] = []  # (file_name, folder) for confirmation if reply is empty
 
     # 1) [FILE:folder=...|name=...] blocks
     pos = 0
@@ -795,6 +796,7 @@ def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet
 
         try:
             files_cabinet.create_file(folder, name, body, tags=None)
+            filed_success.append((name, folder))
             print(
                 f"{Fore.MAGENTA}Intelligence file saved: {folder!r} / {name!r}{Style.RESET_ALL}"
             )
@@ -832,6 +834,7 @@ def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet
 
         try:
             files_cabinet.create_file(folder, name, body, tags=None)
+            filed_success.append((name, folder))
             print(
                 f"{Fore.MAGENTA}Intelligence file saved (legacy block): {folder!r} / {name!r}{Style.RESET_ALL}"
             )
@@ -847,6 +850,11 @@ def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet
         left = text[:start].rstrip()
         right = text[end:].lstrip()
         text = f"{left}\n\n{right}".strip() if left and right else (left + right).strip()
+
+    if not (text or "").strip() and filed_success:
+        text = "Filed. " + " ".join(
+            f"[{fname}] saved to [{fld}]." for fname, fld in filed_success
+        )
 
     return text
 
