@@ -69,6 +69,17 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
 ANGEL_PATTERN_PREFIX = "[ANGEL_PATTERN]:"
 # Sentinel for Angel to output a new/updated person profile (parsed and stored)
 ANGEL_PROFILE_PREFIX = "[ANGEL_PROFILE]:"
+# Legacy: Intelligence File Cabinet creation block (parsed in generate_reply)
+INTELLIGENCE_FILE_CREATED_PREFIX = "[INTELLIGENCE FILE CREATED]"
+# Preferred machine-parseable filing tag (stripped from Tyler-visible reply after save)
+_INTELLIGENCE_FILE_TAG_RE = re.compile(
+    r"\[FILE:\s*folder\s*=\s*([^|]*?)\s*\|\s*name\s*=\s*([^\]]+?)\s*\]",
+    re.IGNORECASE,
+)
+# Folder:/File: lines after [INTELLIGENCE FILE CREATED]
+_LEGACY_INTEL_FILE_BLOCK_RE = re.compile(
+    r"(?i)\[INTELLIGENCE FILE CREATED\]\s*\r?\n\s*Folder:\s*([^\n\r]+)\s*\r?\n\s*File:\s*([^\n\r]+)\s*\r?\n([\s\S]*?)(?=\r?\n\s*\[INTELLIGENCE FILE CREATED\]|\r?\n\s*\[FILE:\s*folder\s*=|\Z)",
+)
 
 # Fenced ```python ... ``` blocks in Angel's reply (executed server-side after generation).
 # Opening fence may use spaces (``` python), optional CRLF after the tag, and optional whitespace after closing ```.
@@ -716,6 +727,128 @@ def extract_stage2_from_reply(reply: str) -> tuple[str, str | None, tuple[str, s
         cleaned = cleaned.rstrip()
 
     return cleaned, pattern_text, profile_tuple
+
+
+def _next_intelligence_markup_in_tail(tail: str) -> int | None:
+    """
+    Offset in tail where the next filing markup starts (so file body ends before it).
+    Returns None if no following markup.
+    """
+    if not tail:
+        return None
+    positions: list[int] = []
+    m2 = _INTELLIGENCE_FILE_TAG_RE.search(tail)
+    if m2:
+        positions.append(m2.start())
+    mleg = re.search(r"(?i)\r?\n\s*\[INTELLIGENCE FILE CREATED\]", tail)
+    if mleg:
+        positions.append(mleg.start())
+    return min(positions) if positions else None
+
+
+def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet") -> str:
+    """
+    Detect filing markup in Angel's reply, call files_cabinet.create_file, and strip
+    saved blocks from the text Tyler sees.
+
+    Preferred: ``[FILE:folder=FolderName|name=FileName]`` then the file body until the
+    next filing marker or EOF.
+
+    Legacy::
+
+        [INTELLIGENCE FILE CREATED]
+        Folder: ...
+        File: ...
+        <body>
+    """
+    if not reply or not isinstance(reply, str):
+        return reply
+    text = reply
+
+    # 1) [FILE:folder=...|name=...] blocks
+    pos = 0
+    while True:
+        m = _INTELLIGENCE_FILE_TAG_RE.search(text, pos)
+        if not m:
+            break
+        folder = (m.group(1) or "").strip() or "Uncategorized"
+        name = (m.group(2) or "").strip()
+        start, end_tag = m.start(), m.end()
+        tail = text[end_tag:]
+        rel_end = _next_intelligence_markup_in_tail(tail)
+        chunk_end = end_tag + rel_end if rel_end is not None else len(text)
+        body = text[end_tag:chunk_end].strip()
+
+        if not name:
+            pos = end_tag
+            continue
+
+        if not body:
+            print(
+                f"{Fore.YELLOW}Intelligence file tag {name!r} had empty body; stripping tag only.{Style.RESET_ALL}"
+            )
+            left = text[:start].rstrip()
+            right = text[end_tag:].lstrip()
+            text = f"{left}\n\n{right}".strip() if left and right else (left + right).strip()
+            pos = 0
+            continue
+
+        try:
+            files_cabinet.create_file(folder, name, body, tags=None)
+            print(
+                f"{Fore.MAGENTA}Intelligence file saved: {folder!r} / {name!r}{Style.RESET_ALL}"
+            )
+        except ValueError as e:
+            print(
+                f"{Fore.YELLOW}Intelligence file not saved ({e}); markup left in reply.{Style.RESET_ALL}"
+            )
+            pos = end_tag
+            continue
+        except Exception as e:
+            print(f"{Fore.YELLOW}Intelligence file save error: {e}{Style.RESET_ALL}")
+            pos = end_tag
+            continue
+
+        left = text[:start].rstrip()
+        right = text[chunk_end:].lstrip()
+        text = f"{left}\n\n{right}".strip() if left and right else (left + right).strip()
+        pos = 0
+
+    # 2) Legacy [INTELLIGENCE FILE CREATED] / Folder: / File: / body
+    while True:
+        m = _LEGACY_INTEL_FILE_BLOCK_RE.search(text)
+        if not m:
+            break
+        folder = (m.group(1) or "").strip() or "Uncategorized"
+        name = (m.group(2) or "").strip()
+        body = (m.group(3) or "").strip()
+        start, end = m.span()
+
+        if not name or not body:
+            left = text[:start].rstrip()
+            right = text[end:].lstrip()
+            text = f"{left}\n\n{right}".strip() if left and right else (left + right).strip()
+            continue
+
+        try:
+            files_cabinet.create_file(folder, name, body, tags=None)
+            print(
+                f"{Fore.MAGENTA}Intelligence file saved (legacy block): {folder!r} / {name!r}{Style.RESET_ALL}"
+            )
+        except ValueError as e:
+            print(
+                f"{Fore.YELLOW}Intelligence file not saved ({e}); legacy block left in reply.{Style.RESET_ALL}"
+            )
+            break
+        except Exception as e:
+            print(f"{Fore.YELLOW}Intelligence file save error: {e}{Style.RESET_ALL}")
+            break
+
+        left = text[:start].rstrip()
+        right = text[end:].lstrip()
+        text = f"{left}\n\n{right}".strip() if left and right else (left + right).strip()
+
+    return text
 
 
 def _strip_transcript_prefixes_from_memory(text: str) -> str:
@@ -1641,7 +1774,9 @@ Python code execution (server sandbox):
 
 Intelligence File Cabinet (your filing system):
 - You maintain an Intelligence File Cabinet: structured files stored for Tyler, organized by folders you invent as an intelligence officer would. There are NO fixed folder names—you create folders dynamically from the nature of the material.
-- When you research or produce findings Tyler may want to retain, offer to save them to a file in a folder that fits (Tyler or the app can create/update files via the API; describe clearly what you recommend filing and where).
+- When you research or produce findings Tyler may want to retain, offer to save them—and when you actually file something, you MUST use the machine-readable tag below or the legacy block; prose alone does not persist a file.
+- REQUIRED format to save a new file (exact spelling and keys; Tyler will not see this tag or the duplicated body after the server saves it): put `[FILE:folder=FolderName|name=FileName]` immediately before the text you want stored (same line or the line above the body). Everything after that tag until the next `[FILE:folder=` or `[INTELLIGENCE FILE CREATED]` or end of message becomes the file content. Use a unique `name` per file (e.g. `Roswell-Notes-1947`). Example: `[FILE:folder=UAP Incidents|name=Foofighters-summary]` then a newline then the intelligence text.
+- Optional legacy block (still parsed): a line `[INTELLIGENCE FILE CREATED]`, then `Folder: ...` and `File: ...` each on their own line, then the file body.
 - When Tyler mentions something important—facts, leads, plans, people, timelines, or decisions—consider suggesting they file it so nothing is lost.
 - You may use any folder label that makes sense. Examples of the kinds of folders you might create (purely illustrative, not a checklist): UAP Incidents, Whistleblowers, Government Programs, Active Investigations, Technology Analysis, People of Interest, Mission Log. These are only examples; create whatever folders fit Tyler's work and interests.
 - Files have names, folder paths, tags, and body text. Refer to what is already filed when it helps; use the live index below when present.
@@ -3238,6 +3373,7 @@ If you infer anything new about that person's preferences or dynamics, append at
                 prior_turns=session_turns,
                 refine_prose_with_stdout=False,
             )
+        reply = process_filed_intelligence_in_reply(reply, self.files_cabinet)
         memory_reply = strip_markdown(reply) if self.use_voice else reply
 
         try:
