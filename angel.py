@@ -68,8 +68,12 @@ ANGEL_PATTERN_PREFIX = "[ANGEL_PATTERN]:"
 # Sentinel for Angel to output a new/updated person profile (parsed and stored)
 ANGEL_PROFILE_PREFIX = "[ANGEL_PROFILE]:"
 
-# Fenced ```python ... ``` blocks in Angel's reply (executed server-side after generation)
-_PYTHON_CODE_BLOCK_RE = re.compile(r"```python\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
+# Fenced ```python ... ``` blocks in Angel's reply (executed server-side after generation).
+# Opening fence may use spaces (``` python), optional CRLF after the tag, and optional whitespace after closing ```.
+_PYTHON_CODE_BLOCK_RE = re.compile(
+    r"```\s*python\s*(?:\r?\n|\r)?(.*?)```\s*",
+    re.IGNORECASE | re.DOTALL,
+)
 
 EXEC_PYTHON_TIMEOUT_SEC = 30
 _EXEC_OUTPUT_MAX_CHARS = 256_000
@@ -1034,13 +1038,46 @@ def execute_python_sandbox(
             pass
 
 
+def _short_python_error_message(stderr: str, max_len: int = 500) -> str:
+    """
+    Turn sandbox stderr into a short user-facing line (no full Python tracebacks).
+    """
+    s = (stderr or "").strip()
+    if not s:
+        return "Execution failed (no details were returned)."
+    matches = list(
+        re.finditer(
+            r"^([\w.]+(?:Error|Exception|BaseException|Warning)): (.+)$",
+            s,
+            re.MULTILINE,
+        )
+    )
+    if matches:
+        m = matches[-1]
+        line = f"{m.group(1)}: {m.group(2)}".strip()
+        return line[:max_len]
+    lines = [ln.rstrip() for ln in s.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        stripped_ln = ln.strip()
+        if stripped_ln.startswith("File ") or stripped_ln.startswith('File "'):
+            continue
+        if stripped_ln == "Traceback (most recent call last):":
+            continue
+        if stripped_ln.startswith("During handling of the above exception"):
+            continue
+        if ln.startswith("  ") and ("File " in ln or "line " in ln.lower()):
+            continue
+        return ln[:max_len]
+    return s[:max_len]
+
+
 def append_executed_python_results_to_reply(reply: str) -> str:
     """
     Find ```python ... ``` fences, run each block in the sandbox, remove those fences
-    entirely from the text Tyler sees, then append stdout/stderr so only Angel's prose
-    (interpretation) plus computed output remain.
+    entirely from the text Tyler sees, then append computed output only when there is
+    real stdout; on failure with empty stdout, append a short error line (no traceback).
     """
-    if not reply or "```python" not in reply.lower():
+    if not reply or not re.search(r"```\s*python", reply, re.IGNORECASE):
         return reply
     matches = list(_PYTHON_CODE_BLOCK_RE.finditer(reply))
     if not matches:
@@ -1049,6 +1086,7 @@ def append_executed_python_results_to_reply(reply: str) -> str:
     stripped = _PYTHON_CODE_BLOCK_RE.sub("\n\n", reply)
     stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
 
+    n_blocks = len(matches)
     sections: list[str] = []
     for i, m in enumerate(matches, start=1):
         raw = m.group(1)
@@ -1056,19 +1094,29 @@ def append_executed_python_results_to_reply(reply: str) -> str:
         if not code:
             continue
         ex = execute_python_sandbox(code)
-        out = (ex.get("output") or "").rstrip() or "(no stdout)"
-        err = (ex.get("error") or "").rstrip()
-        if ex.get("success"):
-            hdr = "**Computed output:**\n" if len(matches) == 1 else f"**Computed output ({i}):**\n"
+        out = ((ex.get("output") or "").rstrip())
+        err_full = ((ex.get("error") or "").rstrip())
+        success = bool(ex.get("success"))
+        out_nonempty = bool(out.strip())
+        short_err = _short_python_error_message(err_full)
+
+        if success:
+            if not out_nonempty:
+                continue
+            hdr = "**Computed output:**\n" if n_blocks == 1 else f"**Computed output ({i}):**\n"
             block = f"{hdr}```\n{out}\n```"
-            if err:
-                block += f"\n```\n(stderr)\n{err}\n```"
+            if err_full.strip():
+                block += f"\n_(stderr)_\n```\n{err_full[:8000]}\n```"
+            sections.append(block)
         else:
-            block = (
-                f"**Computation issue ({i}):**\nstdout:\n```\n{out}\n```\n"
-                f"stderr / error:\n```\n{err or '(none)'}\n```"
-            )
-        sections.append(block)
+            hdr = "**Computation issue:**\n" if n_blocks == 1 else f"**Computation issue ({i}):**\n"
+            if out_nonempty:
+                sections.append(
+                    f"{hdr}Partial stdout:\n```\n{out}\n```\n**Error:** {short_err}"
+                )
+            else:
+                sections.append(f"{hdr}{short_err}")
+
     if not sections:
         return stripped
     appendix = "\n\n---\n" + "\n\n".join(sections) + "\n"
@@ -1110,7 +1158,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Voice conversation on desktop (microphone + TTS).
 - Text and voice interface on mobile web.
 - Cloud deployment accessible from any device.
-- Sandboxed Python execution for computation and science: numpy, scipy, pandas, matplotlib (headless), sympy. You may embed a hidden ```python block for the server to run (30s limit); Tyler never sees that code—only your written answer plus the appended computed output.
+- Sandboxed Python execution for computation and science: numpy, scipy, pandas, matplotlib (headless), sympy. You may embed a hidden ```python fenced block for the server to run (30s limit). That entire fence—including every line of code—is removed before Tyler sees your message; Tyler only sees your prose plus any appended stdout from the run. Never paste the same code again in plain text.
 
 {date_time_str}
 """
@@ -1171,9 +1219,11 @@ Memory reflection (how you think, not just what you store):
 - When a recent reflection appears in your context, you may cite it naturally (e.g. "When I reviewed what I remember, I noticed…") without treating it as infallible truth.
 
 Python code execution (server sandbox):
-- Write Python code to compute the answer when computation, statistics, data shaping, simulation, numerical or symbolic math, or modeling would help—but do not show the code in your response. In your visible reply, give only your final answer, reasoning, and interpretation in natural language.
-- Put the runnable code alone inside a single fenced block tagged python (triple-backtick python) at the end of your model output. That block is stripped before Tyler sees your message and is executed silently; only stdout/stderr from the run are appended under your prose so Tyler sees computed results alongside your interpretation.
-- Use print() inside the hidden block for numbers, tables, and summaries. Libraries: numpy, scipy, pandas, matplotlib (Agg backend is automatic; prefer printed summaries over expecting images), sympy.
+- Write simple, valid Python to compute the answer when computation, statistics, data shaping, simulation, numerical or symbolic math, or modeling would help. In the text Tyler sees, give ONLY your final answer, reasoning, and interpretation in natural language—never repeat or display the code; the ```python fence is removed in full before delivery.
+- Put the runnable code alone inside a single fenced block tagged python (triple-backtick + python) at the end of your model output. The server strips that entire fence (opening line through closing ```) and runs the code; Tyler never sees it.
+- Always use print() for every result you want Tyler to see; execution only surfaces stdout. Do not rely on implicit expression values or notebook-style last-line display.
+- Use only positional arguments with range(), e.g. range(10) or range(0, n)—range() does not accept keyword arguments like stop= in Python.
+- Libraries: numpy, scipy, pandas, matplotlib (Agg backend is automatic; prefer printed summaries over expecting images), sympy.
 - If execution fails, Tyler still will not see your code—briefly explain in prose what went wrong and, if useful, supply a corrected hidden block on the next turn.
 - Keep hidden scripts short and safe: avoid unnecessary network calls, file writes outside temp unless Tyler asked, or destructive operations.
 """
