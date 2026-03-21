@@ -16,6 +16,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import angel_predictions
 import angel_proactive
 import angel_translation
+import angel_file_reading
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -1654,6 +1655,66 @@ def create_app() -> Flask:
             return jsonify({"ok": True, "file": rec})
         except ValueError as e:
             return jsonify({"ok": False, "error": str(e)}), 400
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/files/read", methods=["POST"])
+    def api_files_read():
+        """
+        Read and analyze an uploaded file: multipart form (field `file`, optional `context`, `file_type`)
+        or JSON body { file_content (base64), file_name, context, file_type }.
+        """
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        context = ""
+        file_name = "upload.bin"
+        file_type = ""
+        file_b64 = ""
+
+        ct = (request.content_type or "").lower()
+        if "multipart/form-data" in ct:
+            f = request.files.get("file")
+            if f and f.filename:
+                try:
+                    raw = f.read()
+                    file_b64 = base64.b64encode(raw).decode("ascii")
+                    file_name = f.filename or "upload.bin"
+                except Exception as e:
+                    return jsonify({"ok": False, "error": f"Could not read upload: {e}"}), 400
+            context = (request.form.get("context") or "").strip()
+            file_type = (request.form.get("file_type") or request.form.get("mime") or "").strip()
+        else:
+            data = request.get_json(silent=True) or {}
+            file_b64 = (data.get("file_content") or data.get("content") or "").strip()
+            file_name = (data.get("file_name") or data.get("name") or "upload.bin").strip() or "upload.bin"
+            context = (data.get("context") or "").strip()
+            file_type = (data.get("file_type") or data.get("mime") or "").strip()
+
+        if not file_b64:
+            return jsonify({
+                "ok": False,
+                "error": "No file content. Use multipart form field 'file' or JSON 'file_content' (base64).",
+            }), 400
+
+        try:
+            r = angel_file_reading.read_and_analyze_file(
+                file_b64,
+                file_name,
+                file_type,
+                context,
+                angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                files_cabinet=angel.files_cabinet,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            if r.get("ok"):
+                r["filing_offer"] = angel_file_reading.filing_suggestion_line(
+                    str(r.get("intelligence_value") or "MEDIUM")
+                )
+                r["suggested_folder"] = angel_file_reading.suggest_filing_folder(r)
+            return jsonify(r)
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
