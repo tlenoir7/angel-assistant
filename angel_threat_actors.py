@@ -550,7 +550,8 @@ Be conservative; if evidence is thin, use LOW/MEDIUM and say so in notes."""
 
 _SEED_ACTORS: list[dict[str, Any]] = [
     {
-        "actor_id": "aaro",
+        # Distinct from mission graph node id "aaro" (same org, different Mem0 row / file TA-aaro-threat-actor).
+        "actor_id": "aaro-threat-actor",
         "name": "AARO (All-domain Anomaly Resolution Office)",
         "actor_type": "organization",
         "role": "DoD office tasked with UAP data collection and public reporting",

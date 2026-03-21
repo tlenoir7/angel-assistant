@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -13,6 +14,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from io import BytesIO
 import wave
+
+_mission_graph_log = logging.getLogger(__name__)
 import tempfile
 
 import requests
@@ -5178,7 +5181,7 @@ def seed_mission_network_if_empty(
             )
 
         def e(a, b, rt, desc, st="STRONG", ev="Mission seed graph"):
-            add_network_edge(
+            return add_network_edge(
                 a, b, rt, desc, st, ev,
                 memory_client=memory_client,
                 user_id=user_id,
@@ -5199,11 +5202,56 @@ def seed_mission_network_if_empty(
         e("Ross Coulthart", "Luis Elizondo", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
         e("Ross Coulthart", "David Grusch", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
         e("Ross Coulthart", "Christopher Mellon", "connected_to", "Media / public commentary.", "MODERATE", "Seed data")
-        e("Marco Rubio", "AARO", "connected_to", "Public statements on UAP governance and oversight context.", "MODERATE", "Seed data")
-        e("Marco Rubio", "House Oversight Committee", "connected_to", "Congressional UAP hearings / oversight context (role varies by cycle).", "MODERATE", "Seed data")
-        e("Marco Rubio", "David Grusch", "corroborates", "Public UAP statements aligned with disclosure themes (open sources).", "WEAK", "Seed data")
+        # Marco Rubio cluster — pass canonical slugs (marco-rubio, aaro, house-oversight-committee, david-grusch)
+        # so edge endpoints match mission node ids after _network_normalize_node_id.
+        _mr_edges = [
+            (
+                "marco-rubio",
+                "aaro",
+                "connected_to",
+                "Public statements on UAP governance and oversight context.",
+                "MODERATE",
+                "Seed data",
+            ),
+            (
+                "marco-rubio",
+                "house-oversight-committee",
+                "connected_to",
+                "Congressional UAP hearings / oversight context (role varies by cycle).",
+                "MODERATE",
+                "Seed data",
+            ),
+            (
+                "marco-rubio",
+                "david-grusch",
+                "corroborates",
+                "Public UAP statements aligned with disclosure themes (open sources).",
+                "WEAK",
+                "Seed data",
+            ),
+        ]
+        for src_raw, tgt_raw, rt, desc, st, ev in _mr_edges:
+            sid = _network_normalize_node_id(src_raw)
+            tid = _network_normalize_node_id(tgt_raw)
+            _mission_graph_log.info(
+                "seed_mission_network_if_empty: Marco Rubio edge input %r -> %r (%s) "
+                "normalized source_id=%s target_id=%s",
+                src_raw,
+                tgt_raw,
+                rt,
+                sid,
+                tid,
+            )
+            edge_out = e(src_raw, tgt_raw, rt, desc, st, ev)
+            _mission_graph_log.info(
+                "seed_mission_network_if_empty: Marco Rubio edge stored edge_id=%s source_id=%s target_id=%s",
+                edge_out.get("edge_id"),
+                edge_out.get("source_id"),
+                edge_out.get("target_id"),
+            )
         return True
     except Exception:
+        _mission_graph_log.exception("seed_mission_network_if_empty failed")
         return False
 
 
