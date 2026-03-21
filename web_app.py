@@ -5,7 +5,7 @@ import time
 from io import BytesIO
 from pathlib import Path
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import requests
 from flask import Flask, Response, jsonify, render_template_string, request
@@ -31,6 +31,12 @@ from angel import (
     CATEGORY_BRIEFING_HISTORY,
     strip_markdown,
     execute_python_sandbox,
+    THREAT_WATCH_DEFAULT_CATEGORIES,
+    THREAT_INTEL_FOLDER,
+    load_merged_threat_watch_categories,
+    add_threat_category,
+    run_threat_detection,
+    format_threat_intelligence_for_briefing,
 )
 
 try:
@@ -57,6 +63,10 @@ REALTIME_PROXY_BY_SID: dict[str, dict] = {}
 PUSH_TOKENS_PATH = Path(__file__).resolve().parent / "push_tokens.json"
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 expo_push_tokens: list[str] = []
+
+# Item 12 threat detection: scheduler handle for delayed HIGH pushes; buffer of headlines
+angel_scheduler: BackgroundScheduler | None = None
+HIGH_THREAT_PUSH_BUFFER: list[str] = []
 
 
 _VALID_CLIENT_DEVICES = frozenset({"ios", "desktop", "mobile_web"})
@@ -255,6 +265,72 @@ def send_expo_push_notifications(
         return {"ok": False, "error": str(e), "status": None, "expo_response": None}
 
 
+def _flush_high_threat_push() -> None:
+    """Send one batched push for HIGH threats (scheduled ~1 hour after scan)."""
+    global HIGH_THREAT_PUSH_BUFFER
+    if not HIGH_THREAT_PUSH_BUFFER:
+        return
+    headlines = HIGH_THREAT_PUSH_BUFFER[:8]
+    HIGH_THREAT_PUSH_BUFFER = []
+    body = "; ".join(h for h in headlines if h)
+    if not body:
+        return
+    send_expo_push_notifications("Angel: elevated threat intel", body[:200])
+
+
+def _run_threat_detection_job() -> None:
+    """Scheduled Tavily + Claude threat scan; CRITICAL push now, HIGH push batched within ~1 hour."""
+    global angel, HIGH_THREAT_PUSH_BUFFER, angel_scheduler
+    if angel is None:
+        return
+    try:
+        client = create_anthropic_client()
+        memories = angel._fetch_combined_memories()
+        memory_summary = build_memory_summary_with_sections(
+            memories, None, omit_reflection_section=True
+        )
+        result = run_threat_detection(
+            client,
+            angel.memory_client,
+            angel.user_id,
+            angel.files_cabinet,
+            use_mem0_cloud=angel._use_mem0_cloud,
+            memory_summary=memory_summary,
+        )
+        for t in result.get("threats") or []:
+            if not isinstance(t, dict):
+                continue
+            if t.get("skipped"):
+                continue
+            lvl = (t.get("threat_level") or "").strip().upper()
+            headline = (t.get("headline") or "").strip() or "Threat intel"
+            if not t.get("filed_as"):
+                continue
+            if lvl == "CRITICAL":
+                send_expo_push_notifications("Angel: CRITICAL threat intel", headline[:200])
+            elif lvl == "HIGH":
+                HIGH_THREAT_PUSH_BUFFER.append(headline)
+        if HIGH_THREAT_PUSH_BUFFER and angel_scheduler is not None:
+            try:
+                angel_scheduler.add_job(
+                    _flush_high_threat_push,
+                    "date",
+                    run_date=datetime.now(timezone.utc) + timedelta(hours=1),
+                    id="angel_high_threat_push_flush",
+                    replace_existing=True,
+                )
+            except Exception as e:
+                print(f"[web_app] Could not schedule HIGH threat push: {e}", flush=True)
+        print(
+            f"[web_app] Threat detection: categories={result.get('categories_scanned')}, "
+            f"items={len(result.get('threats') or [])}, errors={len(result.get('errors') or [])}",
+            flush=True,
+        )
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[web_app] Threat detection job failed: {e}", flush=True)
+
+
 def _run_morning_briefing_job():
     global morning_briefing, briefing_generated_at
     try:
@@ -267,6 +343,7 @@ def _run_morning_briefing_job():
         latest_reflection = get_latest_reflection_text(memories)
         recent_briefing_history = get_recent_briefing_history_for_prompt(memories, days=7)
         tz = os.getenv("TIMEZONE", "America/Los_Angeles")
+        threat_appendix = format_threat_intelligence_for_briefing(angel.files_cabinet)
         morning_briefing = generate_morning_briefing(
             client,
             user_id,
@@ -274,6 +351,7 @@ def _run_morning_briefing_job():
             timezone=tz,
             latest_reflection=latest_reflection,
             recent_briefing_history=recent_briefing_history or None,
+            threat_appendix=threat_appendix or None,
         )
         briefing_generated_at = time.time()
         send_briefing_email(morning_briefing)
@@ -346,7 +424,7 @@ def _run_check_in_job():
 
 
 def create_app() -> Flask:
-    global angel, socketio
+    global angel, socketio, angel_scheduler
     app = Flask(__name__)
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "angel-dev-secret-set-in-production")
 
@@ -384,6 +462,7 @@ def create_app() -> Flask:
         hour, minute = 8, 0
     sched_tz = os.getenv("TIMEZONE", "America/Los_Angeles").strip()
     scheduler = BackgroundScheduler()
+    angel_scheduler = scheduler
     scheduler.add_job(_run_morning_briefing_job, "cron", hour=hour, minute=minute)
     scheduler.add_job(
         _run_weekly_reflection_job,
@@ -394,6 +473,7 @@ def create_app() -> Flask:
         timezone=sched_tz,
     )
     scheduler.add_job(_run_check_in_job, "interval", minutes=15)
+    scheduler.add_job(_run_threat_detection_job, "interval", hours=6)
     scheduler.start()
 
     # --- WebSocket (Socket.IO) for persistent iOS / low-latency clients ---
@@ -1397,6 +1477,98 @@ def create_app() -> Flask:
             return jsonify({"error": "Angel not initialized"}), 503
         folders = angel.files_cabinet.list_folders()
         return jsonify({"ok": True, "folders": folders})
+
+    # --- Item 12: threat detection (watch categories + Threat Intelligence files) ---
+    # Default watch queries are defined in angel.THREAT_WATCH_DEFAULT_CATEGORIES (imported above).
+
+    @app.route("/api/threats/scan", methods=["GET"])
+    def api_threats_scan():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            client = create_anthropic_client()
+            memories = angel._fetch_combined_memories()
+            memory_summary = build_memory_summary_with_sections(
+                memories, None, omit_reflection_section=True
+            )
+            result = run_threat_detection(
+                client,
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                memory_summary=memory_summary,
+            )
+            for t in result.get("threats") or []:
+                if isinstance(t, dict) and t.get("summary"):
+                    t["summary"] = _sanitize_text(str(t["summary"]))
+            return jsonify({"ok": True, **result})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/threats/list", methods=["GET"])
+    def api_threats_list():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            recs = angel.files_cabinet.list_files(folder=THREAT_INTEL_FOLDER)
+            out = []
+            for r in recs:
+                name = (r.get("name") or "").strip()
+                if not name:
+                    continue
+                full = angel.files_cabinet.get_file(name)
+                if full:
+                    out.append(full)
+            return jsonify({"ok": True, "folder": THREAT_INTEL_FOLDER, "files": out})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/threats/category/add", methods=["POST"])
+    def api_threats_category_add():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        label = (data.get("category") or data.get("label") or "").strip()
+        if not label:
+            return jsonify({"ok": False, "error": "JSON body needs 'category' or 'label'."}), 400
+        try:
+            add_threat_category(
+                angel.memory_client,
+                angel.user_id,
+                label,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            merged = load_merged_threat_watch_categories(
+                angel.memory_client, angel.user_id, angel._use_mem0_cloud
+            )
+            return jsonify({"ok": True, "added": label, "categories": merged})
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/threats/categories", methods=["GET"])
+    def api_threats_categories():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            merged = load_merged_threat_watch_categories(
+                angel.memory_client, angel.user_id, angel._use_mem0_cloud
+            )
+            return jsonify(
+                {
+                    "ok": True,
+                    "categories": merged,
+                    "default_count": len(THREAT_WATCH_DEFAULT_CATEGORIES),
+                }
+            )
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.route("/api/briefing", methods=["GET"])
     def api_briefing():

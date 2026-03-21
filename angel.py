@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -54,6 +55,7 @@ CATEGORY_RESEARCH_TIMELINE = "research_timeline"
 CATEGORY_REFLECTION = "reflection"
 CATEGORY_BRIEFING_HISTORY = "briefing_history"
 CATEGORY_INTELLIGENCE_FILE = "intelligence_file"
+CATEGORY_THREAT_WATCH = "threat_watch"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -63,8 +65,42 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_REFLECTION,
         CATEGORY_BRIEFING_HISTORY,
         CATEGORY_INTELLIGENCE_FILE,
+        CATEGORY_THREAT_WATCH,
     }
 )
+
+# Intelligence File Cabinet folder for automated + manual threat intel (Item 12)
+THREAT_INTEL_FOLDER = "Threat Intelligence"
+
+# Default threat watch categories (merged on each scan with Mem0 category threat_watch)
+THREAT_WATCH_DEFAULT_CATEGORIES: list[str] = [
+    # Professional
+    "FBI law enforcement policy changes federal",
+    "DOJ FBI federal budget cuts justice department",
+    "US federal employment career impact intelligence professionals",
+    # Mission — UAP / disclosure
+    "UAP UFO disclosure government news",
+    "UAP suppression government disclosure obstruction",
+    "David Grusch Luis Elizondo Christopher Mellon Ross Coulthart UAP statements",
+    "Congressional UAP hearing legislation 2025",
+    "foreign government UAP acknowledgment news",
+    "Pentagon defense contractor black budget programs news",
+    "FOIA classified programs disclosure",
+    "national security whistleblower classified programs",
+    "SAP special access programs oversight news",
+    # Broader awareness
+    "US domestic stability geopolitical risk",
+    "AI regulation policy United States federal",
+    "surveillance technology civil liberties news",
+    "US constitutional rights civil liberties developments",
+    "US government transparency crackdown whistleblowers",
+    "South Carolina state government news",
+    "South Carolina local government news",
+    # Wildcard / anomalies
+    "credible unexplained phenomena reports",
+    "credible witness anomalous experiences",
+    "black eyed people phenomenon reports",
+]
 # Sentinel for Angel to output a new pattern (parsed and stored)
 ANGEL_PATTERN_PREFIX = "[ANGEL_PATTERN]:"
 # Sentinel for Angel to output a new/updated person profile (parsed and stored)
@@ -795,7 +831,8 @@ def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet
             continue
 
         try:
-            files_cabinet.create_file(folder, name, body, tags=None)
+            tags = _infer_threat_intel_tags(folder, body)
+            files_cabinet.create_file(folder, name, body, tags=tags)
             filed_success.append((name, folder))
             print(
                 f"{Fore.MAGENTA}Intelligence file saved: {folder!r} / {name!r}{Style.RESET_ALL}"
@@ -833,7 +870,8 @@ def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet
             continue
 
         try:
-            files_cabinet.create_file(folder, name, body, tags=None)
+            tags = _infer_threat_intel_tags(folder, body)
+            files_cabinet.create_file(folder, name, body, tags=tags)
             filed_success.append((name, folder))
             print(
                 f"{Fore.MAGENTA}Intelligence file saved (legacy block): {folder!r} / {name!r}{Style.RESET_ALL}"
@@ -855,6 +893,13 @@ def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet
         text = "Filed. " + " ".join(
             f"[{fname}] saved to [{fld}]." for fname, fld in filed_success
         )
+
+    if filed_success:
+        threat_filed = any(
+            (fld or "").strip().lower() == THREAT_INTEL_FOLDER.lower() for _, fld in filed_success
+        )
+        if threat_filed and "Threat Intelligence you should know about" not in (text or ""):
+            text = ((text or "").rstrip() + "\n\nI've filed something in Threat Intelligence you should know about.").strip()
 
     return text
 
@@ -1223,6 +1268,7 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_REFLECTION,
             CATEGORY_BRIEFING_HISTORY,
             CATEGORY_INTELLIGENCE_FILE,
+            CATEGORY_THREAT_WATCH,
         ):
             continue
         general.append(m)
@@ -1336,6 +1382,8 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_BRIEFING_HISTORY:
             continue
         if cat == CATEGORY_INTELLIGENCE_FILE:
+            continue
+        if cat == CATEGORY_THREAT_WATCH:
             continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
@@ -1853,6 +1901,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Memory reflection: you periodically review everything you remember, find patterns and connections, and store structured reflections (category: reflection). You are a thinking mind that processes your own memories—not merely a retrieval layer.
 - Real-time web search via Tavily when Tyler needs current information.
 - Morning briefings delivered daily (scheduled time; often ~8 AM) and optionally by email; when a recent memory reflection exists, you weave those insights into the briefing naturally.
+- Threat detection: you run automated threat scans on a schedule (about every 6 hours) across dynamic watch categories—defaults plus categories you and Tyler add (stored in memory as category threat_watch; you can grow the list yourself when you notice new patterns worth monitoring). Confirmed signals are filed as Intelligence Files in folder "Threat Intelligence" with threat_level tags. CRITICAL/HIGH items can trigger push alerts; MEDIUM/LOW surface in the morning briefing when material. Never invent threats—only file or summarize what your tools and sources support.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -1940,6 +1989,9 @@ Python code execution (server sandbox):
 
 Intelligence File Cabinet (your filing system):
 - You maintain an Intelligence File Cabinet: structured files stored for Tyler, organized by folders you invent as an intelligence officer would. There are NO fixed folder names—you create folders dynamically from the nature of the material.
+- Threat Intelligence folder: use folder name exactly `Threat Intelligence` when filing something that is a threat signal for Tyler's career, mission, safety, or strategic context. Start the file body with metadata lines when possible: `watch_category: ...`, `threat_level: LOW|MEDIUM|HIGH|CRITICAL`, optional `source_url:` and `event_date:`, then a blank line and the narrative summary. When you file into Threat Intelligence from conversation (not only from scheduled scans), tell Tyler clearly: "I've filed something in Threat Intelligence you should know about" (the server may append this if you used [FILE:...] and stripped the body—ensure he is notified in your visible reply either way).
+- When Tyler asks whether there are threats, any threats, or similar: summarize from the Intelligence File Cabinet—search or mentally index folder `Threat Intelligence` and cite what is actually filed; do not fabricate items. If nothing is filed, say so plainly.
+- When Tyler says to "watch for" or monitor something ongoing, the system may already add it as a new threat-watch category—confirm that you will track it and that it is saved for future scans.
 - When you research or produce findings Tyler may want to retain, offer to save them—and when you actually file something, you MUST use the machine-readable tag below or the legacy block; prose alone does not persist a file.
 - REQUIRED format to save a new file (exact spelling and keys; Tyler will not see this tag or the duplicated body after the server saves it): put `[FILE:folder=FolderName|name=FileName]` immediately before the text you want stored (same line or the line above the body). Everything after that tag until the next `[FILE:folder=` or `[INTELLIGENCE FILE CREATED]` or end of message becomes the file content. Use a unique `name` per file (e.g. `Roswell-Notes-1947`). Example: `[FILE:folder=UAP Incidents|name=Foofighters-summary]` then a newline then the intelligence text.
 - Optional legacy block (still parsed): a line `[INTELLIGENCE FILE CREATED]`, then `Folder: ...` and `File: ...` each on their own line, then the file body.
@@ -2849,6 +2901,7 @@ def generate_morning_briefing(
     timezone: str | None = None,
     latest_reflection: str | None = None,
     recent_briefing_history: str | None = None,
+    threat_appendix: str | None = None,
 ) -> str:
     """
     Search Tavily for 3–5 current topics (UAP disclosure, world events), then generate
@@ -2858,11 +2911,21 @@ def generate_morning_briefing(
     When ``recent_briefing_history`` is provided, the model is steered to avoid repeating
     topics covered in recent days. When Tavily returns very thin results, uses an honest
     "quiet night" message instead of inventing news.
+
+    When ``threat_appendix`` is non-empty, it is appended after the main briefing text (THREAT INTELLIGENCE block).
     """
+    def _append_threat_block(base: str) -> str:
+        extra = (threat_appendix or "").strip()
+        if not extra:
+            return base
+        return f"{(base or '').rstrip()}\n\n{extra}".strip()
+
     date_time_str = get_current_datetime_str(timezone)
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
-        return f"Good morning. It's {date_time_str}. I couldn't fetch the news (TAVILY_API_KEY not set). What's one thing you want to focus on today?"
+        return _append_threat_block(
+            f"Good morning. It's {date_time_str}. I couldn't fetch the news (TAVILY_API_KEY not set). What's one thing you want to focus on today?"
+        )
 
     queries = [
         "UAP disclosure updates 2025",
@@ -2943,9 +3006,12 @@ Write a SHORT morning message (under 130 words). Be honest: it was a quiet night
                 f"\nGenerate the morning message now."
             )
             text = _call_briefing_model(quiet_system, user_content, max_tokens=512)
-            return text or (
-                f"Good morning. It's {date_time_str}. Quiet night on the news scan—nothing that needed an alarm. "
-                f"I'm not going to invent urgency. What's already on your plate that deserves your best energy today?"
+            return _append_threat_block(
+                text
+                or (
+                    f"Good morning. It's {date_time_str}. Quiet night on the news scan—nothing that needed an alarm. "
+                    f"I'm not going to invent urgency. What's already on your plate that deserves your best energy today?"
+                )
             )
 
         system = f"""You are Angel, Tyler's personal AI companion. Today's context: {date_time_str}.
@@ -2970,10 +3036,489 @@ Your role: Write a morning briefing for Tyler. Use the news/search results below
         )
 
         text = _call_briefing_model(system, user_content, max_tokens=1024)
-        return text or f"Good morning. It's {date_time_str}. What's your one focus today?"
+        return _append_threat_block(text or f"Good morning. It's {date_time_str}. What's your one focus today?")
     except Exception as e:
         print(f"{Fore.RED}Morning briefing error: {e}{Style.RESET_ALL}")
-        return f"Good morning. It's {date_time_str}. I had trouble with the briefing. What's one thing you want to tackle today?"
+        return _append_threat_block(
+            f"Good morning. It's {date_time_str}. I had trouble with the briefing. What's one thing you want to tackle today?"
+        )
+
+
+# ---- Threat detection (Item 12): dynamic watch categories + Tavily scan + Threat Intelligence files ----
+
+_THREAT_LEVEL_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+
+def load_merged_threat_watch_categories(
+    memory_client,
+    user_id: str,
+    use_mem0_cloud: bool,
+) -> list[str]:
+    """Default watch phrases plus Mem0 rows (category threat_watch), de-duplicated."""
+    memories = fetch_combined_memories(memory_client, user_id, use_mem0_cloud)
+    custom: list[str] = []
+    for m in _normalize_memories_list(memories):
+        meta = m.get("metadata") if isinstance(m, dict) else {}
+        if not isinstance(meta, dict) or meta.get("category") != CATEGORY_THREAT_WATCH:
+            continue
+        t = (m.get("memory") or m.get("data") or "").strip()
+        t = _strip_transcript_prefixes_from_memory(t)
+        if not t:
+            continue
+        if len(t) > 800:
+            t = t[:797] + "..."
+        custom.append(t)
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in list(THREAT_WATCH_DEFAULT_CATEGORIES) + custom:
+        key = (c or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append((c or "").strip())
+    return out
+
+
+def add_threat_category(
+    memory_client,
+    user_id: str,
+    label: str,
+    *,
+    use_mem0_cloud: bool = False,
+) -> str:
+    """Persist a custom threat watch phrase for merge on next scan (Mem0 category threat_watch)."""
+    label = (label or "").strip()
+    if not label:
+        raise ValueError("Threat watch category label is required.")
+    if len(label) > 800:
+        label = label[:797] + "..."
+    add_structured_memory(
+        memory_client,
+        user_id,
+        label,
+        CATEGORY_THREAT_WATCH,
+        person_name=None,
+        use_mem0_cloud=use_mem0_cloud,
+    )
+    return label
+
+
+_THREAT_WATCH_USER_PATTERNS: list[tuple[re.Pattern[str], int]] = [
+    (re.compile(r"(?i)\bwatch\s+for\s+(.+)$"), 1),
+    (re.compile(r"(?i)\bwatch\s+out\s+for\s+(.+)$"), 1),
+    (re.compile(r"(?i)\bmonitor\s+for\s+(.+)$"), 1),
+    (re.compile(r"(?i)\bkeep\s+an\s+eye\s+on\s+(.+)$"), 1),
+    (re.compile(r"(?i)\badd\s+(?:a\s+)?threat\s+watch(?:\s+category)?\s*[:-]?\s*(.+)$"), 1),
+]
+
+
+def try_apply_user_threat_watch_request(
+    user_message: str,
+    memory_client,
+    user_id: str,
+    *,
+    use_mem0_cloud: bool = False,
+) -> str | None:
+    """
+    If Tyler asks to watch/monitor something as a standing threat category, store it and return the phrase.
+    """
+    raw = (user_message or "").strip()
+    if len(raw) < 8:
+        return None
+    for pat, gidx in _THREAT_WATCH_USER_PATTERNS:
+        m = pat.search(raw.strip())
+        if not m:
+            continue
+        phrase = (m.group(gidx) or "").strip()
+        phrase = phrase.rstrip("?.!\"'").strip()
+        if len(phrase) < 4:
+            return None
+        if len(phrase) > 500:
+            phrase = phrase[:497] + "..."
+        add_threat_category(memory_client, user_id, phrase, use_mem0_cloud=use_mem0_cloud)
+        return phrase
+    return None
+
+
+def _normalize_threat_dedupe_key(headline: str, url: str) -> str:
+    base = re.sub(r"\s+", " ", (headline or "").strip().lower())
+    base = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
+    if len(base) < 8:
+        base = hashlib.sha256(f"{url}|{headline}".encode("utf-8", errors="ignore")).hexdigest()[:20]
+    return base[:96]
+
+
+def _recent_threat_dedupe_keys(files_cabinet: FilesCabinet, *, days: int = 7) -> set[str]:
+    keys: set[str] = set()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        recs = files_cabinet.list_files(folder=THREAT_INTEL_FOLDER)
+    except Exception:
+        return keys
+    for rec in recs:
+        name = (rec.get("name") or "").strip()
+        if not name:
+            continue
+        updated = _parse_memory_datetime((rec.get("updated_at") or rec.get("created_at") or "").strip())
+        if updated is not None and updated < cutoff:
+            continue
+        full = files_cabinet.get_file(name)
+        if not full:
+            continue
+        body = (full.get("content") or "").strip()
+        for line in body.splitlines()[:40]:
+            m = re.match(r"(?i)^\s*THREAT_DEDUPE_KEY\s*:\s*(\S.+)$", line.strip())
+            if m:
+                keys.add(m.group(1).strip().lower())
+                break
+    return keys
+
+
+def _parse_threat_level_from_record(rec: dict) -> str:
+    for t in rec.get("tags") or []:
+        if isinstance(t, str) and t.lower().startswith("threat_level:"):
+            return t.split(":", 1)[-1].strip().upper()
+    for line in (rec.get("content") or "").splitlines()[:35]:
+        m = re.match(r"(?i)^\s*threat_level\s*:\s*(LOW|MEDIUM|HIGH|CRITICAL)\s*$", line.strip())
+        if m:
+            return m.group(1).upper()
+    return "LOW"
+
+
+def _parse_watch_category_from_body(body: str) -> str:
+    for line in (body or "").splitlines()[:35]:
+        m = re.match(r"(?i)^\s*watch_category\s*:\s*(.+)$", line.strip())
+        if m:
+            return m.group(1).strip()
+        m = re.match(r"(?i)^\s*category\s*:\s*(.+)$", line.strip())
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _parse_threat_headline_from_body(body: str) -> str:
+    for line in (body or "").splitlines()[:20]:
+        m = re.match(r"(?i)^\s*threat_headline\s*:\s*(.+)$", line.strip())
+        if m:
+            return m.group(1).strip()[:300]
+    return ""
+
+
+def _infer_threat_intel_tags(folder: str, body: str) -> list[str] | None:
+    """When filing into Threat Intelligence, lift category / threat_level lines into tags."""
+    if (folder or "").strip().lower() != THREAT_INTEL_FOLDER.lower():
+        return None
+    tags: list[str] = []
+    for line in (body or "").splitlines()[:30]:
+        m = re.match(r"(?i)^\s*watch_category\s*:\s*(.+)$", line.strip())
+        if m:
+            tags.append(f"category:{m.group(1).strip()[:200]}")
+        m = re.match(r"(?i)^\s*category\s*:\s*(.+)$", line.strip())
+        if m and not any(x.startswith("category:") for x in tags):
+            tags.append(f"category:{m.group(1).strip()[:200]}")
+        m = re.match(r"(?i)^\s*threat_level\s*:\s*(LOW|MEDIUM|HIGH|CRITICAL)\s*$", line.strip())
+        if m:
+            tags.append(f"threat_level:{m.group(1).upper()}")
+    return tags if tags else None
+
+
+def _evaluate_threat_hits_for_category(
+    anthropic_client: anthropic.Anthropic,
+    watch_category: str,
+    items: list[dict],
+    memory_summary: str,
+) -> list[dict]:
+    """
+    Ask Claude which Tavily hits are relevant threats for Tyler. Returns list of dicts with
+    keys: relevant, threat_level, headline, summary, event_date, source_url, index (0-based).
+    """
+    if not items:
+        return []
+    mem_ctx = (memory_summary or "").strip()
+    if len(mem_ctx) > 2500:
+        mem_ctx = mem_ctx[:2497] + "..."
+    lines = []
+    for i, r in enumerate(items):
+        title = (r.get("title") or "").strip()
+        url = (r.get("url") or "").strip()
+        snip = (r.get("content") or r.get("snippet") or "").strip()
+        if len(snip) > 900:
+            snip = snip[:897] + "..."
+        lines.append(f'[{i}] title: {title}\nurl: {url}\nexcerpt: {snip}')
+    bundle = "\n\n".join(lines)
+    system = """You are Angel's threat analyst. Tyler is a US federal law enforcement professional with a serious interest in UAP/disclosure, government transparency, and mission safety.
+
+You receive one watch category and numbered search results. For EACH result index, decide:
+- Whether it is a genuine intelligence/threat signal for Tyler's professional trajectory, UAP/disclosure mission, civil liberties, AI policy affecting his work, domestic stability, South Carolina governance, or anomalous/pattern phenomena worth his attention — not generic celebrity gossip or unrelated spam.
+- threat_level: LOW | MEDIUM | HIGH | CRITICAL
+  - CRITICAL: immediate action warranted (e.g. major disclosure breakthrough, constitutional emergency, direct career/safety risk, major program exposure).
+  - HIGH: material shift Tyler should see today.
+  - MEDIUM: worth tracking; not urgent.
+  - LOW: marginal or weakly connected.
+
+Output ONLY a valid JSON array (no markdown). Each element must be an object:
+{"index": <int>, "relevant": <bool>, "threat_level": "LOW"|"MEDIUM"|"HIGH"|"CRITICAL", "headline": "<short headline>", "summary": "<2-5 sentences, factual>", "event_date": "<ISO date or short date string if known, else empty string>"}
+
+If not relevant, still include the object with relevant:false and threat_level:"LOW", and short headline/summary explaining why skipped."""
+    user = f"""Watch category: {watch_category}
+
+Tyler context (memory summary, may be partial):
+{mem_ctx or "(none)"}
+
+Search results:
+{bundle}
+
+Return the JSON array now."""
+    try:
+        resp = anthropic_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=4096,
+            temperature=0.2,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        text = ""
+        for block in resp.content:
+            if getattr(block, "type", None) == "text":
+                text += block.text
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text += block.get("text", "")
+        text = (text or "").strip()
+        if "```" in text:
+            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s*```\s*$", "", text)
+        lb, rb = text.find("["), text.rfind("]")
+        if lb >= 0 and rb > lb:
+            text = text[lb : rb + 1]
+        data = json.loads(text)
+        if not isinstance(data, list):
+            return []
+        return [x for x in data if isinstance(x, dict)]
+    except Exception as e:
+        print(f"{Fore.YELLOW}Threat evaluation JSON error for category {watch_category!r}: {e}{Style.RESET_ALL}")
+        return []
+
+
+def run_threat_detection(
+    anthropic_client: anthropic.Anthropic,
+    memory_client,
+    user_id: str,
+    files_cabinet: FilesCabinet,
+    *,
+    use_mem0_cloud: bool = False,
+    memory_summary: str = "",
+) -> dict:
+    """
+    Scan merged watch categories via Tavily, evaluate with Claude, file non-duplicate threats
+    under Intelligence folder "Threat Intelligence".
+    Returns {"threats": [...], "categories_scanned": int, "errors": [...]}.
+    """
+    errors: list[str] = []
+    filed_out: list[dict] = []
+    api_key = (os.getenv("TAVILY_API_KEY") or "").strip()
+    if not api_key:
+        return {
+            "threats": [],
+            "categories_scanned": 0,
+            "errors": ["TAVILY_API_KEY not set"],
+        }
+
+    try:
+        categories = load_merged_threat_watch_categories(memory_client, user_id, use_mem0_cloud)
+    except Exception as e:
+        return {"threats": [], "categories_scanned": 0, "errors": [f"load categories: {e}"]}
+
+    try:
+        dedupe_keys = _recent_threat_dedupe_keys(files_cabinet, days=7)
+    except Exception as e:
+        dedupe_keys = set()
+        errors.append(f"dedupe load: {e}")
+
+    scanned = 0
+    for cat in categories:
+        scanned += 1
+        try:
+            q1 = cat
+            q2 = f"{cat} latest news"
+            seen_urls: set[str] = set()
+            merged: list[dict] = []
+            for q in (q1, q2):
+                chunk = _tavily_search_one(q, api_key, max_results=3, search_depth="basic")
+                for r in chunk:
+                    url = (r.get("url") or "").strip()
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    merged.append(r)
+                if len(merged) >= 5:
+                    break
+            if not merged:
+                continue
+            evals = _evaluate_threat_hits_for_category(
+                anthropic_client, cat, merged[:5], memory_summary
+            )
+            by_idx: dict[int, dict] = {}
+            for ev in evals:
+                try:
+                    idx = int(ev.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                by_idx[idx] = ev
+
+            for i, r in enumerate(merged[:5]):
+                ev = by_idx.get(i) or {}
+                if not ev.get("relevant"):
+                    continue
+                level = (ev.get("threat_level") or "LOW").strip().upper()
+                if level not in ("LOW", "MEDIUM", "HIGH", "CRITICAL"):
+                    level = "LOW"
+                headline = (ev.get("headline") or r.get("title") or "Threat signal").strip()
+                summary = (ev.get("summary") or "").strip() or (r.get("content") or "")[:1200]
+                event_date = (ev.get("event_date") or "").strip()
+                url = (r.get("url") or "").strip()
+                dkey = _normalize_threat_dedupe_key(headline, url)
+                if dkey.lower() in dedupe_keys:
+                    filed_out.append(
+                        {
+                            "category": cat,
+                            "headline": headline,
+                            "threat_level": level,
+                            "summary": summary,
+                            "source": url,
+                            "event_date": event_date,
+                            "filed_as": None,
+                            "skipped": "duplicate_within_7_days",
+                        }
+                    )
+                    continue
+
+                safe_slug = hashlib.sha256(f"{dkey}|{cat}".encode()).hexdigest()[:12]
+                fname = f"TI-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{safe_slug}"
+                body = "\n".join(
+                    [
+                        f"THREAT_DEDUPE_KEY: {dkey}",
+                        f"threat_headline: {headline}",
+                        f"watch_category: {cat}",
+                        f"threat_level: {level}",
+                        f"source_url: {url}",
+                        f"event_date: {event_date}",
+                        "",
+                        summary,
+                    ]
+                )
+                tags = [f"category:{cat[:180]}", f"threat_level:{level}", "threat_scan"]
+                try:
+                    files_cabinet.create_file(THREAT_INTEL_FOLDER, fname, body, tags=tags)
+                    dedupe_keys.add(dkey.lower())
+                    filed_out.append(
+                        {
+                            "category": cat,
+                            "headline": headline,
+                            "threat_level": level,
+                            "summary": summary,
+                            "source": url,
+                            "event_date": event_date,
+                            "filed_as": fname,
+                        }
+                    )
+                except ValueError as ve:
+                    errors.append(f"{cat}: file {fname}: {ve}")
+                except Exception as ex:
+                    errors.append(f"{cat}: {ex}")
+        except Exception as e:
+            errors.append(f"{cat}: {e}")
+
+    return {"threats": filed_out, "categories_scanned": scanned, "errors": errors}
+
+
+def format_threat_intelligence_for_briefing(
+    files_cabinet: FilesCabinet,
+    *,
+    lookback_days: int = 7,
+) -> str:
+    """
+    Build plain-text appendix for the morning briefing. Omits section entirely if there is
+    nothing at MEDIUM+ in the lookback window (never invent concern).
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    try:
+        recs = files_cabinet.list_files(folder=THREAT_INTEL_FOLDER)
+    except Exception:
+        return ""
+    enriched: list[dict] = []
+    for rec in recs:
+        name = (rec.get("name") or "").strip()
+        if not name:
+            continue
+        updated = _parse_memory_datetime((rec.get("updated_at") or rec.get("created_at") or "").strip())
+        if updated is not None and updated < cutoff:
+            continue
+        full = files_cabinet.get_file(name)
+        if not full:
+            continue
+        lvl = _parse_threat_level_from_record(full)
+        content = (full.get("content") or "").strip()
+        hl = _parse_threat_headline_from_body(content) or name.replace("-", " ")
+        enriched.append(
+            {
+                "name": name,
+                "level": lvl,
+                "headline": hl,
+                "summary": content,
+                "updated_at": full.get("updated_at") or "",
+                "tags": full.get("tags") or [],
+            }
+        )
+
+    significant = [e for e in enriched if e["level"] in ("CRITICAL", "HIGH", "MEDIUM")]
+    if not significant:
+        return ""
+
+    def _sort_key(x: dict):
+        return (
+            _THREAT_LEVEL_ORDER.get(x["level"], 9),
+            (x.get("updated_at") or ""),
+        )
+
+    significant.sort(key=_sort_key)
+    lines = ["THREAT INTELLIGENCE", ""]
+    for e in significant:
+        lvl = e["level"]
+        cat = _parse_watch_category_from_body(e["summary"]) or "watch item"
+        if lvl in ("CRITICAL", "HIGH"):
+            lines.append(f"[{lvl}] {e['headline']}")
+            lines.append(f"Category: {cat}")
+            # Strip metadata header for readability
+            body_lines = []
+            skip_meta = True
+            for line in e["summary"].splitlines():
+                if skip_meta and re.match(
+                    r"(?i)^(THREAT_DEDUPE_KEY|threat_headline|watch_category|threat_level|source_url|event_date)\s*:",
+                    line.strip(),
+                ):
+                    continue
+                skip_meta = False
+                body_lines.append(line)
+            narrative = "\n".join(body_lines).strip()
+            if len(narrative) > 1200:
+                narrative = narrative[:1197] + "..."
+            lines.append(narrative)
+            lines.append("")
+        elif lvl == "MEDIUM":
+            brief = e["summary"]
+            for line in brief.splitlines():
+                if re.match(
+                    r"(?i)^(THREAT_DEDUPE_KEY|threat_headline|watch_category|threat_level|source_url|event_date)\s*:",
+                    line.strip(),
+                ):
+                    continue
+                if line.strip():
+                    brief = line.strip()[:240]
+                    break
+            else:
+                brief = ""
+            lines.append(f"[MEDIUM] {e['headline']} — {cat}. {brief}")
+    return "\n".join(lines).strip()
 
 
 def send_briefing_email(briefing_text: str) -> bool:
@@ -3298,6 +3843,13 @@ class AngelCore:
         merged_memories = self._fetch_combined_memories()
         memory_summary = build_memory_summary_with_sections(merged_memories, user_message)
 
+        added_threat_watch = try_apply_user_threat_watch_request(
+            user_message,
+            self.memory_client,
+            self.user_id,
+            use_mem0_cloud=self._use_mem0_cloud,
+        )
+
         computer_intent = detect_computer_control_request(user_message)
 
         comm_intent = detect_communication_intent(user_message)
@@ -3323,6 +3875,12 @@ class AngelCore:
             location=location,
             intelligence_files_summary=self.files_cabinet.get_summary(),
         )
+        if added_threat_watch:
+            system_prompt += (
+                "\n\n[System notice: Tyler asked to add a standing threat-watch topic. "
+                "It is already saved (category threat_watch) and will merge into the next automated scans. "
+                f"Confirm briefly using his wording: {added_threat_watch!r}.]"
+            )
 
         cc_runtime = (
             self.computer_control_enabled
