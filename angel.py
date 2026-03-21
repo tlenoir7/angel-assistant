@@ -177,13 +177,13 @@ class Mem0CloudClient:
             "Content-Type": "application/json",
         }
 
-    def get_all(self, user_id: str):
+    def get_all(self, user_id: str, *, page: int = 1, page_size: int = 200):
         # v2 get memories (POST /v2/memories/)
         url = f"{MEM0_API_BASE_URL}/v2/memories/"
         payload = {
             "filters": {"user_id": user_id},
-            "page": 1,
-            "page_size": 200,
+            "page": max(1, int(page)),
+            "page_size": min(500, max(1, int(page_size))),
         }
         resp = requests.post(url, headers=self._headers(), json=payload, timeout=30)
         resp.raise_for_status()
@@ -4734,16 +4734,143 @@ Include the primary subject in entities if not already listed. Add relationships
     return {"ok": True, "added_nodes": added_nodes, "added_edges": added_edges, "primary_id": pid}
 
 
+def _purge_local_network_memory_entries(user_id: str) -> int:
+    """Remove all network_node / network_edge rows from tyler_memories.json for user_id."""
+    cats = frozenset({CATEGORY_NETWORK_NODE, CATEGORY_NETWORK_EDGE})
+    try:
+        entries = _load_local_memory_entries(user_id)
+        if not isinstance(entries, list):
+            return 0
+        removed = 0
+        kept: list = []
+        for e in entries:
+            if isinstance(e, dict):
+                meta = e.get("metadata")
+                if isinstance(meta, dict) and meta.get("category") in cats:
+                    removed += 1
+                    continue
+            kept.append(e)
+        if removed:
+            _save_local_memory_entries(user_id, kept)
+        return removed
+    except Exception:
+        return 0
+
+
+def _purge_mem0_network_graph_memories(
+    memory_client, user_id: str, *, use_mem0_cloud: bool
+) -> int:
+    """
+    Delete every Mem0 cloud memory with category network_node or network_edge.
+    Paginates through all memory pages, then repeats until a full scan deletes nothing.
+    """
+    if not use_mem0_cloud or not isinstance(memory_client, Mem0CloudClient):
+        return 0
+    deleted = 0
+    page_sz = 200
+    for _ in range(100):
+        found_any = False
+        page = 1
+        while page <= 500:
+            try:
+                raw = memory_client.get_all(user_id=user_id, page=page, page_size=page_sz)
+            except Exception:
+                return deleted
+            results = raw.get("results") if isinstance(raw, dict) else raw
+            if not isinstance(results, list) or not results:
+                break
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                meta = item.get("metadata") or {}
+                if not isinstance(meta, dict):
+                    continue
+                if meta.get("category") not in (
+                    CATEGORY_NETWORK_NODE,
+                    CATEGORY_NETWORK_EDGE,
+                ):
+                    continue
+                rid = (item.get("id") or item.get("memory_id") or "").strip()
+                if not rid:
+                    continue
+                try:
+                    memory_client.delete_memory(rid)
+                    deleted += 1
+                    found_any = True
+                except Exception:
+                    pass
+            if len(results) < page_sz:
+                break
+            page += 1
+        if not found_any:
+            break
+    return deleted
+
+
+def reset_mission_network_and_reseed(
+    memory_client,
+    user_id: str,
+    files_cabinet: FilesCabinet,
+    use_mem0_cloud: bool,
+) -> dict:
+    """
+    Recovery: delete Network Intelligence mirror files, purge network_node/network_edge
+    from local storage and Mem0 cloud, then run seed_mission_network_if_empty synchronously.
+    """
+    out: dict = {
+        "ok": True,
+        "intel_files_deleted": 0,
+        "local_network_entries_removed": 0,
+        "mem0_network_memories_deleted": 0,
+        "seed_ran": False,
+        "nodes_after": 0,
+        "edges_after": 0,
+        "error": None,
+    }
+    try:
+        try:
+            recs = files_cabinet.list_files(folder=NETWORK_INTEL_FOLDER)
+        except Exception:
+            recs = []
+        for rec in recs:
+            name = (rec.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                if files_cabinet.delete_file(name):
+                    out["intel_files_deleted"] += 1
+            except Exception:
+                pass
+
+        out["local_network_entries_removed"] = _purge_local_network_memory_entries(user_id)
+        out["mem0_network_memories_deleted"] = _purge_mem0_network_graph_memories(
+            memory_client, user_id, use_mem0_cloud=use_mem0_cloud
+        )
+
+        out["seed_ran"] = seed_mission_network_if_empty(
+            memory_client, user_id, files_cabinet, use_mem0_cloud
+        )
+        nodes, edges = network_load_graph(
+            memory_client, user_id, use_mem0_cloud, files_cabinet
+        )
+        out["nodes_after"] = len(nodes)
+        out["edges_after"] = len(edges)
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    return out
+
+
 def seed_mission_network_if_empty(
     memory_client,
     user_id: str,
     files_cabinet: FilesCabinet,
     use_mem0_cloud: bool,
 ) -> bool:
-    """One-time seed of Tyler mission entities if the graph is empty. Returns True if seed ran."""
+    """Seed Tyler mission graph when there are no edges yet (orphan nodes still trigger seed)."""
     try:
-        nodes, _ = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
-        if nodes:
+        _, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+        if len(edges) > 0:
             return False
 
         seed_nodes: list[tuple[str, str, str, str, list[str]]] = [
@@ -4818,8 +4945,9 @@ def schedule_mission_network_seed_background(
     use_mem0_cloud: bool,
 ) -> None:
     """
-    Fire-and-forget: at most one daemon thread sleeps 10s then runs seed_mission_network_if_empty.
-    Never schedules two threads; seed body uses a non-blocking lock so concurrent runs are skipped.
+    Fire-and-forget: at most one daemon thread sleeps 10s then runs seed_mission_network_if_empty
+    (only when the graph still has zero edges). Never schedules two threads; seed body uses a
+    non-blocking lock so concurrent runs are skipped.
     """
     global _mission_network_seed_thread_started
     try:

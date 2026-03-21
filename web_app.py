@@ -48,6 +48,7 @@ from angel import (
     get_network_summary,
     map_osint_to_network,
     schedule_mission_network_seed_background,
+    reset_mission_network_and_reseed,
     network_load_graph,
 )
 
@@ -1831,6 +1832,27 @@ def create_app() -> Flask:
                 use_mem0_cloud=angel._use_mem0_cloud,
             )
             return jsonify({"ok": True, "edge": edge})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/network/reset", methods=["GET"])
+    def api_network_reset():
+        """
+        Destructive recovery: wipe mission network (Mem0 + local + Network Intelligence files)
+        and synchronously re-seed the default graph.
+        """
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            summary = reset_mission_network_and_reseed(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            code = 200 if summary.get("ok") else 500
+            return jsonify(summary), code
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
