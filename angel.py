@@ -463,14 +463,20 @@ def _network_upsert_structured_memory(
         pass
     if use_mem0_cloud and hasattr(memory_client, "add"):
         try:
-            memory_client.add(
-                [
-                    {"role": "user", "content": f"[Angel network {category}] {text[:1200]}"},
-                    {"role": "assistant", "content": "Stored."},
-                ],
-                user_id=user_id,
-                metadata=dict(meta),
-            )
+            messages = [
+                {"role": "user", "content": f"[Angel network {category}] {text[:1200]}"},
+                {"role": "assistant", "content": "Stored."},
+            ]
+            try:
+                memory_client.add(
+                    messages,
+                    user_id=user_id,
+                    metadata=dict(meta),
+                    infer=False,
+                    async_mode=True,
+                )
+            except TypeError:
+                memory_client.add(messages, user_id=user_id, metadata=dict(meta))
         except Exception:
             pass
 
@@ -4124,6 +4130,87 @@ def network_intel_filename(node_id: str) -> str:
     return f"{NETWORK_FILE_PREFIX}{nid}" if nid else "NET-unknown"
 
 
+_NETWORK_RELEVANCE_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+
+def _network_relevance_rank(rel) -> int:
+    return _NETWORK_RELEVANCE_RANK.get(str(rel or "").strip().upper(), 0)
+
+
+def _network_pick_richer_node(prev: dict, incoming: dict) -> dict:
+    """Prefer newer last_updated; on exact tie prefer higher mission relevance."""
+    ta = (prev.get("last_updated") or "")
+    tb = (incoming.get("last_updated") or "")
+    if tb > ta:
+        return dict(incoming)
+    if ta > tb:
+        return dict(prev)
+    rb = _network_relevance_rank(incoming.get("relevance"))
+    ra = _network_relevance_rank(prev.get("relevance"))
+    return dict(incoming) if rb > ra else dict(prev)
+
+
+def _network_pick_richer_edge(prev: dict, incoming: dict) -> dict:
+    """Prefer newer date_established; on tie keep incoming (deterministic)."""
+    ta = (prev.get("date_established") or "")
+    tb = (incoming.get("date_established") or "")
+    if tb > ta:
+        return dict(incoming)
+    if ta > tb:
+        return dict(prev)
+    return dict(incoming)
+
+
+def _network_merge_node_into(nodes: dict[str, dict], incoming: dict) -> None:
+    nid = str(incoming.get("id") or "").strip()
+    if not nid:
+        return
+    prev = nodes.get(nid)
+    if prev is None:
+        nodes[nid] = dict(incoming)
+    else:
+        nodes[nid] = _network_pick_richer_node(prev, incoming)
+
+
+def _network_merge_edge_into(edges: dict[str, dict], incoming: dict) -> None:
+    eid = str(incoming.get("edge_id") or "").strip()
+    if not eid:
+        return
+    prev = edges.get(eid)
+    if prev is None:
+        edges[eid] = dict(incoming)
+    else:
+        edges[eid] = _network_pick_richer_edge(prev, incoming)
+
+
+def _network_merge_local_graph_entries(
+    user_id: str, nodes: dict[str, dict], edges: dict[str, dict]
+) -> None:
+    """
+    Merge network graph rows from local tyler_memories.json.
+    When use_mem0_cloud is True, API fetch omits local rows — this restores canonical JSON
+    (correct relevance, etc.) written by _network_upsert_structured_memory.
+    """
+    for m in _load_local_memory_entries(user_id):
+        if not isinstance(m, dict):
+            continue
+        meta = m.get("metadata")
+        if not isinstance(meta, dict):
+            continue
+        cat = meta.get("category")
+        raw = (m.get("memory") or m.get("data") or "").strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if cat == CATEGORY_NETWORK_NODE and isinstance(obj, dict) and obj.get("id"):
+            _network_merge_node_into(nodes, obj)
+        elif cat == CATEGORY_NETWORK_EDGE and isinstance(obj, dict) and obj.get("edge_id"):
+            _network_merge_edge_into(edges, obj)
+
+
 def _network_normalize_node_id(raw: str) -> str:
     s = (raw or "").strip()
     if not s:
@@ -4149,15 +4236,9 @@ def _network_parse_nodes_edges_from_memories(memories) -> tuple[dict[str, dict],
         except json.JSONDecodeError:
             continue
         if cat == CATEGORY_NETWORK_NODE and isinstance(obj, dict) and obj.get("id"):
-            nid = str(obj["id"]).strip()
-            prev = nodes.get(nid)
-            if prev is None or (obj.get("last_updated") or "") >= (prev.get("last_updated") or ""):
-                nodes[nid] = dict(obj)
+            _network_merge_node_into(nodes, obj)
         elif cat == CATEGORY_NETWORK_EDGE and isinstance(obj, dict) and obj.get("edge_id"):
-            eid = str(obj["edge_id"]).strip()
-            prev = edges.get(eid)
-            if prev is None or (obj.get("date_established") or "") >= (prev.get("date_established") or ""):
-                edges[eid] = dict(obj)
+            _network_merge_edge_into(edges, obj)
     return nodes, edges
 
 
@@ -4183,13 +4264,10 @@ def _network_merge_intel_files(
             continue
         n = payload.get("node")
         if isinstance(n, dict) and n.get("id"):
-            nid = str(n["id"])
-            prev = nodes.get(nid)
-            if prev is None or (n.get("last_updated") or "") >= (prev.get("last_updated") or ""):
-                nodes[nid] = dict(n)
+            _network_merge_node_into(nodes, n)
         for e in payload.get("edges") or []:
             if isinstance(e, dict) and e.get("edge_id"):
-                edges[str(e["edge_id"])] = dict(e)
+                _network_merge_edge_into(edges, e)
 
 
 def _network_canonical_endpoint_id(raw: str) -> str:
@@ -4215,8 +4293,12 @@ def _network_normalize_graph_nodes_edges(
         nn = dict(n)
         nn["id"] = ck
         prev = canon_nodes.get(ck)
-        if prev is None or (nn.get("last_updated") or "") >= (prev.get("last_updated") or ""):
+        if prev is None:
             canon_nodes[ck] = nn
+        else:
+            chosen = _network_pick_richer_node(prev, nn)
+            chosen["id"] = ck
+            canon_nodes[ck] = chosen
     canon_edges: dict[str, dict] = {}
     for eid, e in edges_map.items():
         if not isinstance(e, dict):
@@ -4238,6 +4320,7 @@ def network_load_graph(
 ) -> tuple[dict[str, dict], list[dict]]:
     memories = fetch_combined_memories(memory_client, user_id, use_mem0_cloud)
     nodes, edges_map = _network_parse_nodes_edges_from_memories(memories)
+    _network_merge_local_graph_entries(user_id, nodes, edges_map)
     _network_merge_intel_files(files_cabinet, nodes, edges_map)
     nodes, edges_map = _network_normalize_graph_nodes_edges(nodes, edges_map)
     return nodes, list(edges_map.values())
@@ -4761,17 +4844,22 @@ def _purge_mem0_network_graph_memories(
     memory_client, user_id: str, *, use_mem0_cloud: bool
 ) -> int:
     """
-    Delete every Mem0 cloud memory with category network_node or network_edge.
-    Paginates through all memory pages, then repeats until a full scan deletes nothing.
+    Delete Mem0 cloud memories with category network_node or network_edge.
+    Hard cap: 30 seconds wall time — returns early with however many were deleted.
     """
     if not use_mem0_cloud or not isinstance(memory_client, Mem0CloudClient):
         return 0
     deleted = 0
+    deadline = time.monotonic() + 30.0
     page_sz = 200
     for _ in range(100):
+        if time.monotonic() >= deadline:
+            return deleted
         found_any = False
         page = 1
         while page <= 500:
+            if time.monotonic() >= deadline:
+                return deleted
             try:
                 raw = memory_client.get_all(user_id=user_id, page=page, page_size=page_sz)
             except Exception:
@@ -4780,6 +4868,8 @@ def _purge_mem0_network_graph_memories(
             if not isinstance(results, list) or not results:
                 break
             for item in results:
+                if time.monotonic() >= deadline:
+                    return deleted
                 if not isinstance(item, dict):
                     continue
                 meta = item.get("metadata") or {}
@@ -4814,8 +4904,8 @@ def reset_mission_network_and_reseed(
     use_mem0_cloud: bool,
 ) -> dict:
     """
-    Recovery: delete Network Intelligence mirror files, purge network_node/network_edge
-    from local storage and Mem0 cloud, then run seed_mission_network_if_empty synchronously.
+    Recovery: delete Network Intelligence mirror files only, then force a full mission seed.
+    Skips slow Mem0 cloud deletes — nodes/edges are upserted in place (canonical JSON also on disk).
     """
     out: dict = {
         "ok": True,
@@ -4842,13 +4932,12 @@ def reset_mission_network_and_reseed(
             except Exception:
                 pass
 
-        out["local_network_entries_removed"] = _purge_local_network_memory_entries(user_id)
-        out["mem0_network_memories_deleted"] = _purge_mem0_network_graph_memories(
-            memory_client, user_id, use_mem0_cloud=use_mem0_cloud
-        )
-
         out["seed_ran"] = seed_mission_network_if_empty(
-            memory_client, user_id, files_cabinet, use_mem0_cloud
+            memory_client,
+            user_id,
+            files_cabinet,
+            use_mem0_cloud,
+            force=True,
         )
         nodes, edges = network_load_graph(
             memory_client, user_id, use_mem0_cloud, files_cabinet
@@ -4866,13 +4955,22 @@ def seed_mission_network_if_empty(
     user_id: str,
     files_cabinet: FilesCabinet,
     use_mem0_cloud: bool,
+    *,
+    force: bool = False,
 ) -> bool:
-    """Seed Tyler mission graph when there are no edges yet (orphan nodes still trigger seed)."""
+    """
+    Seed Tyler mission graph when there are no edges yet (orphan nodes still trigger seed).
+    If force=True, always run the full seed (upserts overwrite existing nodes/edges by id).
+    """
     try:
-        _, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
-        if len(edges) > 0:
-            return False
+        if not force:
+            _, edges = network_load_graph(
+                memory_client, user_id, use_mem0_cloud, files_cabinet
+            )
+            if len(edges) > 0:
+                return False
 
+        # Relevance: Grusch & Elizondo CRITICAL; all other seed entities HIGH (see network summary / mission graph).
         seed_nodes: list[tuple[str, str, str, str, list[str]]] = [
             ("David Grusch", "person", "UAP whistleblower; former intelligence community.", "CRITICAL", ["UAP", "disclosure", "whistleblower"]),
             ("Luis Elizondo", "person", "Former AATIP / UAP program visibility.", "CRITICAL", ["UAP", "AATIP", "disclosure"]),
