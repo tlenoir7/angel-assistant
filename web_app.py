@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
@@ -71,6 +72,57 @@ socketio: SocketIO | None = None
 SOCKET_SESSIONS: dict[str, dict] = {}
 # sid -> {"session": AngelRealtimeSession} for OpenAI Realtime proxy (namespace /realtime)
 REALTIME_PROXY_BY_SID: dict[str, dict] = {}
+
+# Async mission network reset (Mem0 purge can exceed HTTP timeouts on Railway)
+_network_reset_lock = threading.Lock()
+_network_reset_status: dict = {
+    "in_progress": False,
+    "last_success": None,  # bool | None — None if no reset has finished yet
+    "last_nodes_after": None,
+    "last_edges_after": None,
+    "last_reset_at": None,  # ISO 8601 UTC when last run finished
+    "last_error": None,
+}
+
+
+def _network_reset_worker(
+    memory_client,
+    user_id: str,
+    files_cabinet,
+    use_mem0_cloud: bool,
+) -> None:
+    """Runs in a daemon thread; never raises."""
+    summary: dict | None = None
+    err: str | None = None
+    try:
+        summary = reset_mission_network_and_reseed(
+            memory_client,
+            user_id,
+            files_cabinet,
+            use_mem0_cloud,
+        )
+    except Exception as ex:
+        err = str(ex)
+        traceback.print_exc()
+    finally:
+        try:
+            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            with _network_reset_lock:
+                _network_reset_status["in_progress"] = False
+                _network_reset_status["last_reset_at"] = now
+                if summary is not None:
+                    _network_reset_status["last_success"] = bool(summary.get("ok"))
+                    _network_reset_status["last_nodes_after"] = summary.get("nodes_after")
+                    _network_reset_status["last_edges_after"] = summary.get("edges_after")
+                    _network_reset_status["last_error"] = summary.get("error")
+                else:
+                    _network_reset_status["last_success"] = False
+                    _network_reset_status["last_nodes_after"] = None
+                    _network_reset_status["last_edges_after"] = None
+                    _network_reset_status["last_error"] = err or "reset thread failed"
+        except Exception:
+            pass
+
 
 # Expo push: in-memory + push_tokens.json (same directory as this module)
 PUSH_TOKENS_PATH = Path(__file__).resolve().parent / "push_tokens.json"
@@ -1839,23 +1891,61 @@ def create_app() -> Flask:
     @app.route("/api/network/reset", methods=["GET"])
     def api_network_reset():
         """
-        Destructive recovery: wipe mission network (Mem0 + local + Network Intelligence files)
-        and synchronously re-seed the default graph.
+        Destructive recovery: starts background wipe + re-seed (returns immediately).
+        Poll GET /api/network/reset/status or /api/network/summary for completion.
         """
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
+        with _network_reset_lock:
+            if _network_reset_status.get("in_progress"):
+                return jsonify({
+                    "ok": True,
+                    "status": "reset_already_running",
+                    "message": (
+                        "A network reset is already in progress. "
+                        "Poll /api/network/reset/status."
+                    ),
+                })
+            _network_reset_status["in_progress"] = True
         try:
-            summary = reset_mission_network_and_reseed(
-                angel.memory_client,
-                angel.user_id,
-                angel.files_cabinet,
-                angel._use_mem0_cloud,
-            )
-            code = 200 if summary.get("ok") else 500
-            return jsonify(summary), code
+            threading.Thread(
+                target=_network_reset_worker,
+                args=(
+                    angel.memory_client,
+                    angel.user_id,
+                    angel.files_cabinet,
+                    angel._use_mem0_cloud,
+                ),
+                daemon=True,
+            ).start()
         except Exception as e:
             traceback.print_exc()
+            with _network_reset_lock:
+                _network_reset_status["in_progress"] = False
             return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({
+            "ok": True,
+            "status": "reset_started",
+            "message": (
+                "Network reset running in background. "
+                "Check /api/network/summary in 60 seconds."
+            ),
+        })
+
+    @app.route("/api/network/reset/status", methods=["GET"])
+    def api_network_reset_status():
+        """State of the async network reset (in progress + last finished run)."""
+        with _network_reset_lock:
+            st = dict(_network_reset_status)
+        return jsonify({
+            "ok": True,
+            "reset_in_progress": bool(st.get("in_progress")),
+            "last_reset_completed_successfully": st.get("last_success"),
+            "last_reset_nodes_after": st.get("last_nodes_after"),
+            "last_reset_edges_after": st.get("last_edges_after"),
+            "last_reset_at": st.get("last_reset_at"),
+            "last_reset_error": st.get("last_error"),
+        })
 
     @app.route("/api/briefing", methods=["GET"])
     def api_briefing():
