@@ -61,6 +61,7 @@ CATEGORY_INTELLIGENCE_FILE = "intelligence_file"
 CATEGORY_THREAT_WATCH = "threat_watch"
 CATEGORY_NETWORK_NODE = "network_node"
 CATEGORY_NETWORK_EDGE = "network_edge"
+CATEGORY_PREDICTION = "prediction"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -73,6 +74,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_THREAT_WATCH,
         CATEGORY_NETWORK_NODE,
         CATEGORY_NETWORK_EDGE,
+        CATEGORY_PREDICTION,
     }
 )
 
@@ -1408,6 +1410,7 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_THREAT_WATCH,
             CATEGORY_NETWORK_NODE,
             CATEGORY_NETWORK_EDGE,
+            CATEGORY_PREDICTION,
         ):
             continue
         general.append(m)
@@ -1527,6 +1530,8 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_NETWORK_NODE:
             continue
         if cat == CATEGORY_NETWORK_EDGE:
+            continue
+        if cat == CATEGORY_PREDICTION:
             continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
@@ -2047,6 +2052,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Threat detection: you run automated threat scans on a schedule (about every 6 hours) across dynamic watch categories—defaults plus categories you and Tyler add (stored in memory as category threat_watch; you can grow the list yourself when you notice new patterns worth monitoring). Confirmed signals are filed as Intelligence Files in folder "Threat Intelligence" with threat_level tags. CRITICAL/HIGH items can trigger push alerts; MEDIUM/LOW surface in the morning briefing when material. Never invent threats—only file or summarize what your tools and sources support.
 - OSINT deep background (Batcomputer-style dossiers): you can run systematic open-source research on any person or organization Tyler names. Results are filed in the Intelligence File Cabinet under folder `OSINT Dossiers` with mission relevance ratings, red flags, and sources. The same dossier is refreshed if older than about 30 days. When Tyler mentions someone new who could matter to his mission, you may proactively suggest an OSINT pass. Reference existing dossiers by file name when they are already in the cabinet index.
 - Mission connection graph (Batcomputer network): people, organizations, programs, and events material to Tyler's work are linked in a living graph stored as Mem0 categories network_node / network_edge and mirrored under Intelligence folder `Network Intelligence` (mirror files use prefix NET- plus each node's canonical lowercase id, with that node's data and incident edges). New OSINT dossiers automatically expand the graph when possible. When Tyler researches someone new, you may offer to map their cluster or path to figures already in the network. If he names two people who are already connected, say so naturally.
+- Predictive modeling (Item 15): you synthesize forward-looking forecasts from threat intel, OSINT dossiers, mission network patterns, briefing history, and live web context (Tavily). Predictions are stored as structured memories (category: prediction) and mirrored under Intelligence folder `Predictions` as files `PRED-{id}`. Each has a timeframe, confidence tier, and status (active / confirmed / denied / expired). You track accuracy when predictions resolve—treat forecasts as informed hypotheses, not facts. Reference active predictions when they illuminate the conversation; acknowledge uncertainty and update your stance when real events confirm or challenge a forecast. Weekly jobs generate new predictions and check open ones against the news.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -2136,6 +2142,7 @@ Intelligence File Cabinet (your filing system):
 - You maintain an Intelligence File Cabinet: structured files stored for Tyler, organized by folders you invent as an intelligence officer would. There are NO fixed folder names—you create folders dynamically from the nature of the material.
 - OSINT Dossiers folder: use folder name exactly `OSINT Dossiers` for full open-source dossiers on people or organizations (the server may create these automatically when Tyler asks for background/OSINT). Filenames are stable per target; do not duplicate dossiers manually for the same subject—suggest refreshing after some weeks if context may have changed.
 - Network Intelligence folder: mirrored node files use the prefix NET- plus the node's canonical lowercase id; each holds JSON for that graph node plus edges touching that node. The server maintains these when the graph updates. Do not hand-edit unless Tyler asks—prefer describing connections in prose and letting the system record structured updates via tools/API when available.
+- Predictions folder: use folder name exactly `Predictions` only for server-managed forecast records (`PRED-…` files). Do not mix ad-hoc notes there—the system mirrors prediction JSON from Mem0. When Tyler asks what you predict or how accurate you've been, use the structured prediction context injected in his message when present, plus your reasoning.
 - Threat Intelligence folder: use folder name exactly `Threat Intelligence` when filing something that is a threat signal for Tyler's career, mission, safety, or strategic context. Start the file body with metadata lines when possible: `watch_category: ...`, `threat_level: LOW|MEDIUM|HIGH|CRITICAL`, optional `source_url:` and `event_date:`, then a blank line and the narrative summary. When you file into Threat Intelligence from conversation (not only from scheduled scans), tell Tyler clearly: "I've filed something in Threat Intelligence you should know about" (the server may append this if you used [FILE:...] and stripped the body—ensure he is notified in your visible reply either way).
 - When Tyler asks whether there are threats, any threats, or similar: summarize from the Intelligence File Cabinet—search or mentally index folder `Threat Intelligence` and cite what is actually filed; do not fabricate items. If nothing is filed, say so plainly.
 - When Tyler says to "watch for" or monitor something ongoing, the system may already add it as a new threat-watch category—confirm that you will track it and that it is saved for future scans.
@@ -5505,6 +5512,13 @@ class AngelCore:
         research_requested = detect_research_request(user_message)
         osint_triggered, osint_target, osint_type = detect_osint_request(user_message)
         net_cmd, net_payload = detect_network_command(user_message)
+        pred_cmd, pred_payload = None, {}
+        try:
+            import angel_predictions as apred
+
+            pred_cmd, pred_payload = apred.detect_prediction_intent(user_message)
+        except Exception:
+            pred_cmd, pred_payload = None, {}
 
         cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
         if device in ("ios", "mobile_web"):
@@ -5540,6 +5554,14 @@ class AngelCore:
                 "\n\nTyler asked about the mission connection graph (Batcomputer network). "
                 "If a JSON block labeled [Mission network …] appears in the user message, summarize it in plain language "
                 "and offer to explore clusters or paths further."
+            )
+        if pred_cmd:
+            system_prompt += (
+                "\n\nTyler's message relates to Angel's predictive modeling (forecasts and accuracy). "
+                "If a block labeled [Angel predictions …] appears in the user message, weave it into a natural answer: "
+                "summarize active forecasts when listing them, stress uncertainty, and connect to what Tyler asked. "
+                "If he asked for a new prediction about a topic, acknowledge that new forecasts were generated server-side "
+                "and interpret them—do not invent additional structured predictions in prose without the system's JSON."
             )
 
         cc_runtime = (
@@ -5777,6 +5799,24 @@ If you infer anything new about that person's preferences or dynamics, append at
             )
             if nblock.strip():
                 augmented_user_message = f"{augmented_user_message}\n\n{nblock}"
+
+        if pred_cmd:
+            try:
+                import angel_predictions as apred
+
+                pblock = apred.format_prediction_reply_for_prompt(
+                    pred_cmd,
+                    pred_payload,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                    anthropic_client=self.anthropic_client,
+                    files_cabinet=self.files_cabinet,
+                )
+                if pblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{pblock}"
+            except Exception:
+                pass
 
         model = "claude-haiku-4-5" if self.use_voice else "claude-sonnet-4-5"
         reply = call_claude(

@@ -13,6 +13,8 @@ from flask import Flask, Response, jsonify, render_template_string, request
 from flask_socketio import SocketIO, emit
 from apscheduler.schedulers.background import BackgroundScheduler
 
+import angel_predictions
+
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
     AngelCore,
@@ -456,6 +458,79 @@ def _run_weekly_reflection_job():
         print(f"[web_app] Weekly memory reflection failed: {e}", flush=True)
 
 
+def _run_weekly_predictions_generate_job():
+    """Sunday 7 AM Eastern: generate new mission forecasts (Item 15)."""
+    global angel
+    if angel is None:
+        return
+    try:
+        r = angel_predictions.generate_predictions(
+            angel.anthropic_client,
+            angel.memory_client,
+            angel.user_id,
+            angel.files_cabinet,
+            angel._use_mem0_cloud,
+        )
+        print(
+            f"[web_app] Weekly predictions generate: count={r.get('count')} skipped_dup={r.get('skipped_duplicates')}",
+            flush=True,
+        )
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[web_app] Weekly predictions generate failed: {e}", flush=True)
+
+
+def _run_weekly_predictions_check_job():
+    """Wednesday 7 AM Eastern: Tavily + Haiku reality check on active predictions."""
+    global angel
+    if angel is None:
+        return
+    try:
+        r = angel_predictions.check_predictions_against_reality(
+            angel.anthropic_client,
+            angel.memory_client,
+            angel.user_id,
+            angel.files_cabinet,
+            angel._use_mem0_cloud,
+        )
+        print(
+            f"[web_app] Predictions reality check: checked={r.get('checked')} auto_resolved={r.get('auto_resolved')}",
+            flush=True,
+        )
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[web_app] Predictions reality check failed: {e}", flush=True)
+
+
+def _schedule_predictions_initial_seed() -> None:
+    """First deploy: after a short delay, seed predictions if none exist."""
+
+    def _job() -> None:
+        try:
+            time.sleep(20)
+        except Exception:
+            return
+        global angel
+        if angel is None:
+            return
+        try:
+            r = angel_predictions.seed_initial_predictions_if_needed(
+                angel.anthropic_client,
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            print(f"[web_app] Initial predictions seed: {r}", flush=True)
+        except Exception:
+            traceback.print_exc()
+
+    try:
+        threading.Thread(target=_job, daemon=True).start()
+    except Exception:
+        pass
+
+
 def _run_check_in_job():
     """If no activity for 4+ hours, generate a short check-in message (once per idle period)."""
     global check_in_message, check_in_generated_at, last_activity_at
@@ -503,6 +578,7 @@ def create_app() -> Flask:
         angel.files_cabinet,
         angel._use_mem0_cloud,
     )
+    _schedule_predictions_initial_seed()
     _load_expo_push_tokens_from_disk()
 
     # Log briefing email env at startup for debugging
@@ -542,6 +618,22 @@ def create_app() -> Flask:
         hour=6,
         minute=0,
         timezone=sched_tz,
+    )
+    scheduler.add_job(
+        _run_weekly_predictions_generate_job,
+        "cron",
+        day_of_week="sun",
+        hour=7,
+        minute=0,
+        timezone="America/New_York",
+    )
+    scheduler.add_job(
+        _run_weekly_predictions_check_job,
+        "cron",
+        day_of_week="wed",
+        hour=7,
+        minute=0,
+        timezone="America/New_York",
     )
     scheduler.add_job(_run_check_in_job, "interval", minutes=15)
     scheduler.add_job(_run_threat_detection_job, "interval", hours=6)
@@ -1946,6 +2038,122 @@ def create_app() -> Flask:
             "last_reset_at": st.get("last_reset_at"),
             "last_reset_error": st.get("last_error"),
         })
+
+    # --- Item 15: Predictive modeling (forecasts + accuracy tracking) ---
+
+    @app.route("/api/predictions", methods=["GET"])
+    def api_predictions_active():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            rows = angel_predictions.get_active_predictions(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "predictions": rows, "count": len(rows)})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/predictions/all", methods=["GET"])
+    def api_predictions_all():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            by_id = angel_predictions.fetch_all_predictions(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+            )
+            rows = sorted(
+                by_id.values(),
+                key=lambda p: (p.get("updated_at") or p.get("created_at") or ""),
+                reverse=True,
+            )
+            return jsonify({"ok": True, "predictions": rows, "count": len(rows)})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/predictions/accuracy", methods=["GET"])
+    def api_predictions_accuracy():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            acc = angel_predictions.get_prediction_accuracy(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, **acc})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/predictions/generate", methods=["POST"])
+    def api_predictions_generate():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        focus = (data.get("focus_topic") or data.get("topic") or "").strip() or None
+        try:
+            r = angel_predictions.generate_predictions(
+                angel.anthropic_client,
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+                focus_topic=focus,
+            )
+            return jsonify({"ok": True, **r})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/predictions/resolve", methods=["POST"])
+    def api_predictions_resolve():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        pid = (data.get("prediction_id") or data.get("id") or "").strip()
+        outcome = (data.get("outcome") or data.get("outcome_notes") or "").strip()
+        if not pid:
+            return jsonify({"ok": False, "error": "prediction_id required"}), 400
+        accurate = bool(data.get("accurate"))
+        try:
+            updated = angel_predictions.resolve_prediction(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+                prediction_id=pid,
+                outcome=outcome or ("Confirmed" if accurate else "Denied"),
+                accurate=accurate,
+            )
+            if not updated:
+                return jsonify({"ok": False, "error": "prediction not found"}), 404
+            return jsonify({"ok": True, "prediction": updated})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/predictions/check", methods=["GET"])
+    def api_predictions_check():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            r = angel_predictions.check_predictions_against_reality(
+                angel.anthropic_client,
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, **r})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.route("/api/briefing", methods=["GET"])
     def api_briefing():
