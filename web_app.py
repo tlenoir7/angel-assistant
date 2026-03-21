@@ -30,6 +30,7 @@ from angel import (
     add_structured_memory,
     CATEGORY_BRIEFING_HISTORY,
     strip_markdown,
+    execute_python_sandbox,
 )
 
 try:
@@ -1154,6 +1155,40 @@ def create_app() -> Flask:
                 "reply": _sanitize_text(reply),
             }
         )
+
+    @app.route("/api/execute", methods=["POST"])
+    def api_execute():
+        """
+        Run Python in a sandboxed subprocess (30s timeout).
+        JSON body: code (str), context (optional description for logging).
+        """
+        data = request.get_json(silent=True) or {}
+        code = (data.get("code") or "").strip()
+        context = (data.get("context") or "").strip()
+        if not code:
+            print("[api_execute] error: missing code", flush=True)
+            return jsonify({"success": False, "output": "", "error": "Missing 'code'."}), 400
+        try:
+            if context:
+                print(f"[api_execute] context: {context[:800]!r}", flush=True)
+            result = execute_python_sandbox(code)
+            return jsonify(
+                {
+                    "success": bool(result.get("success")),
+                    "output": _sanitize_text(str(result.get("output") or "")),
+                    "error": _sanitize_text(str(result.get("error") or "")),
+                }
+            )
+        except Exception as e:
+            print(f"[api_execute] unexpected error: {e}", flush=True)
+            traceback.print_exc()
+            return jsonify(
+                {
+                    "success": False,
+                    "output": "",
+                    "error": _sanitize_text(str(e)),
+                }
+            ), 500
 
     @app.route("/api/vision", methods=["POST"])
     def api_vision():

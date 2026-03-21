@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import subprocess
 import sys
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -66,6 +67,12 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
 ANGEL_PATTERN_PREFIX = "[ANGEL_PATTERN]:"
 # Sentinel for Angel to output a new/updated person profile (parsed and stored)
 ANGEL_PROFILE_PREFIX = "[ANGEL_PROFILE]:"
+
+# Fenced ```python ... ``` blocks in Angel's reply (executed server-side after generation)
+_PYTHON_CODE_BLOCK_RE = re.compile(r"```python\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
+
+EXEC_PYTHON_TIMEOUT_SEC = 30
+_EXEC_OUTPUT_MAX_CHARS = 256_000
 
 
 class Mem0CloudClient:
@@ -972,6 +979,95 @@ def format_location_context_line(location: dict | None) -> str | None:
     return f"Tyler's current location: ({lat_s}, {lng_s})"
 
 
+def execute_python_sandbox(
+    code: str,
+    timeout_seconds: int = EXEC_PYTHON_TIMEOUT_SEC,
+) -> dict[str, object]:
+    """
+    Run Python code in an isolated subprocess (same interpreter as Angel).
+    Returns dict with keys: output (stdout), error (stderr + exit hints), success (bool).
+    """
+    code = (code or "").strip()
+    if not code:
+        return {"output": "", "error": "Empty code.", "success": False}
+
+    fd, path = tempfile.mkstemp(suffix="_angel_exec.py", text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(code)
+        env = os.environ.copy()
+        env.setdefault("MPLBACKEND", "Agg")
+        env.setdefault("PYTHONUTF8", "1")
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-I", path],
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                cwd=tempfile.gettempdir(),
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "output": "",
+                "error": f"Execution timed out after {timeout_seconds} seconds.",
+                "success": False,
+            }
+        out = (proc.stdout or "")[:_EXEC_OUTPUT_MAX_CHARS]
+        err = (proc.stderr or "")[:_EXEC_OUTPUT_MAX_CHARS]
+        success = proc.returncode == 0
+        err_parts = []
+        if err.strip():
+            err_parts.append(err.rstrip())
+        if not success and proc.returncode is not None:
+            err_parts.append(f"[exit code {proc.returncode}]")
+        err_combined = "\n".join(err_parts).strip()
+        return {"output": out, "error": err_combined, "success": success}
+    except Exception as e:
+        print(f"{Fore.RED}execute_python_sandbox: {e}{Style.RESET_ALL}")
+        traceback.print_exc()
+        return {"output": "", "error": str(e), "success": False}
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def append_executed_python_results_to_reply(reply: str) -> str:
+    """
+    Find ```python ... ``` fences in Angel's reply, run each block in the sandbox,
+    and append stdout/stderr sections so Tyler sees execution output.
+    """
+    if not reply or "```python" not in reply.lower():
+        return reply
+    matches = list(_PYTHON_CODE_BLOCK_RE.finditer(reply))
+    if not matches:
+        return reply
+    sections: list[str] = []
+    for i, m in enumerate(matches, start=1):
+        raw = m.group(1)
+        code = (raw or "").strip()
+        if not code:
+            continue
+        ex = execute_python_sandbox(code)
+        out = (ex.get("output") or "").rstrip() or "(no stdout)"
+        err = (ex.get("error") or "").rstrip()
+        if ex.get("success"):
+            block = f"**Python execution {i}** (success)\n```text\n{out}\n```"
+            if err:
+                block += f"\n```text\n(stderr)\n{err}\n```"
+        else:
+            block = (
+                f"**Python execution {i}** (failed)\nstdout:\n```text\n{out}\n```\n"
+                f"stderr / error:\n```text\n{err or '(none)'}\n```"
+            )
+        sections.append(block)
+    if not sections:
+        return reply
+    return reply.rstrip() + "\n\n---\n" + "\n\n".join(sections) + "\n"
+
+
 def build_system_prompt(
     memory_summary: str,
     voice_mode: bool = False,
@@ -1007,6 +1103,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Voice conversation on desktop (microphone + TTS).
 - Text and voice interface on mobile web.
 - Cloud deployment accessible from any device.
+- Sandboxed Python execution for computation and science: numpy, scipy, pandas, matplotlib (headless), sympy. When you include ```python fenced blocks in your reply, the server runs them (30s limit) and appends stdout/stderr so Tyler sees numerical or analytical results.
 
 {date_time_str}
 """
@@ -1065,6 +1162,12 @@ Memory reflection (how you think, not just what you store):
 - You sometimes run a dedicated pass over your stored memories to notice patterns, links between unrelated facts, change over time, open loops, contradictions, and insights Tyler might miss. Those syntheses are saved as reflections you can refer to later.
 - Treat long-term memory as material to think with: connect dots, question stale assumptions, and name tensions when you see them—while staying grounded in what is actually stored.
 - When a recent reflection appears in your context, you may cite it naturally (e.g. "When I reviewed what I remember, I noticed…") without treating it as infallible truth.
+
+Python code execution (server sandbox):
+- When a question benefits from exact computation, statistics, data shaping, simulation, numerical or symbolic math, or quick exploratory analysis—and prose alone is weaker than runnable code—write self-contained ```python blocks. Use print() for results, tables, and summaries.
+- Available libraries include numpy, scipy, pandas, matplotlib (set Agg backend is automatic; prefer printing numeric summaries or text descriptions over expecting an image UI), and sympy.
+- Your ```python blocks are executed automatically after you respond; stdout and stderr are appended under your message. If something fails, briefly acknowledge and offer a corrected block if Tyler wants to retry.
+- Keep scripts short and safe: avoid unnecessary network calls, file writes outside temp unless Tyler asked, or destructive operations.
 """
 
     stage2 = """
@@ -2634,6 +2737,7 @@ If you infer anything new about that person's preferences or dynamics, append at
             )
 
         reply = cleaned_reply
+        reply = append_executed_python_results_to_reply(reply)
         memory_reply = strip_markdown(reply) if self.use_voice else reply
 
         try:
