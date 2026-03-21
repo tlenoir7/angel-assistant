@@ -270,6 +270,13 @@ def run_osint_surveillance(
     if not api_key:
         return {**out, "ok": False, "error": "TAVILY_API_KEY not set"}
 
+    try:
+        import angel_environmental_map as aem
+
+        aem.ensure_seed_locations(memory_client, user_id, files_cabinet, use_mem0_cloud)
+    except Exception:
+        pass
+
     bundles: dict[str, list[dict[str, Any]]] = {}
     raw_for_eval: list[str] = []
 
@@ -384,6 +391,20 @@ Rules: Be conservative. STRONG = clearly unusual, well-sourced pattern relevant 
                 cross_bits.append(f"Possible theme overlap with Threat Intelligence: {th[:160]}")
         if cross_bits:
             row["threat_intel_crossref"] = cross_bits[:5]
+        try:
+            import angel_environmental_map as aem
+
+            nm = aem.match_text_to_locations(
+                f"{row.get('headline', '')} {row.get('summary', '')} {row.get('region_hint', '')}",
+                memory_client,
+                user_id,
+                use_mem0_cloud,
+                top_n=6,
+            )
+            if nm:
+                row["near_mapped_locations"] = nm
+        except Exception:
+            pass
         _finding_upsert(memory_client, user_id, row, use_mem0_cloud)
         out["signals"].append(row)
         summaries_for_pred.append(row.get("summary") or row.get("headline") or "")
@@ -590,7 +611,17 @@ def format_surveillance_for_briefing(
             lines.append(f"- {f.get('headline', '')[:160]}")
     if not lines:
         return ""
-    return "SURVEILLANCE INTELLIGENCE (open-source, legal OSINT)\n" + "\n".join(lines)
+    base = "SURVEILLANCE INTELLIGENCE (open-source, legal OSINT)\n" + "\n".join(lines)
+    try:
+        import angel_environmental_map as aem
+
+        sigs = (last_run or {}).get("signals") if isinstance(last_run, dict) else None
+        sm = aem.format_surveillance_map_lines(sigs or [])
+        if sm:
+            base = base + "\n\n" + sm
+    except Exception:
+        pass
+    return base
 
 
 def detect_surveillance_chat_intent(user_message: str) -> tuple[str | None, dict[str, Any]]:

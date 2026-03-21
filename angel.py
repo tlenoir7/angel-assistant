@@ -69,6 +69,8 @@ CATEGORY_FOREIGN_INTEL = "foreign_intelligence"
 CATEGORY_THREAT_ACTOR = "threat_actor"
 # Batcomputer — open-source surveillance monitoring (legal OSINT)
 CATEGORY_SURVEILLANCE_INTEL = "surveillance_intelligence"
+# Batcomputer — environmental / mission geography map
+CATEGORY_ENV_LOCATION = "env_location"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -87,6 +89,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_FOREIGN_INTEL,
         CATEGORY_THREAT_ACTOR,
         CATEGORY_SURVEILLANCE_INTEL,
+        CATEGORY_ENV_LOCATION,
     }
 )
 
@@ -1431,6 +1434,7 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_FOREIGN_INTEL,
             CATEGORY_THREAT_ACTOR,
             CATEGORY_SURVEILLANCE_INTEL,
+            CATEGORY_ENV_LOCATION,
         ):
             continue
         general.append(m)
@@ -1562,6 +1566,8 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_THREAT_ACTOR:
             continue
         if cat == CATEGORY_SURVEILLANCE_INTEL:
+            continue
+        if cat == CATEGORY_ENV_LOCATION:
             continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
@@ -2089,6 +2095,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Threat Actor database (Batcomputer opposition layer): structured profiles on **people, organizations, programs, and factions** that open sources portray as working **against disclosure, transparency, or Tyler's mission**—distinct from allies covered in OSINT Dossiers. Stored as category `threat_actor` and mirrored under Intelligence folder `Threat Actors` as files `TA-{actor_id}`. Each record includes threat_type (e.g. suppression, disinformation, retaliation), threat_level, known_actions, and evidence citations from open sources only. Threat actors appear on the **mission network graph** (often tagged `threat_actor`). When discussing opposition to disclosure, reference this database when relevant; distinguish **allies** (dossiers) from **opposition** (threat actors). HIGH/CRITICAL threat scans and some OSINT results may suggest assessing someone for this database—say so without alleging classified proof.
 - Forensic visual analysis (Batcomputer): you perform **multi-layer** assessment of images Tyler shares—content, **authenticity / manipulation** (including AI-generation cues), intelligence extraction (OCR-style text, markings, equipment), and **mission relevance** (UAP, network entities). Outputs can be filed automatically under Intelligence folder `Forensic Analysis` as `FA-*` when intelligence value is HIGH/CRITICAL; UNKNOWN/ANOMALOUS UAP assessments may cross-reference folder `UAP Incidents`. Use POST `/api/forensic/analyze`, `/api/forensic/uap`, or `/api/forensic/document` for structured JSON (iOS can use these instead of `/api/vision` when Tyler wants forensic mode). Apply forensic skepticism to leaked UAP photos and document screenshots; never claim digital forensics lab certification—be clear about limits.
 - Open-source surveillance monitoring (Batcomputer): you run **scheduled multi-category** scans over **legal public** sources (Tavily news/search) — aerial, ground, maritime, public records, anomalous events, social signals — evaluate signals as NOISE / WEAK / MODERATE / STRONG; **STRONG** findings file to Intelligence folder `Surveillance Intelligence` as `SI-*`; **correlated** cluster signals (multiple categories reinforcing same geography/timeframe) are flagged **HIGH** priority. Cross-check themes against **Threat Intelligence** when possible; **active predictions** may be noted when aligned. Surveillance summaries appear in the **morning briefing**; manual run via GET `/api/surveillance/run`. This is not classified collection or illegal surveillance.
+- **Environmental map** (Batcomputer geography layer): mission-relevant physical locations — UAP hotspots, installations, restricted airspace, incident sites, facilities, and person-associated places — are stored as structured memories (category `env_location`) and mirrored under Intelligence folder `Environmental Map` as files `LOC-{location_id}`. The map is **excluded from routine memory digests** but you should **reference it naturally** when geography, incidents, programs, or travel matter. Open-source surveillance runs **cross-reference** headlines/summaries against this map; when Tyler's device reports GPS near a **HIGH/CRITICAL** point, you may note it briefly. APIs: GET `/api/map/locations`, `/api/map/summary`, `/api/map/near`, POST `/api/map/research`. Do not claim classified facility details—only what the map and open sources support.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -4182,6 +4189,20 @@ Write the full dossier now."""
         )
     except Exception:
         pass
+    try:
+        import angel_environmental_map as _aem
+
+        _aem.maybe_ingest_locations_from_osint_text(
+            dossier_main,
+            target,
+            anthropic_client,
+            files_cabinet.memory_client,
+            files_cabinet.user_id,
+            files_cabinet,
+            files_cabinet._use_mem0_cloud,
+        )
+    except Exception:
+        pass
     return out
 
 
@@ -5667,6 +5688,14 @@ class AngelCore:
         except Exception:
             surv_cmd, surv_payload = None, {}
 
+        map_cmd, map_payload = None, {}
+        try:
+            import angel_environmental_map as aemap
+
+            map_cmd, map_payload = aemap.detect_map_chat_intent(user_message)
+        except Exception:
+            map_cmd, map_payload = None, {}
+
         ta_cmd, ta_payload = None, {}
         try:
             import angel_threat_actors as ata
@@ -5758,6 +5787,13 @@ class AngelCore:
                 "\n\nTyler asked about **open-source surveillance monitoring** (legal public OSINT: flight/maritime/news/records patterns). "
                 "If a block labeled [Angel surveillance monitoring] appears, summarize recent signals by category, highlight STRONG or **correlated** clusters, "
                 "and connect to mission context without implying classified collection."
+            )
+        if map_cmd:
+            system_prompt += (
+                "\n\nTyler's message relates to the **Environmental map** (Batcomputer geography layer). "
+                "If a block labeled [Angel environmental map] or [Angel environmental map — research] or [Angel environmental map — nearby] appears, "
+                "answer in plain language: summarize the JSON profile, significance, incident/program links, and mission relevance. "
+                "For research results, confirm the location was added or updated and the `LOC-*` file under Environmental Map when successful."
             )
 
         cc_runtime = (
@@ -6102,6 +6138,24 @@ If you infer anything new about that person's preferences or dynamics, append at
             except Exception:
                 pass
 
+        if map_cmd:
+            try:
+                import angel_environmental_map as aemap
+
+                mblock = aemap.format_map_chat_block(
+                    map_cmd,
+                    map_payload,
+                    anthropic_client=self.anthropic_client,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                    files_cabinet=self.files_cabinet,
+                )
+                if mblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{mblock}"
+            except Exception:
+                pass
+
         if ta_cmd:
             try:
                 import angel_threat_actors as ata
@@ -6119,6 +6173,20 @@ If you infer anything new about that person's preferences or dynamics, append at
                     augmented_user_message = f"{augmented_user_message}\n\n{tablock}"
             except Exception:
                 pass
+
+        try:
+            import angel_environmental_map as aemap
+
+            px = aemap.format_proximity_alert_for_prompt(
+                location,
+                self.memory_client,
+                self.user_id,
+                self._use_mem0_cloud,
+            )
+            if px.strip():
+                augmented_user_message = f"{augmented_user_message}\n\n{px}"
+        except Exception:
+            pass
 
         model = "claude-haiku-4-5" if self.use_voice else "claude-sonnet-4-5"
         reply = call_claude(

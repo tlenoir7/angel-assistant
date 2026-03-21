@@ -20,6 +20,7 @@ import angel_file_reading
 import angel_threat_actors
 import angel_forensic
 import angel_surveillance
+import angel_environmental_map
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -478,6 +479,54 @@ def _run_morning_briefing_job():
             proactive_intelligence_appendix=proactive_appendix or None,
             surveillance_appendix=surveillance_appendix or None,
         )
+        try:
+            angel_environmental_map.ensure_seed_locations(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            extra_blocks: list[str] = []
+            lat_s = (os.getenv("BRIEFING_LOCATION_LAT") or "").strip()
+            lon_s = (os.getenv("BRIEFING_LOCATION_LON") or "").strip()
+            if lat_s and lon_s:
+                tn = angel_environmental_map.format_briefing_travel_note_if_env(
+                    float(lat_s),
+                    float(lon_s),
+                    angel.memory_client,
+                    user_id,
+                    angel._use_mem0_cloud,
+                )
+                if tn:
+                    extra_blocks.append(tn)
+            summ = angel_environmental_map.get_location_summary(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            if summ and summ.get("total", 0):
+                compact = {
+                    "total": summ["total"],
+                    "by_significance": summ.get("by_significance"),
+                    "sample_locations": [
+                        x.get("name") for x in (summ.get("locations") or [])[:12]
+                    ],
+                }
+                extra_blocks.append(
+                    "ENVIRONMENTAL MAP (summary)\n"
+                    + json.dumps(compact, ensure_ascii=False, indent=2)[:3000]
+                )
+            if (
+                extra_blocks
+                and morning_briefing
+                and "Briefing unavailable" not in morning_briefing
+            ):
+                morning_briefing = (morning_briefing or "").rstrip() + "\n\n" + "\n\n".join(
+                    extra_blocks
+                )
+        except Exception as e:
+            print(f"[web_app] Environmental map briefing appendix: {e}", flush=True)
+
         briefing_generated_at = time.time()
         send_briefing_email(morning_briefing)
         if morning_briefing and "Briefing unavailable" not in morning_briefing:
@@ -673,6 +722,34 @@ def _schedule_threat_actor_seed() -> None:
         pass
 
 
+def _schedule_environmental_map_seed() -> None:
+    """Batcomputer: seed mission geography (UAP hotspots, installations, etc.) if missing."""
+
+    def _job() -> None:
+        try:
+            time.sleep(40)
+        except Exception:
+            return
+        global angel
+        if angel is None:
+            return
+        try:
+            r = angel_environmental_map.ensure_seed_locations(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            print(f"[web_app] Environmental map seed: {r}", flush=True)
+        except Exception:
+            traceback.print_exc()
+
+    try:
+        threading.Thread(target=_job, daemon=True).start()
+    except Exception:
+        pass
+
+
 def _run_proactive_intelligence_job():
     """Every 4 hours: background Tavily monitoring for watch list (Item 16)."""
     global angel
@@ -746,6 +823,7 @@ def create_app() -> Flask:
     _schedule_proactive_watch_seed()
     _schedule_foreign_watch_seed()
     _schedule_threat_actor_seed()
+    _schedule_environmental_map_seed()
     _load_expo_push_tokens_from_disk()
 
     # Log briefing email env at startup for debugging
@@ -2863,6 +2941,226 @@ def create_app() -> Flask:
                 limit=n,
             )
             return jsonify({"ok": True, "findings": rows, "count": len(rows)})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Environmental map (Batcomputer geography layer) ---
+    @app.route("/api/map/locations", methods=["GET"])
+    def api_map_locations():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            lt = (request.args.get("location_type") or "").strip() or None
+            sig = (request.args.get("significance") or "").strip() or None
+            angel_environmental_map.ensure_seed_locations(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            locs = angel_environmental_map.list_locations(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+                location_type=lt,
+                significance=sig,
+            )
+            return jsonify({"ok": True, "locations": locs})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/map/locations/<path:location_id>", methods=["GET"])
+    def api_map_location_one(location_id):
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            angel_environmental_map.ensure_seed_locations(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            loc = angel_environmental_map.get_location(
+                location_id,
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            if not loc:
+                return jsonify({"ok": False, "error": "not found"}), 404
+            return jsonify({"ok": True, "location": loc})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/map/summary", methods=["GET"])
+    def api_map_summary():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            angel_environmental_map.ensure_seed_locations(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            s = angel_environmental_map.get_location_summary(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "summary": s})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/map/region/<path:region>", methods=["GET"])
+    def api_map_region(region):
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            angel_environmental_map.ensure_seed_locations(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            rows = angel_environmental_map.get_locations_by_region(
+                region,
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "region": region, "locations": rows})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/map/location/add", methods=["POST"])
+    def api_map_location_add():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        location_type = (data.get("location_type") or "").strip()
+        region = (data.get("region") or "").strip()
+        description = (data.get("description") or "").strip()
+        significance = (data.get("significance") or "MEDIUM").strip()
+        if not name or not location_type or not region or not description:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "name, location_type, region, and description are required",
+                }
+            ), 400
+        coords = data.get("coordinates")
+        if coords is not None and not isinstance(coords, dict):
+            coords = None
+        ce = data.get("connected_entities")
+        if ce is not None and not isinstance(ce, list):
+            ce = []
+        ki = data.get("known_incidents")
+        if ki is not None and not isinstance(ki, list):
+            ki = []
+        tags = data.get("tags")
+        if tags is not None and not isinstance(tags, list):
+            tags = []
+        lid = (data.get("location_id") or "").strip() or None
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            loc = angel_environmental_map.add_location(
+                name,
+                location_type,
+                coords,
+                region,
+                description,
+                significance,
+                ce,
+                ki,
+                memory_client=angel.memory_client,
+                user_id=user_id,
+                files_cabinet=angel.files_cabinet,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                location_id=lid,
+                tags=tags,
+                active_monitoring=bool(data.get("active_monitoring", True)),
+            )
+            return jsonify({"ok": True, "location": loc})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/map/research", methods=["POST"])
+    def api_map_research():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        context = (data.get("context") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "name required"}), 400
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            r = angel_environmental_map.research_location(
+                name,
+                context,
+                angel.anthropic_client,
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            code = 200 if r.get("ok") else 400
+            return jsonify(r), code
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/map/near", methods=["GET"])
+    def api_map_near():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            lat_s = (request.args.get("lat") or "").strip()
+            lon_s = (request.args.get("lon") or "").strip()
+            rad_s = (request.args.get("radius") or "75").strip()
+            if not lat_s or not lon_s:
+                return jsonify({"ok": False, "error": "lat and lon required"}), 400
+            lat = float(lat_s)
+            lon = float(lon_s)
+            radius = float(rad_s)
+            angel_environmental_map.ensure_seed_locations(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            rows = angel_environmental_map.get_locations_near_coordinates(
+                lat,
+                lon,
+                radius,
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify(
+                {
+                    "ok": True,
+                    "lat": lat,
+                    "lon": lon,
+                    "radius_miles": radius,
+                    "locations": rows,
+                }
+            )
+        except ValueError:
+            return jsonify({"ok": False, "error": "invalid lat, lon, or radius"}), 400
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
