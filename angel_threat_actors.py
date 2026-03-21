@@ -633,6 +633,8 @@ _SEED_ACTORS: list[dict[str, Any]] = [
     },
 ]
 
+_SEED_ACTOR_IDS: frozenset[str] = frozenset(s["actor_id"] for s in _SEED_ACTORS)
+
 
 def maybe_ensure_threat_actor_seeds(
     memory_client: Any,
@@ -640,10 +642,14 @@ def maybe_ensure_threat_actor_seeds(
     files_cabinet: Any,
     use_mem0_cloud: bool,
 ) -> dict[str, Any]:
-    """Idempotent: seed default opposition actors if database is empty."""
-    if _load_all_actors(memory_client, user_id, use_mem0_cloud):
+    """Idempotent: seed default opposition actors when any canonical seed id is missing."""
+    existing = _load_all_actors(memory_client, user_id, use_mem0_cloud)
+    missing = [aid for aid in _SEED_ACTOR_IDS if aid not in existing]
+    if not missing:
         return {"ok": True, "skipped": True, "reason": "already_populated"}
-    return ensure_threat_actor_seeds(memory_client, user_id, files_cabinet, use_mem0_cloud)
+    return ensure_threat_actor_seeds(
+        memory_client, user_id, files_cabinet, use_mem0_cloud, force_reseed=False
+    )
 
 
 def ensure_threat_actor_seeds(
@@ -651,12 +657,14 @@ def ensure_threat_actor_seeds(
     user_id: str,
     files_cabinet: Any,
     use_mem0_cloud: bool,
+    *,
+    force_reseed: bool = False,
 ) -> dict[str, Any]:
     existing = _load_all_actors(memory_client, user_id, use_mem0_cloud)
     added = 0
     for seed in _SEED_ACTORS:
         aid = seed["actor_id"]
-        if aid in existing:
+        if not force_reseed and aid in existing:
             continue
         add_threat_actor(
             seed["name"],
@@ -687,7 +695,12 @@ def ensure_threat_actor_seeds(
         )
     except Exception:
         pass
-    return {"ok": True, "added": added, "total": len(_load_all_actors(memory_client, user_id, use_mem0_cloud))}
+    return {
+        "ok": True,
+        "added": added,
+        "total": len(_load_all_actors(memory_client, user_id, use_mem0_cloud)),
+        "force_reseed": force_reseed,
+    }
 
 
 # --- OSINT / threat scan hooks ---

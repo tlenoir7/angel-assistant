@@ -8,7 +8,7 @@ import time
 from collections import deque
 import sys
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from io import BytesIO
@@ -878,7 +878,7 @@ def add_structured_memory(
     """
     metadata = {
         "category": category,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "source": "angel-stage2",
     }
     if person_name:
@@ -5199,8 +5199,9 @@ def seed_mission_network_if_empty(
         e("Ross Coulthart", "Luis Elizondo", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
         e("Ross Coulthart", "David Grusch", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
         e("Ross Coulthart", "Christopher Mellon", "connected_to", "Media / public commentary.", "MODERATE", "Seed data")
-        e("Marco Rubio", "AARO", "connected_to", "Public statements on UAP governance.", "WEAK", "Seed data")
-        e("Marco Rubio", "House Oversight Committee", "member_of", "Congressional role (historical/current cycles vary).", "MODERATE", "Seed data")
+        e("Marco Rubio", "AARO", "connected_to", "Public statements on UAP governance and oversight context.", "MODERATE", "Seed data")
+        e("Marco Rubio", "House Oversight Committee", "connected_to", "Congressional UAP hearings / oversight context (role varies by cycle).", "MODERATE", "Seed data")
+        e("Marco Rubio", "David Grusch", "corroborates", "Public UAP statements aligned with disclosure themes (open sources).", "WEAK", "Seed data")
         return True
     except Exception:
         return False
@@ -6391,7 +6392,7 @@ If you infer anything new about that person's preferences or dynamics, append at
             metadata = merge_user_event_date_into_metadata(
                 {
                     "source": "angel-core",
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 },
                 user_message,
             )
@@ -6424,7 +6425,7 @@ If you infer anything new about that person's preferences or dynamics, append at
             metadata = merge_user_event_date_into_metadata(
                 {
                     "source": "angel-voice",
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 },
                 user_message,
             )
@@ -6657,7 +6658,7 @@ def main():
             metadata = merge_user_event_date_into_metadata(
                 {
                     "source": "angel-cli",
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 },
                 user_message,
             )

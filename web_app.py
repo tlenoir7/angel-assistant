@@ -1,12 +1,13 @@
 import base64
 import json
+import logging
 import os
 import threading
 import time
 from io import BytesIO
 from pathlib import Path
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import requests
 from flask import Flask, Response, jsonify, render_template_string, request
@@ -97,6 +98,9 @@ _network_reset_status: dict = {
 }
 
 
+_log = logging.getLogger(__name__)
+
+
 def _network_reset_worker(
     memory_client,
     user_id: str,
@@ -117,12 +121,17 @@ def _network_reset_worker(
         err = str(ex)
         traceback.print_exc()
     finally:
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        _log.info(
+            "network reset worker: thread completing (summary=%s err=%s)",
+            "ok" if isinstance(summary, dict) and summary.get("ok") else None,
+            err,
+        )
         try:
-            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             with _network_reset_lock:
                 _network_reset_status["in_progress"] = False
                 _network_reset_status["last_reset_at"] = now
-                if summary is not None:
+                if isinstance(summary, dict):
                     _network_reset_status["last_success"] = bool(summary.get("ok"))
                     _network_reset_status["last_nodes_after"] = summary.get("nodes_after")
                     _network_reset_status["last_edges_after"] = summary.get("edges_after")
@@ -132,8 +141,18 @@ def _network_reset_worker(
                     _network_reset_status["last_nodes_after"] = None
                     _network_reset_status["last_edges_after"] = None
                     _network_reset_status["last_error"] = err or "reset thread failed"
-        except Exception:
-            pass
+        except Exception as ex:
+            _log.exception("network reset worker: failed to update status dict: %s", ex)
+            try:
+                with _network_reset_lock:
+                    _network_reset_status["in_progress"] = False
+                    _network_reset_status["last_error"] = (
+                        _network_reset_status.get("last_error") or str(ex)
+                    )
+            except Exception:
+                _log.exception("network reset worker: could not force in_progress=False")
+        else:
+            _log.info("network reset worker: status updated; in_progress=False at %s", now)
 
 
 # Expo push: in-memory + push_tokens.json (same directory as this module)
@@ -744,6 +763,7 @@ def _schedule_threat_actor_seed() -> None:
                 angel.user_id,
                 angel.files_cabinet,
                 angel._use_mem0_cloud,
+                force_reseed=False,
             )
             print(f"[web_app] Threat actor seed: {r}", flush=True)
         except Exception:
@@ -2321,6 +2341,29 @@ def create_app() -> Flask:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    @app.route("/api/threat-actors/reseed", methods=["GET"])
+    def api_threat_actors_reseed():
+        """Force upsert of all default threat-actor seeds (manual recovery)."""
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            r = angel_threat_actors.ensure_threat_actor_seeds(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+                force_reseed=True,
+            )
+            rows = angel_threat_actors.list_threat_actors(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, **r, "actors": rows, "count": len(rows)})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.route("/api/threat-actors/summary", methods=["GET"])
     def api_threat_actors_summary():
         if angel is None:
@@ -3819,7 +3862,7 @@ def create_app() -> Flask:
             except Exception:
                 tzinfo = None
 
-            now = datetime.now(tzinfo) if tzinfo is not None else datetime.utcnow()
+            now = datetime.now(tzinfo) if tzinfo is not None else datetime.now(UTC)
             current_time = now.isoformat()
         except Exception:
             current_time = None
