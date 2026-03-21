@@ -7,9 +7,11 @@ import base64
 import io
 import json
 import os
+import threading
 import time
 import wave
 import struct
+from collections.abc import Callable
 
 import websockets
 from websockets.sync.client import connect as ws_connect
@@ -19,8 +21,12 @@ try:
 except ImportError:
     audioop = None
 
-REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
 OPENAI_BETA_HEADER = "realtime=v1"
+
+
+def _realtime_ws_url() -> str:
+    model = (os.environ.get("OPENAI_REALTIME_MODEL") or "gpt-realtime").strip()
+    return f"wss://api.openai.com/v1/realtime?model={model}"
 
 
 def _wav_to_pcm16_24k(wav_bytes: bytes) -> bytes:
@@ -60,9 +66,12 @@ def _wav_to_pcm16_24k(wav_bytes: bytes) -> bytes:
 
 
 def _get_headers() -> dict:
+    # Prefer OPENAI_REALTIME_API_KEY for Realtime; fall back to OPENAI_API_KEY.
     api_key = os.environ.get("OPENAI_REALTIME_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
-        raise ValueError("OPENAI_REALTIME_API_KEY or OPENAI_API_KEY environment variable is not set")
+        raise ValueError(
+            "OPENAI_REALTIME_API_KEY (or OPENAI_API_KEY) environment variable is not set"
+        )
     return {
         "Authorization": f"Bearer {api_key}",
         "OpenAI-Beta": OPENAI_BETA_HEADER,
@@ -72,10 +81,25 @@ def _get_headers() -> dict:
 class AngelRealtimeSession:
     """
     Persistent Realtime API session. One websocket stays open for the entire Angel session.
+
+    Two usage modes:
+    - **Blocking turn** (desktop GUI): ``send_audio()`` appends, commits, receives until done.
+    - **Streaming proxy**: start a receiver thread with ``start_receiver_thread``, then use
+      ``append_input_audio_base64`` / ``commit_input_buffer`` / ``create_audio_response``.
     """
 
     def __init__(self) -> None:
         self._ws = None
+        self._send_lock = threading.Lock()
+        self._receiver_stop = threading.Event()
+        self._receiver_thread: threading.Thread | None = None
+
+    def _send_json(self, obj: dict) -> None:
+        if self._ws is None:
+            raise RuntimeError("Realtime session not connected")
+        payload = json.dumps(obj)
+        with self._send_lock:
+            self._ws.send(payload)
 
     def connect(self, system_prompt: str) -> None:
         """
@@ -84,7 +108,8 @@ class AngelRealtimeSession:
         """
         if self._ws is not None:
             self.disconnect()
-        self._ws = ws_connect(REALTIME_URL, additional_headers=_get_headers())
+        self._receiver_stop.clear()
+        self._ws = ws_connect(_realtime_ws_url(), additional_headers=_get_headers())
         session_config = {
             "type": "session.update",
             "session": {
@@ -96,7 +121,7 @@ class AngelRealtimeSession:
                 "turn_detection": None,
             },
         }
-        self._ws.send(json.dumps(session_config))
+        self._send_json(session_config)
         while True:
             msg = json.loads(self._ws.recv())
             if msg.get("type") == "session.updated":
@@ -105,6 +130,73 @@ class AngelRealtimeSession:
                 self._ws.close()
                 self._ws = None
                 raise RuntimeError(msg.get("error", {}).get("message", "Session update failed"))
+
+    def start_receiver_thread(self, on_message: Callable[[dict], None]) -> None:
+        """
+        Background thread: forward every server JSON event to ``on_message``.
+        Used by the Railway Socket.IO proxy; do not use together with ``send_audio`` on the same session.
+        """
+        self.stop_receiver_thread()
+        self._receiver_stop.clear()
+
+        def _runner() -> None:
+            while not self._receiver_stop.is_set() and self._ws is not None:
+                try:
+                    raw = self._ws.recv()
+                except Exception:
+                    if not self._receiver_stop.is_set():
+                        try:
+                            on_message({"type": "_realtime_socket_closed"})
+                        except Exception:
+                            pass
+                    break
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                try:
+                    on_message(msg)
+                except Exception:
+                    pass
+
+        self._receiver_thread = threading.Thread(target=_runner, daemon=True)
+        self._receiver_thread.start()
+
+    def stop_receiver_thread(self) -> None:
+        self._receiver_stop.set()
+        if self._receiver_thread is not None:
+            self._receiver_thread.join(timeout=3.0)
+            self._receiver_thread = None
+
+    def append_input_audio_base64(self, audio_b64: str) -> None:
+        """Append one PCM16 little-endian mono 24 kHz chunk (base64) to the input buffer."""
+        self._send_json({"type": "input_audio_buffer.append", "audio": audio_b64})
+
+    def append_input_pcm16_24k(self, pcm_bytes: bytes, chunk_size: int = 8192) -> None:
+        """Split raw PCM16 LE mono 24 kHz bytes into append events (no artificial delays)."""
+        for i in range(0, len(pcm_bytes), chunk_size):
+            chunk = pcm_bytes[i : i + chunk_size]
+            b64 = base64.standard_b64encode(chunk).decode("ascii")
+            self.append_input_audio_base64(b64)
+
+    def append_input_wav_bytes(self, wav_bytes: bytes, chunk_size: int = 8192) -> None:
+        """Decode a WAV blob to PCM16 24kHz mono and append to the input buffer."""
+        pcm_bytes = _wav_to_pcm16_24k(wav_bytes)
+        self.append_input_pcm16_24k(pcm_bytes, chunk_size=chunk_size)
+
+    def commit_input_buffer(self) -> None:
+        self._send_json({"type": "input_audio_buffer.commit"})
+
+    def create_audio_response(self, max_output_tokens: int = 4096) -> None:
+        self._send_json(
+            {
+                "type": "response.create",
+                "response": {
+                    "modalities": ["audio", "text"],
+                    "max_output_tokens": max_output_tokens,
+                },
+            }
+        )
 
     def send_audio(self, wav_bytes: bytes) -> tuple[str, bytes]:
         """
@@ -143,18 +235,20 @@ class AngelRealtimeSession:
             n = len(chunk)
             print(f"[Realtime] send_audio: sending chunk size = {n}")
             chunk_b64 = base64.standard_b64encode(chunk).decode("ascii")
-            self._ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": chunk_b64}))
+            self._send_json({"type": "input_audio_buffer.append", "audio": chunk_b64})
             total_sent += n
             time.sleep(0.1)
         print(f"[Realtime] send_audio: total bytes sent before commit = {total_sent}")
 
         time.sleep(0.5)
-        self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        self._send_json({"type": "input_audio_buffer.commit"})
         time.sleep(0.3)
-        self._ws.send(json.dumps({
-            "type": "response.create",
-            "response": {"modalities": ["audio", "text"], "max_output_tokens": 500},
-        }))
+        self._send_json(
+            {
+                "type": "response.create",
+                "response": {"modalities": ["audio", "text"], "max_output_tokens": 500},
+            }
+        )
 
         transcript_parts: list[str] = []
         audio_chunks: list[bytes] = []
@@ -189,6 +283,7 @@ class AngelRealtimeSession:
 
     def disconnect(self) -> None:
         """Close the websocket connection."""
+        self.stop_receiver_thread()
         if self._ws is not None:
             try:
                 self._ws.close()

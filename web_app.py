@@ -1,3 +1,7 @@
+import eventlet
+
+eventlet.monkey_patch()
+
 import base64
 import json
 import os
@@ -21,6 +25,7 @@ from angel import (
     send_briefing_email,
     create_anthropic_client,
     build_memory_summary_with_sections,
+    build_system_prompt,
     run_memory_reflection,
     get_latest_reflection_text,
     get_recent_briefing_history_for_prompt,
@@ -29,6 +34,11 @@ from angel import (
     CATEGORY_BRIEFING_HISTORY,
     strip_markdown,
 )
+
+try:
+    from angel_realtime import AngelRealtimeSession
+except Exception:
+    AngelRealtimeSession = None  # type: ignore[misc, assignment]
 
 # Module-level storage for morning briefing and check-in
 morning_briefing = None
@@ -42,6 +52,8 @@ angel = None
 socketio: SocketIO | None = None
 # sid -> {"device": str, "turns": list[tuple[str, str]]} for multi-turn Claude context
 SOCKET_SESSIONS: dict[str, dict] = {}
+# sid -> {"session": AngelRealtimeSession} for OpenAI Realtime proxy (namespace /realtime)
+REALTIME_PROXY_BY_SID: dict[str, dict] = {}
 
 # Expo push: in-memory + push_tokens.json (same directory as this module)
 PUSH_TOKENS_PATH = Path(__file__).resolve().parent / "push_tokens.json"
@@ -335,11 +347,10 @@ def create_app() -> Flask:
     scheduler.start()
 
     # --- WebSocket (Socket.IO) for persistent iOS / low-latency clients ---
-    async_mode = os.getenv("SOCKETIO_ASYNC_MODE", "eventlet")
     socketio = SocketIO(
         app,
         cors_allowed_origins=os.getenv("SOCKETIO_CORS", "*"),
-        async_mode=async_mode,
+        async_mode="eventlet",
         logger=os.getenv("SOCKETIO_DEBUG", "").lower() in ("1", "true", "yes"),
         engineio_logger=os.getenv("SOCKETIO_DEBUG", "").lower() in ("1", "true", "yes"),
     )
@@ -456,6 +467,188 @@ def create_app() -> Flask:
         except Exception as e:
             traceback.print_exc()
             emit("angel_error", {"message": str(e)})
+
+    # --- Socket.IO namespace /realtime: proxy to OpenAI GPT-4o Realtime API (iPhone, etc.) ---
+    def _build_openai_realtime_system_prompt() -> str:
+        memories = angel._fetch_combined_memories()
+        memory_summary = build_memory_summary_with_sections(memories, None)
+        return build_system_prompt(
+            memory_summary,
+            voice_mode=True,
+            strategy_hint=False,
+            pattern_hint=False,
+            profile_hint=False,
+            computer_control_enabled=False,
+            device="ios",
+        )
+
+    def _forward_openai_realtime_to_client(sid: str, msg: dict) -> None:
+        t = msg.get("type")
+        try:
+            with app.app_context():
+                if t == "_realtime_socket_closed":
+                    socketio.emit(
+                        "realtime_error",
+                        {"message": "OpenAI Realtime connection closed"},
+                        room=sid,
+                        namespace="/realtime",
+                    )
+                    return
+                if t == "response.audio.delta":
+                    d = msg.get("delta", "")
+                    if d:
+                        socketio.emit(
+                            "realtime_response_audio",
+                            {"delta": d},
+                            room=sid,
+                            namespace="/realtime",
+                        )
+                elif t == "response.audio_transcript.delta":
+                    d = msg.get("delta", "")
+                    if d:
+                        socketio.emit(
+                            "realtime_transcript",
+                            {"delta": d, "done": False},
+                            room=sid,
+                            namespace="/realtime",
+                        )
+                elif t == "response.audio_transcript.done":
+                    socketio.emit(
+                        "realtime_transcript",
+                        {
+                            "transcript": _sanitize_text(str(msg.get("transcript", ""))),
+                            "done": True,
+                        },
+                        room=sid,
+                        namespace="/realtime",
+                    )
+                elif t == "response.text.delta":
+                    d = msg.get("delta", "")
+                    if d:
+                        socketio.emit(
+                            "realtime_transcript",
+                            {"delta": d, "done": False, "channel": "text"},
+                            room=sid,
+                            namespace="/realtime",
+                        )
+                elif t == "response.done":
+                    socketio.emit(
+                        "realtime_response_done",
+                        {},
+                        room=sid,
+                        namespace="/realtime",
+                    )
+                elif t == "error":
+                    err = msg.get("error") or {}
+                    msg_txt = (
+                        err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                    )
+                    socketio.emit(
+                        "realtime_error",
+                        {"message": _sanitize_text(msg_txt)},
+                        room=sid,
+                        namespace="/realtime",
+                    )
+                elif t == "response.error":
+                    socketio.emit(
+                        "realtime_error",
+                        {"message": _sanitize_text(str(msg))},
+                        room=sid,
+                        namespace="/realtime",
+                    )
+        except Exception as e:
+            print(f"[realtime] forward error: {e}", flush=True)
+            traceback.print_exc()
+
+    @socketio.on("connect", namespace="/realtime")
+    def _realtime_ns_connect(auth):
+        global last_activity_at
+        last_activity_at = time.time()
+        if AngelRealtimeSession is None:
+            print("[realtime] AngelRealtimeSession unavailable (import failed)", flush=True)
+            return False
+        if not (os.getenv("OPENAI_REALTIME_API_KEY") or os.getenv("OPENAI_API_KEY")):
+            print("[realtime] Missing OPENAI_REALTIME_API_KEY / OPENAI_API_KEY", flush=True)
+            return False
+        sid = request.sid
+        try:
+            system_prompt = _build_openai_realtime_system_prompt()
+            rt = AngelRealtimeSession()
+            rt.connect(system_prompt)
+        except Exception as e:
+            traceback.print_exc()
+            print(f"[realtime] connect failed: {e}", flush=True)
+            return False
+        REALTIME_PROXY_BY_SID[sid] = {"session": rt}
+        rt.start_receiver_thread(lambda m, sid=sid: _forward_openai_realtime_to_client(sid, m))
+        print(f"[realtime] OpenAI Realtime proxy started sid={sid!s}", flush=True)
+        return True
+
+    @socketio.on("disconnect", namespace="/realtime")
+    def _realtime_ns_disconnect():
+        sid = request.sid
+        entry = REALTIME_PROXY_BY_SID.pop(sid, None)
+        if entry and entry.get("session"):
+            try:
+                entry["session"].disconnect()
+            except Exception:
+                pass
+        print(f"[realtime] disconnected sid={sid!s}", flush=True)
+
+    @socketio.on("realtime_audio", namespace="/realtime")
+    def _realtime_ns_audio(data):
+        global last_activity_at
+        last_activity_at = time.time()
+        sid = request.sid
+        entry = REALTIME_PROXY_BY_SID.get(sid)
+        if not entry:
+            emit(
+                "realtime_error",
+                {"message": "No Realtime session; reconnect."},
+                namespace="/realtime",
+            )
+            return
+        payload = data if isinstance(data, dict) else {}
+        b64 = payload.get("audio") or payload.get("audio_base64") or ""
+        if not isinstance(b64, str) or not b64.strip():
+            emit("realtime_error", {"message": "Missing audio (base64)."}, namespace="/realtime")
+            return
+        fmt = (payload.get("format") or "pcm16_24000").strip().lower()
+        rt = entry["session"]
+        try:
+            if fmt in ("pcm16", "pcm16_24000", "pcm_s16le_24000", "raw"):
+                raw = base64.b64decode(b64.strip())
+                rt.append_input_pcm16_24k(raw)
+            elif fmt in ("wav", "audio/wav", "wave"):
+                raw = base64.b64decode(b64.strip())
+                rt.append_input_wav_bytes(raw)
+            else:
+                # Pass through as standard base64 PCM16 chunks (OpenAI wire format)
+                rt.append_input_audio_base64(b64.strip())
+        except Exception as e:
+            traceback.print_exc()
+            emit("realtime_error", {"message": str(e)}, namespace="/realtime")
+
+    @socketio.on("realtime_commit", namespace="/realtime")
+    def _realtime_ns_commit(data=None):
+        global last_activity_at
+        last_activity_at = time.time()
+        sid = request.sid
+        entry = REALTIME_PROXY_BY_SID.get(sid)
+        if not entry:
+            emit(
+                "realtime_error",
+                {"message": "No Realtime session; reconnect."},
+                namespace="/realtime",
+            )
+            return
+        rt = entry["session"]
+        try:
+            rt.commit_input_buffer()
+            rt.create_audio_response()
+        except Exception as e:
+            traceback.print_exc()
+            emit("realtime_error", {"message": str(e)}, namespace="/realtime")
 
     INDEX_HTML = """
     <!doctype html>

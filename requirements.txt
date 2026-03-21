@@ -9,6 +9,7 @@ openai
 colorama
 python-dotenv
 requests
+websockets>=12.0
 faster-whisper
 apscheduler
 
