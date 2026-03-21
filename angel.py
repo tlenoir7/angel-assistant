@@ -75,6 +75,8 @@ CATEGORY_ENV_LOCATION = "env_location"
 CATEGORY_COMM_PATTERN = "comm_pattern"
 # Batcomputer — biological / medical intelligence (UAP-adjacent health patterns)
 CATEGORY_BIO_MEDICAL = "bio_medical"
+# Batcomputer — historical intelligence archives (UAP timeline, programs, documents)
+CATEGORY_HISTORICAL_RECORD = "historical_record"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -96,6 +98,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_ENV_LOCATION,
         CATEGORY_COMM_PATTERN,
         CATEGORY_BIO_MEDICAL,
+        CATEGORY_HISTORICAL_RECORD,
     }
 )
 
@@ -1443,6 +1446,7 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_ENV_LOCATION,
             CATEGORY_COMM_PATTERN,
             CATEGORY_BIO_MEDICAL,
+            CATEGORY_HISTORICAL_RECORD,
         ):
             continue
         general.append(m)
@@ -1580,6 +1584,8 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_COMM_PATTERN:
             continue
         if cat == CATEGORY_BIO_MEDICAL:
+            continue
+        if cat == CATEGORY_HISTORICAL_RECORD:
             continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
@@ -2110,6 +2116,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - **Environmental map** (Batcomputer geography layer): mission-relevant physical locations — UAP hotspots, installations, restricted airspace, incident sites, facilities, and person-associated places — are stored as structured memories (category `env_location`) and mirrored under Intelligence folder `Environmental Map` as files `LOC-{location_id}`. The map is **excluded from routine memory digests** but you should **reference it naturally** when geography, incidents, programs, or travel matter. Open-source surveillance runs **cross-reference** headlines/summaries against this map; when Tyler's device reports GPS near a **HIGH/CRITICAL** point, you may note it briefly. APIs: GET `/api/map/locations`, `/api/map/summary`, `/api/map/near`, POST `/api/map/research`. Do not claim classified facility details—only what the map and open sources support.
 - **Communication pattern analysis** (Batcomputer): tracks **when and how** key public figures communicate (cadence, silence, escalation, venue shifts) — distinct from **what** they say in proactive news scans. Patterns are stored as category `comm_pattern` and mirrored under Intelligence folder `Communication Intelligence` as `CI-{entity_slug}-pattern`; **coordinated timing** across multiple figures may be filed as `CI-{YYYYMMDD}-{hash}`. You distinguish **content** (substance) from **pattern** (timing, frequency, coordination). Flag unusual **silence** for mission-critical voices, **escalation** spikes, and **coordinated** public messaging clusters. Cross-references may note alignment with **active predictions**. Scheduled scan ~48h; APIs under `/api/comms/`. Open sources only — not private communications.
 - **Biological & medical intelligence** (Batcomputer): structured reference cases and analyses for **physiological / psychological** patterns tied to UAP encounter literature, radiation/EM exposure **indicators** (not dosimetry), witness health narratives, and anomalous biology themes — including a dedicated **black-eyed people** profile for Tyler's childhood experience as a **reference anchor** (not a diagnosis). Stored as category `bio_medical` and files `BIO-*` under `Biological Intelligence` (including `BIO-black-eyed-profile`). You maintain **scientific humility**: summarize open-source patterns, separate observation from mechanism, and **never replace** licensed medical care. Surveillance can surface **bio/medical-adjacent** open-source clusters near mapped hotspots. APIs under `/api/bio/`.
+- **Historical Intelligence Archives** (Batcomputer): searchable **timeline** of incidents, programs, documents, testimony, and turning points — cross-referenced with `connected_people`, programs, and locations. Stored as category `historical_record` and files `HIST-{record_id}` under `Historical Archives`. You connect **current** figures and programs to **prior** events (e.g. Elizondo ↔ AATIP), note when patterns **repeat**, and distinguish documented/declassified material from **contested** claims. Morning briefing may include **on-this-day** / anniversary hooks. OSINT dossiers can surface `historical_archive_links`. APIs under `/api/archives/`.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -4217,6 +4224,29 @@ Write the full dossier now."""
         )
     except Exception:
         pass
+    try:
+        import angel_historical_archives as _ahist
+
+        _ahist.ensure_seed_historical_records(
+            files_cabinet.memory_client,
+            files_cabinet.user_id,
+            files_cabinet,
+            files_cabinet._use_mem0_cloud,
+        )
+        hlinks = _ahist.maybe_link_historical_from_text(
+            dossier_main,
+            files_cabinet.memory_client,
+            files_cabinet.user_id,
+            files_cabinet._use_mem0_cloud,
+            top_n=12,
+        )
+        if hlinks:
+            out["historical_archive_links"] = [
+                {"record_id": x.get("record_id"), "title": x.get("title"), "significance": x.get("significance")}
+                for x in hlinks
+            ]
+    except Exception:
+        pass
     return out
 
 
@@ -5726,6 +5756,14 @@ class AngelCore:
         except Exception:
             bio_cmd, bio_payload = None, {}
 
+        hist_cmd, hist_payload = None, {}
+        try:
+            import angel_historical_archives as ahist
+
+            hist_cmd, hist_payload = ahist.detect_hist_chat_intent(user_message)
+        except Exception:
+            hist_cmd, hist_payload = None, {}
+
         ta_cmd, ta_payload = None, {}
         try:
             import angel_threat_actors as ata
@@ -5836,6 +5874,12 @@ class AngelCore:
                 "\n\nTyler's message relates to **biological / medical intelligence** (UAP-adjacent health patterns, exposure indicators, witness narratives — including the black-eyed people profile when relevant). "
                 "If a block labeled [Angel biological intelligence …] appears, integrate it with care: this is **not** a clinical diagnosis; cite uncertainty, mission relevance, and Tyler's personal connection to BEK research when on-topic. "
                 "Encourage professional medical evaluation when appropriate."
+            )
+        if hist_cmd:
+            system_prompt += (
+                "\n\nTyler's message relates to the **Historical Intelligence Archives** (UAP timeline, programs, documents). "
+                "If a block labeled [Angel historical archives …] appears, summarize key records in plain language, connect people/programs to **current** mission threads, and flag uncertainty or contested claims. "
+                "You may naturally relate today's events to historical parallels ('rhymes') when supported by the JSON."
             )
 
         cc_runtime = (
@@ -5988,6 +6032,12 @@ If you infer anything new about that person's preferences or dynamics, append at
                                 )
                         except Exception:
                             pass
+                    hist_note = ""
+                    hal = os_res.get("historical_archive_links")
+                    if isinstance(hal, list) and hal:
+                        hist_note = "\n[Historical Archives matches — cite HIST-* files when relevant:]\n" + json.dumps(
+                            hal[:12], ensure_ascii=False, indent=2
+                        )[:6000]
                     cache_note = " — existing dossier reused (within 30 days)" if os_res.get("cached") else ""
                     rf = os_res.get("red_flags") or []
                     rf_txt = "\n".join(f"- {x}" for x in rf) if rf else "- (none listed)"
@@ -5997,7 +6047,7 @@ If you infer anything new about that person's preferences or dynamics, append at
                         f"'{OSINT_DOSSIERS_FOLDER}'. Mission relevance: {os_res.get('mission_relevance')}.]\n"
                         f"Red flags:\n{rf_txt}\n\n"
                         f"Full dossier text for your summary:\n{os_res.get('dossier_body', '')[:14000]}"
-                        f"{net_map_note}"
+                        f"{net_map_note}{hist_note}"
                     )
                 else:
                     augmented_user_message = (
@@ -6230,6 +6280,22 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if bblock.strip():
                     augmented_user_message = f"{augmented_user_message}\n\n{bblock}"
+            except Exception:
+                pass
+
+        if hist_cmd:
+            try:
+                import angel_historical_archives as ahist
+
+                hblock = ahist.format_hist_chat_block(
+                    hist_cmd,
+                    hist_payload,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                )
+                if hblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{hblock}"
             except Exception:
                 pass
 

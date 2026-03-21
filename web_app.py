@@ -23,6 +23,7 @@ import angel_surveillance
 import angel_environmental_map
 import angel_communication_patterns
 import angel_biological_intelligence
+import angel_historical_archives
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -544,6 +545,21 @@ def _run_morning_briefing_job():
         except Exception as e:
             print(f"[web_app] Communication patterns briefing appendix: {e}", flush=True)
 
+        try:
+            hist_brief = angel_historical_archives.format_on_this_day_and_anniversaries(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            if (
+                hist_brief
+                and morning_briefing
+                and "Briefing unavailable" not in morning_briefing
+            ):
+                morning_briefing = (morning_briefing or "").rstrip() + "\n\n" + hist_brief
+        except Exception as e:
+            print(f"[web_app] Historical archives briefing appendix: {e}", flush=True)
+
         briefing_generated_at = time.time()
         send_briefing_email(morning_briefing)
         if morning_briefing and "Briefing unavailable" not in morning_briefing:
@@ -795,6 +811,34 @@ def _schedule_biological_intelligence_seed() -> None:
         pass
 
 
+def _schedule_historical_archives_seed() -> None:
+    """Batcomputer: seed Historical Intelligence Archives (timeline records)."""
+
+    def _job() -> None:
+        try:
+            time.sleep(48)
+        except Exception:
+            return
+        global angel
+        if angel is None:
+            return
+        try:
+            r = angel_historical_archives.ensure_seed_historical_records(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            print(f"[web_app] Historical archives seed: {r}", flush=True)
+        except Exception:
+            traceback.print_exc()
+
+    try:
+        threading.Thread(target=_job, daemon=True).start()
+    except Exception:
+        pass
+
+
 def _run_communication_patterns_job() -> None:
     """Every 48h: open-source communication cadence / coordination analysis for watched figures."""
 
@@ -896,6 +940,7 @@ def create_app() -> Flask:
     _schedule_threat_actor_seed()
     _schedule_environmental_map_seed()
     _schedule_biological_intelligence_seed()
+    _schedule_historical_archives_seed()
     _load_expo_push_tokens_from_disk()
 
     # Log briefing email env at startup for debugging
@@ -3433,6 +3478,237 @@ def create_app() -> Flask:
             )
             p = angel_biological_intelligence.get_black_eyed_profile()
             return jsonify({"ok": True, "profile": p})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Historical Intelligence Archives ---
+    @app.route("/api/archives/timeline", methods=["GET"])
+    def api_archives_timeline():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            angel_historical_archives.ensure_seed_historical_records(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            tl = angel_historical_archives.get_timeline(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "timeline": tl})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/archives/summary", methods=["GET"])
+    def api_archives_summary():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            angel_historical_archives.ensure_seed_historical_records(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            s = angel_historical_archives.get_archive_summary(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "summary": s})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/archives/search", methods=["GET"])
+    def api_archives_search():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        q = (request.args.get("q") or "").strip()
+        if not q:
+            return jsonify({"ok": False, "error": "q required"}), 400
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            angel_historical_archives.ensure_seed_historical_records(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            rows = angel_historical_archives.search_archives(
+                q,
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "query": q, "records": rows})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/archives/person/<path:name>", methods=["GET"])
+    def api_archives_person(name):
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            angel_historical_archives.ensure_seed_historical_records(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            rows = angel_historical_archives.get_records_by_person(
+                name,
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "person": name, "records": rows})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/archives/add", methods=["POST"])
+    def api_archives_add():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "JSON body required"}), 400
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            rec = angel_historical_archives.add_historical_record(
+                (data.get("title") or "").strip(),
+                (data.get("record_type") or "incident").strip(),
+                (data.get("date") or "").strip(),
+                (data.get("location") or "").strip(),
+                (data.get("description") or "").strip(),
+                (data.get("significance") or "MEDIUM").strip(),
+                data.get("connected_people") if isinstance(data.get("connected_people"), list) else [],
+                (data.get("evidence_quality") or "documented").strip(),
+                (data.get("current_relevance") or "").strip(),
+                data.get("sources") if isinstance(data.get("sources"), list) else [],
+                data.get("tags") if isinstance(data.get("tags"), list) else [],
+                memory_client=angel.memory_client,
+                user_id=user_id,
+                files_cabinet=angel.files_cabinet,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                record_id=(data.get("record_id") or "").strip() or None,
+                date_precision=(data.get("date_precision") or "approximate").strip(),
+                connected_programs=data.get("connected_programs")
+                if isinstance(data.get("connected_programs"), list)
+                else None,
+                connected_locations=data.get("connected_locations")
+                if isinstance(data.get("connected_locations"), list)
+                else None,
+            )
+            return jsonify({"ok": True, "record": rec})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/archives/research", methods=["POST"])
+    def api_archives_research():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        context = (data.get("context") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "name required"}), 400
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            r = angel_historical_archives.research_historical_event(
+                name,
+                context,
+                angel.anthropic_client,
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            code = 200 if r.get("ok") else 400
+            return jsonify(r), code
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/archives/<path:record_id>", methods=["GET"])
+    def api_archives_one(record_id):
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            angel_historical_archives.ensure_seed_historical_records(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            rec = angel_historical_archives.get_record(
+                record_id,
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            if not rec:
+                return jsonify({"ok": False, "error": "not found"}), 404
+            return jsonify({"ok": True, "record": rec})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/archives", methods=["GET"])
+    def api_archives_list():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            user_id = os.getenv("ANGEL_USER_ID", "railway-user")
+            angel_historical_archives.ensure_seed_historical_records(
+                angel.memory_client,
+                user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            rt = (request.args.get("type") or "").strip() or None
+            sig = (request.args.get("significance") or "").strip().upper() or None
+            sy = (request.args.get("start_year") or "").strip()
+            ey = (request.args.get("end_year") or "").strip()
+            rows = angel_historical_archives.list_all_records(
+                angel.memory_client,
+                user_id,
+                angel._use_mem0_cloud,
+            )
+            if rt:
+                rows = [r for r in rows if (r.get("record_type") or "").lower() == rt.lower()]
+            if sig:
+                rows = [r for r in rows if (r.get("significance") or "").upper() == sig]
+            if sy and ey:
+                try:
+                    syy = int(sy)
+                    eyy = int(ey)
+                    rows = [
+                        r
+                        for r in rows
+                        if (y := angel_historical_archives._extract_year(r.get("date") or ""))
+                        is not None
+                        and syy <= y <= eyy
+                    ]
+                except ValueError:
+                    pass
+            try:
+                rows.sort(key=angel_historical_archives._sort_key_date)
+            except Exception:
+                pass
+            return jsonify({"ok": True, "records": rows, "count": len(rows)})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
