@@ -1290,10 +1290,12 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    # Local dev: Socket.IO + Flask (use eventlet async mode to match production).
-    port = int(os.getenv("PORT", "8000"))
-    if socketio is not None:
-        socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
-    else:
-        app.run(host="0.0.0.0", port=port, debug=False)
+    # Production (Railway) and local: eventlet serves HTTP + WebSockets; no gunicorn.
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        debug=False,
+        use_reloader=False,
+    )
 
