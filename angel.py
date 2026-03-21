@@ -275,29 +275,86 @@ def _memory_text_for_debug(item) -> str:
     return str(item)
 
 
-def _load_local_memories(user_id: str):
+# Canonical empty on-disk shape for tyler_memories.json (per-user lists under "users").
+# Top-level "memories" satisfies empty-array JSON; Angel stores rows in users[user_id].
+_EMPTY_LOCAL_MEMORY_DOC: dict = {"memories": [], "users": {}}
+
+
+def _write_local_memory_file_silent(data: dict) -> None:
+    """Persist tyler_memories.json; swallow errors (never raise to callers)."""
+    try:
+        LOCAL_MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOCAL_MEMORY_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _load_local_memory_file_data() -> dict:
+    """
+    Read and normalize tyler_memories.json. Never raises; never logs.
+    Missing file: return empty doc (no write until something is saved).
+    Empty, invalid JSON, or wrong types: reinitialize to _EMPTY_LOCAL_MEMORY_DOC and rewrite.
+    """
     try:
         if not LOCAL_MEMORY_FILE.exists():
-            return []
-        with LOCAL_MEMORY_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+            return dict(_EMPTY_LOCAL_MEMORY_DOC)
+
+        raw = LOCAL_MEMORY_FILE.read_text(encoding="utf-8")
+        if not raw.strip():
+            _write_local_memory_file_silent(dict(_EMPTY_LOCAL_MEMORY_DOC))
+            return dict(_EMPTY_LOCAL_MEMORY_DOC)
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            _write_local_memory_file_silent(dict(_EMPTY_LOCAL_MEMORY_DOC))
+            return dict(_EMPTY_LOCAL_MEMORY_DOC)
+
+        if not isinstance(data, dict):
+            _write_local_memory_file_silent(dict(_EMPTY_LOCAL_MEMORY_DOC))
+            return dict(_EMPTY_LOCAL_MEMORY_DOC)
+
+        if "memories" in data and not isinstance(data.get("memories"), list):
+            data["memories"] = []
+        users = data.get("users")
+        if not isinstance(users, dict):
+            data["users"] = {}
+        else:
+            data["users"] = users
+        data.setdefault("memories", [])
+        return data
+    except Exception:
+        try:
+            _write_local_memory_file_silent(dict(_EMPTY_LOCAL_MEMORY_DOC))
+        except Exception:
+            pass
+        return dict(_EMPTY_LOCAL_MEMORY_DOC)
+
+
+def _load_local_memories(user_id: str):
+    try:
+        data = _load_local_memory_file_data()
         users = data.get("users", {})
-        return users.get(user_id, [])
-    except Exception as e:
-        print(f"{Fore.RED}Warning: could not load local memories: {e}{Style.RESET_ALL}")
-        print(traceback.format_exc())
+        if not isinstance(users, dict):
+            return []
+        arr = users.get(user_id, [])
+        return arr if isinstance(arr, list) else []
+    except Exception:
         return []
 
 
 def _append_local_memory(user_id: str, memory_text: str, metadata: dict):
     try:
-        if LOCAL_MEMORY_FILE.exists():
-            with LOCAL_MEMORY_FILE.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        else:
-            data = {"users": {}}
+        data = _load_local_memory_file_data()
         users = data.setdefault("users", {})
+        if not isinstance(users, dict):
+            users = {}
+            data["users"] = users
         user_memories = users.setdefault(user_id, [])
+        if not isinstance(user_memories, list):
+            user_memories = []
+            users[user_id] = user_memories
         user_memories.append(
             {
                 "memory": memory_text,
@@ -305,43 +362,36 @@ def _append_local_memory(user_id: str, memory_text: str, metadata: dict):
                 "created_at": metadata.get("timestamp"),
             }
         )
-        with LOCAL_MEMORY_FILE.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"{Fore.RED}Warning: could not save local memory: {e}{Style.RESET_ALL}")
-        print(traceback.format_exc())
+        _write_local_memory_file_silent(data)
+    except Exception:
+        pass
 
 
 def _load_local_memory_entries(user_id: str) -> list:
     """Return the raw list of memory entry dicts for user_id from tyler_memories.json."""
     try:
-        if not LOCAL_MEMORY_FILE.exists():
-            return []
-        with LOCAL_MEMORY_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = _load_local_memory_file_data()
         users = data.get("users", {})
+        if not isinstance(users, dict):
+            return []
         arr = users.get(user_id, [])
         return arr if isinstance(arr, list) else []
-    except Exception as e:
-        print(f"{Fore.RED}Warning: could not load local memory entries: {e}{Style.RESET_ALL}")
+    except Exception:
         return []
 
 
 def _save_local_memory_entries(user_id: str, entries: list) -> None:
     """Replace the on-disk memory list for user_id (full file rewrite)."""
     try:
-        if LOCAL_MEMORY_FILE.exists():
-            with LOCAL_MEMORY_FILE.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        else:
-            data = {"users": {}}
+        data = _load_local_memory_file_data()
         users = data.setdefault("users", {})
+        if not isinstance(users, dict):
+            users = {}
+            data["users"] = users
         users[user_id] = entries
-        with LOCAL_MEMORY_FILE.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"{Fore.RED}Warning: could not save local memory entries: {e}{Style.RESET_ALL}")
-        print(traceback.format_exc())
+        _write_local_memory_file_silent(data)
+    except Exception:
+        pass
 
 
 def _parse_intelligence_tags(meta: dict) -> list[str]:
