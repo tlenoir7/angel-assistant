@@ -1038,44 +1038,25 @@ def execute_python_sandbox(
             pass
 
 
-def _short_python_error_message(stderr: str, max_len: int = 500) -> str:
+def append_executed_python_results_to_reply(
+    reply: str,
+    *,
+    anthropic_client: anthropic.Anthropic | None = None,
+    system_prompt: str | None = None,
+    model: str = "claude-sonnet-4-5",
+    prior_turns: list[tuple[str, str]] | None = None,
+    refine_prose_with_stdout: bool = True,
+) -> str:
     """
-    Turn sandbox stderr into a short user-facing line (no full Python tracebacks).
-    """
-    s = (stderr or "").strip()
-    if not s:
-        return "Execution failed (no details were returned)."
-    matches = list(
-        re.finditer(
-            r"^([\w.]+(?:Error|Exception|BaseException|Warning)): (.+)$",
-            s,
-            re.MULTILINE,
-        )
-    )
-    if matches:
-        m = matches[-1]
-        line = f"{m.group(1)}: {m.group(2)}".strip()
-        return line[:max_len]
-    lines = [ln.rstrip() for ln in s.splitlines() if ln.strip()]
-    for ln in reversed(lines):
-        stripped_ln = ln.strip()
-        if stripped_ln.startswith("File ") or stripped_ln.startswith('File "'):
-            continue
-        if stripped_ln == "Traceback (most recent call last):":
-            continue
-        if stripped_ln.startswith("During handling of the above exception"):
-            continue
-        if ln.startswith("  ") and ("File " in ln or "line " in ln.lower()):
-            continue
-        return ln[:max_len]
-    return s[:max_len]
+    Find ```python ... ``` fences, run each block in the sandbox, and remove those
+    fences entirely from the text Tyler sees. Nothing about execution (stdout, stderr,
+    errors) is appended to the reply.
 
-
-def append_executed_python_results_to_reply(reply: str) -> str:
-    """
-    Find ```python ... ``` fences, run each block in the sandbox, remove those fences
-    entirely from the text Tyler sees, then append computed output only when there is
-    real stdout; on failure with empty stdout, append a short error line (no traceback).
+    When execution succeeds for every non-empty block and there is non-empty stdout,
+    optionally run a follow-up Claude call (if client + system_prompt are provided)
+    to fold that stdout into natural language so the final reply matches computed
+    values—Tyler still never sees raw program output. On any execution failure, the
+    draft prose is returned unchanged (Angel's reasoned answer stands).
     """
     if not reply or not re.search(r"```\s*python", reply, re.IGNORECASE):
         return reply
@@ -1086,41 +1067,59 @@ def append_executed_python_results_to_reply(reply: str) -> str:
     stripped = _PYTHON_CODE_BLOCK_RE.sub("\n\n", reply)
     stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
 
-    n_blocks = len(matches)
-    sections: list[str] = []
-    for i, m in enumerate(matches, start=1):
+    ran_any = False
+    all_ok = True
+    stdout_chunks: list[str] = []
+    for m in matches:
         raw = m.group(1)
         code = (raw or "").strip()
         if not code:
             continue
+        ran_any = True
         ex = execute_python_sandbox(code)
+        if not ex.get("success"):
+            all_ok = False
+            continue
         out = ((ex.get("output") or "").rstrip())
-        err_full = ((ex.get("error") or "").rstrip())
-        success = bool(ex.get("success"))
-        out_nonempty = bool(out.strip())
-        short_err = _short_python_error_message(err_full)
+        if out:
+            stdout_chunks.append(out)
 
-        if success:
-            if not out_nonempty:
-                continue
-            hdr = "**Computed output:**\n" if n_blocks == 1 else f"**Computed output ({i}):**\n"
-            block = f"{hdr}```\n{out}\n```"
-            if err_full.strip():
-                block += f"\n_(stderr)_\n```\n{err_full[:8000]}\n```"
-            sections.append(block)
-        else:
-            hdr = "**Computation issue:**\n" if n_blocks == 1 else f"**Computation issue ({i}):**\n"
-            if out_nonempty:
-                sections.append(
-                    f"{hdr}Partial stdout:\n```\n{out}\n```\n**Error:** {short_err}"
-                )
-            else:
-                sections.append(f"{hdr}{short_err}")
+    combined_stdout = "\n\n".join(stdout_chunks).strip()
 
-    if not sections:
-        return stripped
-    appendix = "\n\n---\n" + "\n\n".join(sections) + "\n"
-    return stripped + appendix if stripped else appendix.strip()
+    if (
+        refine_prose_with_stdout
+        and ran_any
+        and all_ok
+        and combined_stdout
+        and anthropic_client is not None
+        and (system_prompt or "").strip()
+    ):
+        refine_user = (
+            "You are polishing your reply to Tyler. Obey your full system instructions and persona.\n\n"
+            "Your draft reply (hidden python fenced code was already removed; this is the prose Tyler would see before polish):\n---\n"
+            + stripped
+            + "\n---\n\n"
+            "Hidden Python ran successfully. Raw stdout (integrate facts and numbers into your answer; Tyler must never see this verbatim or as a pasted block):\n---\n"
+            + combined_stdout
+            + "\n---\n\n"
+            "Respond with your complete final reply to Tyler in natural language only. "
+            "Use exact values and conclusions from the stdout where they belong. "
+            "Do not use markdown code fences, do not mention Python, code execution, or stdout. "
+            "If the stdout adds nothing useful, keep your draft largely as-is."
+        )
+        refined = call_claude(
+            anthropic_client,
+            system_prompt,
+            refine_user,
+            model=model,
+            prior_turns=prior_turns,
+        )
+        refined = (refined or "").strip()
+        if refined.startswith("(Angel encountered an error talking to Claude"):
+            return stripped
+        return refined or stripped
+
+    return stripped
 
 
 def build_system_prompt(
@@ -1158,7 +1157,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Voice conversation on desktop (microphone + TTS).
 - Text and voice interface on mobile web.
 - Cloud deployment accessible from any device.
-- Sandboxed Python execution for computation and science: numpy, scipy, pandas, matplotlib (headless), sympy. You may embed a hidden ```python fenced block for the server to run (30s limit). That entire fence—including every line of code—is removed before Tyler sees your message; Tyler only sees your prose plus any appended stdout from the run. Never paste the same code again in plain text.
+- Sandboxed Python execution for computation and science: numpy, scipy, pandas, matplotlib (headless), sympy. You may embed a hidden ```python fenced block for the server to run (30s limit). That entire fence is removed before Tyler sees your message; stdout from a successful run is merged into your final natural-language reply in a silent server pass—Tyler never sees raw program output or a separate computed-results section. Never paste the same code again in plain text.
 
 {date_time_str}
 """
@@ -1221,7 +1220,7 @@ Memory reflection (how you think, not just what you store):
 Python code execution (server sandbox):
 - Write simple, valid Python to compute the answer when computation, statistics, data shaping, simulation, numerical or symbolic math, or modeling would help. In the text Tyler sees, give ONLY your final answer, reasoning, and interpretation in natural language—never repeat or display the code; the ```python fence is removed in full before delivery.
 - Put the runnable code alone inside a single fenced block tagged python (triple-backtick + python) at the end of your model output. The server strips that entire fence (opening line through closing ```) and runs the code; Tyler never sees it.
-- Always use print() for every result you want Tyler to see; execution only surfaces stdout. Do not rely on implicit expression values or notebook-style last-line display.
+- Always use print() for every computed value the server should merge into your reply; stdout is not shown to Tyler—it is folded into your polished prose. Do not rely on implicit expression values or notebook-style last-line display.
 - Use only positional arguments with range(), e.g. range(10) or range(0, n)—range() does not accept keyword arguments like stop= in Python.
 - Libraries: numpy, scipy, pandas, matplotlib (Agg backend is automatic; prefer printed summaries over expecting images), sympy.
 - If execution fails, Tyler still will not see your code—briefly explain in prose what went wrong and, if useful, supply a corrected hidden block on the next turn.
@@ -2795,7 +2794,23 @@ If you infer anything new about that person's preferences or dynamics, append at
             )
 
         reply = cleaned_reply
-        reply = append_executed_python_results_to_reply(reply)
+        reply = append_executed_python_results_to_reply(
+            reply,
+            anthropic_client=self.anthropic_client,
+            system_prompt=system_prompt,
+            model=model,
+            prior_turns=session_turns,
+        )
+        # If the refinement pass emitted another hidden fence, strip and run once more without re-refining.
+        if reply and re.search(r"```\s*python", reply, re.IGNORECASE):
+            reply = append_executed_python_results_to_reply(
+                reply,
+                anthropic_client=self.anthropic_client,
+                system_prompt=system_prompt,
+                model=model,
+                prior_turns=session_turns,
+                refine_prose_with_stdout=False,
+            )
         memory_reply = strip_markdown(reply) if self.use_voice else reply
 
         try:
