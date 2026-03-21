@@ -15,6 +15,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
     AngelCore,
+    COMPUTER_CONTROL_AVAILABLE,
     tts_gpt4o,
     transcribe_with_whisper,
     generate_morning_briefing,
@@ -58,6 +59,23 @@ expo_push_tokens: list[str] = []
 
 
 _VALID_CLIENT_DEVICES = frozenset({"ios", "desktop", "mobile_web"})
+
+
+def _vision_device_from_body(device_raw: str) -> str:
+    d = (device_raw or "").strip().lower()
+    if d in _VALID_CLIENT_DEVICES:
+        return d
+    return "mobile_web"
+
+
+def _normalize_jpeg_base64(image_field: str) -> str:
+    """Strip data-URL wrapper and whitespace from a base64 JPEG payload."""
+    s = (image_field or "").strip()
+    if not s:
+        return ""
+    if s.startswith("data:") and "base64," in s:
+        s = s.split("base64,", 1)[1].strip()
+    return "".join(s.split())
 
 
 def _request_device() -> str:
@@ -1101,6 +1119,95 @@ def create_app() -> Flask:
                 "reply": _sanitize_text(reply),
             }
         )
+
+    @app.route("/api/vision", methods=["POST"])
+    def api_vision():
+        """
+        Camera vision: JPEG (base64) + question, using Claude vision with Angel's full system prompt and memory.
+        JSON body: image (base64 JPEG), question (str), device (ios | desktop | mobile_web).
+        """
+        global last_activity_at, check_in_message, check_in_generated_at
+        last_activity_at = time.time()
+        check_in_message = None
+        check_in_generated_at = None
+
+        data = request.get_json(silent=True) or {}
+        image_b64 = _normalize_jpeg_base64(str(data.get("image") or ""))
+        question = (data.get("question") or "").strip()
+        device = _vision_device_from_body(str(data.get("device") or ""))
+
+        if not image_b64:
+            print("[api_vision] error: missing or empty image", flush=True)
+            return jsonify({"error": "Missing or empty 'image' (base64 JPEG)."}), 400
+        if not question:
+            print("[api_vision] error: missing question", flush=True)
+            return jsonify({"error": "Missing or empty 'question'."}), 400
+
+        try:
+            try:
+                raw_bytes = base64.b64decode(image_b64, validate=True)
+            except TypeError:
+                raw_bytes = base64.b64decode(image_b64)
+        except Exception as e:
+            print(f"[api_vision] error: invalid base64 image: {e}", flush=True)
+            traceback.print_exc()
+            return jsonify({"error": "Invalid base64 image data."}), 400
+
+        if len(raw_bytes) < 10 or not raw_bytes.startswith(b"\xff\xd8\xff"):
+            print("[api_vision] error: payload does not look like JPEG", flush=True)
+            return jsonify({"error": "Image must be base64-encoded JPEG."}), 400
+
+        try:
+            memories = angel._fetch_combined_memories()
+            memory_summary = build_memory_summary_with_sections(memories, question)
+            cc_for_prompt = (
+                angel.computer_control_enabled
+                and COMPUTER_CONTROL_AVAILABLE
+                and device not in ("ios", "mobile_web")
+            )
+            system_prompt = build_system_prompt(
+                memory_summary,
+                voice_mode=False,
+                strategy_hint=False,
+                pattern_hint=False,
+                profile_hint=False,
+                computer_control_enabled=cc_for_prompt,
+                device=device,
+            )
+            client = create_anthropic_client()
+            user_content = [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": question,
+                },
+            ]
+            resp = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=4096,
+                temperature=0.4,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}],
+            )
+            parts: list[str] = []
+            for block in resp.content:
+                if getattr(block, "type", None) == "text":
+                    parts.append(block.text)
+                elif isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            reply = "\n".join(parts).strip() or "(No text in response.)"
+            return jsonify({"reply": _sanitize_text(reply)})
+        except Exception as e:
+            print(f"[api_vision] Claude vision error: {e}", flush=True)
+            traceback.print_exc()
+            return jsonify({"error": "Vision analysis failed.", "details": str(e)}), 500
 
     @app.route("/api/briefing", methods=["GET"])
     def api_briefing():
