@@ -64,6 +64,7 @@ CATEGORY_NETWORK_EDGE = "network_edge"
 CATEGORY_PREDICTION = "prediction"
 CATEGORY_PROACTIVE_WATCH = "proactive_watch"
 CATEGORY_PROACTIVE_FINDING = "proactive_finding"
+CATEGORY_FOREIGN_INTEL = "foreign_intelligence"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -79,6 +80,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_PREDICTION,
         CATEGORY_PROACTIVE_WATCH,
         CATEGORY_PROACTIVE_FINDING,
+        CATEGORY_FOREIGN_INTEL,
     }
 )
 
@@ -1417,6 +1419,7 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_PREDICTION,
             CATEGORY_PROACTIVE_WATCH,
             CATEGORY_PROACTIVE_FINDING,
+            CATEGORY_FOREIGN_INTEL,
         ):
             continue
         general.append(m)
@@ -1542,6 +1545,8 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_PROACTIVE_WATCH:
             continue
         if cat == CATEGORY_PROACTIVE_FINDING:
+            continue
+        if cat == CATEGORY_FOREIGN_INTEL:
             continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
@@ -2064,6 +2069,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Mission connection graph (Batcomputer network): people, organizations, programs, and events material to Tyler's work are linked in a living graph stored as Mem0 categories network_node / network_edge and mirrored under Intelligence folder `Network Intelligence` (mirror files use prefix NET- plus each node's canonical lowercase id, with that node's data and incident edges). New OSINT dossiers automatically expand the graph when possible. When Tyler researches someone new, you may offer to map their cluster or path to figures already in the network. If he names two people who are already connected, say so naturally.
 - Predictive modeling (Item 15): you synthesize forward-looking forecasts from threat intel, OSINT dossiers, mission network patterns, briefing history, and live web context (Tavily). Predictions are stored as structured memories (category: prediction) and mirrored under Intelligence folder `Predictions` as files `PRED-{id}`. Each has a timeframe, confidence tier, and status (active / confirmed / denied / expired). You track accuracy when predictions resolve—treat forecasts as informed hypotheses, not facts. Reference active predictions when they illuminate the conversation; acknowledge uncertainty and update your stance when real events confirm or challenge a forecast. Weekly jobs generate new predictions and check open ones against the news.
 - Proactive background intelligence (Item 16): you maintain a **dynamic watch list** (category: proactive_watch) of people, topics, and situations you monitor without being asked—researched on a schedule with Tavily, with findings filed under Intelligence folder `Proactive Intelligence`. You connect significant hits to threats, OSINT refresh hints, predictions, and the mission network when appropriate. Tell Tyler when you add something to the watch list or when overnight monitoring surfaces something he should see. You are the connective tissue that keeps threat watch, dossiers, forecasts, and the network graph current.
+- Real-time translation & foreign intelligence (Item 18): you understand, translate, and analyze foreign-language content relevant to Tyler's mission—foreign government UAP acknowledgments, international documents, non-English news, and communications from international figures. You auto-detect language, translate to clear English, and provide mission relevance, key terms, red flags, and **linguistic nuance** (what is said carefully vs avoided; diplomatic vs direct claims). Proactive intelligence runs include multilingual Tavily queries (e.g. Spanish, French, German, Russian, Chinese, Japanese UAP-related phrasing); significant hits are filed under Intelligence folder `Foreign Intelligence` (FI- files) with source language tags and cross-references to OSINT and threat intel when appropriate. When Tyler pastes foreign text or asks to translate, you deliver English plus mission context. When foreign sources corroborate or contradict domestic open reporting, say so explicitly—without claiming classified access.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -5588,6 +5594,14 @@ class AngelCore:
         except Exception:
             proactive_cmd, proactive_payload = None, {}
 
+        trans_cmd, trans_payload = None, {}
+        try:
+            import angel_translation as tr
+
+            trans_cmd, trans_payload = tr.detect_translation_intent(user_message)
+        except Exception:
+            trans_cmd, trans_payload = None, {}
+
         cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
         if device in ("ios", "mobile_web"):
             cc_for_prompt = False
@@ -5637,6 +5651,13 @@ class AngelCore:
                 "If a block labeled [Angel proactive watch list] or [Proactive watch] or [Proactive findings] appears, "
                 "answer naturally: confirm what you're monitoring, offer to adjust watches, and surface anything urgent. "
                 "When you added a watch in this turn, tell Tyler explicitly that it's on your list."
+            )
+        if trans_cmd:
+            system_prompt += (
+                "\n\nTyler's message triggered translation / foreign-source analysis. "
+                "If a block labeled [Angel translation] or [Foreign-source search] appears, summarize it in plain language: "
+                "give the English sense, mission relevance, and any diplomatic or linguistic nuance. "
+                "Note when foreign reporting corroborates or contradicts typical U.S. domestic framing—without claiming classified access."
             )
 
         cc_runtime = (
@@ -5907,6 +5928,25 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if pblock.strip():
                     augmented_user_message = f"{augmented_user_message}\n\n{pblock}"
+            except Exception:
+                pass
+
+        if trans_cmd:
+            try:
+                import angel_translation as tr
+
+                tblock = tr.format_translation_for_prompt(
+                    trans_cmd,
+                    trans_payload,
+                    anthropic_client=self.anthropic_client,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                    files_cabinet=self.files_cabinet,
+                    user_message=user_message,
+                )
+                if tblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{tblock}"
             except Exception:
                 pass
 

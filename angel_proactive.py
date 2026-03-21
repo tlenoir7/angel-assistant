@@ -510,6 +510,20 @@ def run_proactive_intelligence(
         _record_finding(memory_client, user_id, use_mem0_cloud, finding_rec)
         out["details"].append({"watch_id": wid, "result": "filed", "file": fname})
 
+    try:
+        import angel_translation as tr
+
+        out["foreign_monitor"] = tr.run_foreign_uap_monitor_pass(
+            anthropic_client,
+            memory_client,
+            user_id,
+            files_cabinet,
+            use_mem0_cloud,
+            max_items=4,
+        )
+    except Exception as ex:
+        out["foreign_monitor"] = {"ok": False, "error": str(ex)}
+
     _LAST_PROACTIVE_RUN = {"at": _now_iso(), "summary": out}
     return out
 

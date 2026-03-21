@@ -15,6 +15,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 import angel_predictions
 import angel_proactive
+import angel_translation
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -574,6 +575,34 @@ def _schedule_proactive_watch_seed() -> None:
         pass
 
 
+def _schedule_foreign_watch_seed() -> None:
+    """Item 18: ensure foreign-intelligence watch items exist (deduped by label)."""
+
+    def _job() -> None:
+        try:
+            time.sleep(32)
+        except Exception:
+            return
+        global angel
+        if angel is None:
+            return
+        try:
+            r = angel_translation.ensure_foreign_watch_items(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            print(f"[web_app] Foreign watch seed: {r}", flush=True)
+        except Exception:
+            traceback.print_exc()
+
+    try:
+        threading.Thread(target=_job, daemon=True).start()
+    except Exception:
+        pass
+
+
 def _run_proactive_intelligence_job():
     """Every 4 hours: background Tavily monitoring for watch list (Item 16)."""
     global angel
@@ -645,6 +674,7 @@ def create_app() -> Flask:
     )
     _schedule_predictions_initial_seed()
     _schedule_proactive_watch_seed()
+    _schedule_foreign_watch_seed()
     _load_expo_push_tokens_from_disk()
 
     # Log briefing email env at startup for debugging
@@ -2312,6 +2342,100 @@ def create_app() -> Flask:
             except ValueError:
                 n = 30
             rows = angel_proactive.fetch_recent_findings(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+                limit=n,
+            )
+            return jsonify({"ok": True, "findings": rows, "count": len(rows)})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Item 18: Real-time translation & foreign intelligence ---
+
+    @app.route("/api/translate", methods=["POST"])
+    def api_translate():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        content = data.get("content") or ""
+        context = (data.get("context") or "").strip()
+        try:
+            r = angel_translation.translate_and_analyze(
+                angel.anthropic_client,
+                content,
+                context,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/translate/search", methods=["POST"])
+    def api_translate_search():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        topic = (data.get("topic") or "").strip()
+        if not topic:
+            return jsonify({"ok": False, "error": "topic required"}), 400
+        langs = data.get("languages")
+        if langs is not None and not isinstance(langs, list):
+            langs = None
+        context = (data.get("context") or "").strip()
+        try:
+            r = angel_translation.search_foreign_sources_and_translate(
+                angel.anthropic_client,
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+                topic=topic,
+                languages=langs,
+                context=context,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/translate/document", methods=["POST"])
+    def api_translate_document():
+        """Full foreign document: translate, analyze, file under Foreign Intelligence, expand network graph."""
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        content = data.get("content") or ""
+        context = (data.get("context") or "").strip()
+        source_label = (data.get("file_name") or data.get("source_label") or "document_upload").strip()
+        try:
+            r = angel_translation.translate_document_and_file(
+                angel.anthropic_client,
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+                content,
+                context,
+                source_label=source_label[:200],
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/foreign/findings", methods=["GET"])
+    def api_foreign_findings():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            lim = request.args.get("limit", "30")
+            try:
+                n = max(1, min(80, int(lim)))
+            except ValueError:
+                n = 30
+            rows = angel_translation.fetch_recent_foreign_findings(
                 angel.memory_client,
                 angel.user_id,
                 angel._use_mem0_cloud,
