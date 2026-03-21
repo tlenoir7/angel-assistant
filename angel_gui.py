@@ -113,6 +113,7 @@ class AngelApp:
                     voice_mode=True,
                     computer_control_enabled=self.computer_control_enabled,
                     device=self.client_device,
+                    intelligence_files_summary=self.core.files_cabinet.get_summary(),
                 )
                 self.realtime_session.connect(system_prompt)
             except Exception as e:
@@ -437,6 +438,7 @@ class AngelApp:
                 voice_mode=True,
                 computer_control_enabled=self.computer_control_enabled,
                 device=self.client_device,
+                intelligence_files_summary=self.core.files_cabinet.get_summary(),
             )
             if self.realtime_session is not None:
                 try:

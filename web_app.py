@@ -522,6 +522,7 @@ def create_app() -> Flask:
             profile_hint=False,
             computer_control_enabled=False,
             device="ios",
+            intelligence_files_summary=angel.files_cabinet.get_summary(),
         )
 
     def _forward_openai_realtime_to_client(sid: str, msg: dict) -> None:
@@ -1243,6 +1244,7 @@ def create_app() -> Flask:
                 profile_hint=False,
                 computer_control_enabled=cc_for_prompt,
                 device=device,
+                intelligence_files_summary=angel.files_cabinet.get_summary(),
             )
             client = create_anthropic_client()
             user_content = [
@@ -1278,6 +1280,109 @@ def create_app() -> Flask:
             print(f"[api_vision] Claude vision error: {e}", flush=True)
             traceback.print_exc()
             return jsonify({"error": "Vision analysis failed.", "details": str(e)}), 500
+
+    # --- Intelligence File Cabinet (dynamic folders; Mem0 category intelligence_file) ---
+    @app.route("/api/files/create", methods=["POST"])
+    def api_files_create():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        folder = data.get("folder", "")
+        name = (data.get("name") or "").strip()
+        content = data.get("content", "")
+        tags = data.get("tags")
+        if tags is not None and not isinstance(tags, list):
+            tags = None
+        try:
+            rec = angel.files_cabinet.create_file(
+                folder, name, content, tags=tags
+            )
+            return jsonify({"ok": True, "file": rec})
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/files/list", methods=["GET"])
+    def api_files_list():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        raw_folder = request.args.get("folder")
+        folder_filter = None
+        if raw_folder is not None and str(raw_folder).strip():
+            folder_filter = str(raw_folder).strip()
+        files = angel.files_cabinet.list_files(folder=folder_filter)
+        return jsonify({"ok": True, "files": files})
+
+    @app.route("/api/files/get", methods=["GET"])
+    def api_files_get():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        name = (request.args.get("name") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "Missing query parameter 'name'."}), 400
+        rec = angel.files_cabinet.get_file(name)
+        if not rec:
+            return jsonify({"ok": False, "error": f"No file named {name!r}."}), 404
+        return jsonify({"ok": True, "file": rec})
+
+    @app.route("/api/files/update", methods=["POST"])
+    def api_files_update():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        content = data.get("content", "")
+        try:
+            rec = angel.files_cabinet.update_file(name, content)
+            return jsonify({"ok": True, "file": rec})
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/files/search", methods=["POST"])
+    def api_files_search():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        query = (data.get("query") or "").strip()
+        if not query:
+            return jsonify({"ok": False, "error": "Missing or empty 'query'."}), 400
+        matches = angel.files_cabinet.search_files(query)
+        return jsonify({"ok": True, "files": matches})
+
+    @app.route("/api/files/summary", methods=["GET"])
+    def api_files_summary():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        text = angel.files_cabinet.get_summary()
+        return jsonify({"ok": True, "summary": text})
+
+    @app.route("/api/files/delete", methods=["POST"])
+    def api_files_delete():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "Missing or empty 'name'."}), 400
+        try:
+            deleted = angel.files_cabinet.delete_file(name)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        if not deleted:
+            return jsonify({"ok": False, "error": f"No file named {name!r}."}), 404
+        return jsonify({"ok": True, "deleted": name})
+
+    @app.route("/api/files/folders", methods=["GET"])
+    def api_files_folders():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        folders = angel.files_cabinet.list_folders()
+        return jsonify({"ok": True, "folders": folders})
 
     @app.route("/api/briefing", methods=["GET"])
     def api_briefing():

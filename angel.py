@@ -53,6 +53,7 @@ CATEGORY_PERSON_PROFILE = "person_profile"
 CATEGORY_RESEARCH_TIMELINE = "research_timeline"
 CATEGORY_REFLECTION = "reflection"
 CATEGORY_BRIEFING_HISTORY = "briefing_history"
+CATEGORY_INTELLIGENCE_FILE = "intelligence_file"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -61,6 +62,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_RESEARCH_TIMELINE,
         CATEGORY_REFLECTION,
         CATEGORY_BRIEFING_HISTORY,
+        CATEGORY_INTELLIGENCE_FILE,
     }
 )
 # Sentinel for Angel to output a new pattern (parsed and stored)
@@ -108,7 +110,15 @@ class Mem0CloudClient:
         resp.raise_for_status()
         return resp.json()
 
-    def add(self, messages, user_id: str, metadata: dict | None = None):
+    def add(
+        self,
+        messages,
+        user_id: str,
+        metadata: dict | None = None,
+        *,
+        infer: bool = True,
+        async_mode: bool = True,
+    ):
         # v1 add memories endpoint supports version="v2"
         url = f"{MEM0_API_BASE_URL}/v1/memories/"
         payload = {
@@ -117,12 +127,22 @@ class Mem0CloudClient:
             "metadata": metadata or {},
             "version": "v2",
             "output_format": "v1.1",
-            "async_mode": True,
-            "infer": True,
+            "async_mode": async_mode,
+            "infer": infer,
         }
         resp = requests.post(url, headers=self._headers(), json=payload, timeout=30)
         resp.raise_for_status()
         return resp.json()
+
+    def delete_memory(self, memory_id: str) -> None:
+        """Delete a single memory in Mem0 Cloud by id (v1 API)."""
+        mid = (memory_id or "").strip()
+        if not mid:
+            return
+        url = f"{MEM0_API_BASE_URL}/v1/memories/{mid}/"
+        resp = requests.delete(url, headers=self._headers(), timeout=30)
+        if resp.status_code not in (200, 204):
+            resp.raise_for_status()
 
 
 # Monkey-patch Mem0's Anthropic LLM so it does not send top_p (Anthropic forbids
@@ -243,6 +263,393 @@ def _append_local_memory(user_id: str, memory_text: str, metadata: dict):
     except Exception as e:
         print(f"{Fore.RED}Warning: could not save local memory: {e}{Style.RESET_ALL}")
         print(traceback.format_exc())
+
+
+def _load_local_memory_entries(user_id: str) -> list:
+    """Return the raw list of memory entry dicts for user_id from tyler_memories.json."""
+    try:
+        if not LOCAL_MEMORY_FILE.exists():
+            return []
+        with LOCAL_MEMORY_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        users = data.get("users", {})
+        arr = users.get(user_id, [])
+        return arr if isinstance(arr, list) else []
+    except Exception as e:
+        print(f"{Fore.RED}Warning: could not load local memory entries: {e}{Style.RESET_ALL}")
+        return []
+
+
+def _save_local_memory_entries(user_id: str, entries: list) -> None:
+    """Replace the on-disk memory list for user_id (full file rewrite)."""
+    try:
+        if LOCAL_MEMORY_FILE.exists():
+            with LOCAL_MEMORY_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = {"users": {}}
+        users = data.setdefault("users", {})
+        users[user_id] = entries
+        with LOCAL_MEMORY_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"{Fore.RED}Warning: could not save local memory entries: {e}{Style.RESET_ALL}")
+        print(traceback.format_exc())
+
+
+def _parse_intelligence_tags(meta: dict) -> list[str]:
+    raw = meta.get("intelligence_tags_json")
+    if raw is None:
+        raw = meta.get("tags")
+    if isinstance(raw, list):
+        return [str(t).strip() for t in raw if str(t).strip()]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(t).strip() for t in parsed if str(t).strip()]
+        except json.JSONDecodeError:
+            pass
+        return [t.strip() for t in raw.split(",") if t.strip()]
+    return []
+
+
+def _intelligence_file_metadata(
+    *,
+    file_name: str,
+    folder: str,
+    tags: list[str] | None,
+    created_at: str,
+    updated_at: str,
+    mem0_memory_id: str | None = None,
+) -> dict:
+    tags = tags or []
+    meta = {
+        "category": CATEGORY_INTELLIGENCE_FILE,
+        "file_name": file_name.strip(),
+        "folder": (folder or "").strip() or "Uncategorized",
+        "intelligence_tags_json": json.dumps(tags, ensure_ascii=False),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "timestamp": updated_at,
+        "source": "angel-file-cabinet",
+    }
+    if mem0_memory_id:
+        meta["mem0_memory_id"] = mem0_memory_id.strip()
+    return meta
+
+
+def _extract_mem0_id_from_add_response(resp: object) -> str | None:
+    if not isinstance(resp, dict):
+        return None
+    for key in ("id", "memory_id", "memoryId"):
+        v = resp.get(key)
+        if v and isinstance(v, str):
+            return v.strip()
+    # Nested shapes from async / batched responses
+    for key in ("results", "memories", "data"):
+        chunk = resp.get(key)
+        if isinstance(chunk, list) and chunk:
+            first = chunk[0]
+            if isinstance(first, dict):
+                for k in ("id", "memory_id"):
+                    v = first.get(k)
+                    if v and isinstance(v, str):
+                        return v.strip()
+    return None
+
+
+class FilesCabinet:
+    """
+    Angel's Intelligence File Cabinet: structured notes in Mem0 (category intelligence_file)
+    plus canonical rows in local tyler_memories.json. Folders are free-form strings.
+    """
+
+    def __init__(self, memory_client, user_id: str, use_mem0_cloud: bool = False):
+        self.memory_client = memory_client
+        self.user_id = user_id or "default-user"
+        self._use_mem0_cloud = bool(use_mem0_cloud)
+
+    def _iter_local_intelligence_entries(self) -> list[dict]:
+        out: list[dict] = []
+        for entry in _load_local_memory_entries(self.user_id):
+            if not isinstance(entry, dict):
+                continue
+            meta = entry.get("metadata")
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("category") != CATEGORY_INTELLIGENCE_FILE:
+                continue
+            fn = (meta.get("file_name") or "").strip()
+            if not fn:
+                continue
+            out.append(entry)
+        return out
+
+    def _entry_to_record(self, entry: dict, *, include_content: bool = True) -> dict:
+        meta = entry.get("metadata") if isinstance(entry, dict) else {}
+        if not isinstance(meta, dict):
+            meta = {}
+        name = (meta.get("file_name") or "").strip()
+        folder = (meta.get("folder") or "").strip() or "Uncategorized"
+        created_at = (meta.get("created_at") or entry.get("created_at") or "").strip()
+        updated_at = (meta.get("updated_at") or meta.get("timestamp") or created_at).strip()
+        tags = _parse_intelligence_tags(meta)
+        rec: dict = {
+            "name": name,
+            "folder": folder,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "tags": tags,
+        }
+        if include_content:
+            rec["content"] = (entry.get("memory") or entry.get("data") or "").strip()
+        return rec
+
+    def _find_local_entry_index(self, file_name: str) -> int | None:
+        target = (file_name or "").strip()
+        if not target:
+            return None
+        entries = _load_local_memory_entries(self.user_id)
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            meta = entry.get("metadata")
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("category") != CATEGORY_INTELLIGENCE_FILE:
+                continue
+            if (meta.get("file_name") or "").strip() == target:
+                return i
+        return None
+
+    def _push_mem0(self, content: str, metadata: dict) -> str | None:
+        if not self._use_mem0_cloud:
+            return None
+        if not hasattr(self.memory_client, "add"):
+            return None
+        fn = metadata.get("file_name", "")
+        fd = metadata.get("folder", "")
+        user_line = (
+            f"[Angel Intelligence File folder={fd!r} name={fn!r}]\n" + (content or "")[:120_000]
+        )
+        messages = [
+            {"role": "user", "content": user_line},
+            {"role": "assistant", "content": "Intelligence file stored."},
+        ]
+        try:
+            add_kw: dict = {"infer": False, "async_mode": True}
+            resp = self.memory_client.add(
+                messages,
+                user_id=self.user_id,
+                metadata=metadata,
+                **add_kw,
+            )
+            return _extract_mem0_id_from_add_response(resp)
+        except TypeError:
+            try:
+                resp = self.memory_client.add(
+                    messages, user_id=self.user_id, metadata=metadata
+                )
+                return _extract_mem0_id_from_add_response(resp)
+            except Exception as e:
+                print(f"{Fore.YELLOW}FilesCabinet Mem0 add: {e}{Style.RESET_ALL}")
+                return None
+        except Exception as e:
+            print(f"{Fore.YELLOW}FilesCabinet Mem0 add: {e}{Style.RESET_ALL}")
+            return None
+
+    def _delete_mem0_for_entry(self, meta: dict) -> None:
+        if not self._use_mem0_cloud:
+            return
+        mid = (meta.get("mem0_memory_id") or "").strip() if isinstance(meta, dict) else ""
+        if mid and isinstance(self.memory_client, Mem0CloudClient):
+            try:
+                self.memory_client.delete_memory(mid)
+            except Exception as e:
+                print(f"{Fore.YELLOW}FilesCabinet Mem0 delete id={mid}: {e}{Style.RESET_ALL}")
+            return
+        # Fallback: search cloud memories by file_name
+        if not isinstance(self.memory_client, Mem0CloudClient):
+            return
+        fname = (meta.get("file_name") or "").strip() if isinstance(meta, dict) else ""
+        if not fname:
+            return
+        try:
+            raw = self.memory_client.get_all(user_id=self.user_id)
+            results = raw.get("results") if isinstance(raw, dict) else raw
+            if not isinstance(results, list):
+                return
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                im = item.get("metadata") or {}
+                if not isinstance(im, dict):
+                    continue
+                if im.get("category") != CATEGORY_INTELLIGENCE_FILE:
+                    continue
+                if (im.get("file_name") or "").strip() != fname:
+                    continue
+                rid = (item.get("id") or item.get("memory_id") or "").strip()
+                if rid:
+                    try:
+                        self.memory_client.delete_memory(rid)
+                    except Exception as e:
+                        print(f"{Fore.YELLOW}FilesCabinet Mem0 delete fallback: {e}{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.YELLOW}FilesCabinet Mem0 delete scan: {e}{Style.RESET_ALL}")
+
+    def create_file(
+        self,
+        folder: str,
+        name: str,
+        content: str,
+        tags: list[str] | None = None,
+    ) -> dict:
+        file_name = (name or "").strip()
+        if not file_name:
+            raise ValueError("File name is required.")
+        if self.get_file(file_name):
+            raise ValueError(f"An intelligence file named {file_name!r} already exists.")
+        folder_s = (folder or "").strip() or "Uncategorized"
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tags_list = [str(t).strip() for t in (tags or []) if str(t).strip()]
+        body = (content or "").strip()
+        meta = _intelligence_file_metadata(
+            file_name=file_name,
+            folder=folder_s,
+            tags=tags_list,
+            created_at=now,
+            updated_at=now,
+        )
+        mem0_id = self._push_mem0(body, dict(meta))
+        if mem0_id:
+            meta["mem0_memory_id"] = mem0_id
+        _append_local_memory(self.user_id, body, meta)
+        return self.get_file(file_name) or {
+            "name": file_name,
+            "folder": folder_s,
+            "content": body,
+            "created_at": now,
+            "updated_at": now,
+            "tags": tags_list,
+        }
+
+    def update_file(self, name: str, new_content: str) -> dict:
+        file_name = (name or "").strip()
+        if not file_name:
+            raise ValueError("File name is required.")
+        idx = self._find_local_entry_index(file_name)
+        if idx is None:
+            raise ValueError(f"No intelligence file named {file_name!r}.")
+        entries = _load_local_memory_entries(self.user_id)
+        entry = entries[idx]
+        meta = dict(entry.get("metadata") or {})
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        meta["updated_at"] = now
+        meta["timestamp"] = now
+        created_before = (meta.get("created_at") or "").strip() or now
+        meta.setdefault("created_at", created_before)
+        body = (new_content or "").strip()
+        self._delete_mem0_for_entry(meta)
+        mem0_id = self._push_mem0(body, meta)
+        if mem0_id:
+            meta["mem0_memory_id"] = mem0_id
+        else:
+            meta.pop("mem0_memory_id", None)
+        entries[idx] = {
+            "memory": body,
+            "metadata": meta,
+            "created_at": entry.get("created_at") or created_before,
+        }
+        _save_local_memory_entries(self.user_id, entries)
+        rec = self.get_file(file_name)
+        if not rec:
+            raise RuntimeError("Update succeeded locally but record could not be reloaded.")
+        return rec
+
+    def delete_file(self, name: str) -> bool:
+        file_name = (name or "").strip()
+        if not file_name:
+            raise ValueError("File name is required.")
+        idx = self._find_local_entry_index(file_name)
+        if idx is None:
+            return False
+        entries = _load_local_memory_entries(self.user_id)
+        entry = entries[idx]
+        meta = entry.get("metadata") if isinstance(entry, dict) else {}
+        if isinstance(meta, dict):
+            self._delete_mem0_for_entry(meta)
+        entries.pop(idx)
+        _save_local_memory_entries(self.user_id, entries)
+        return True
+
+    def get_file(self, name: str) -> dict | None:
+        file_name = (name or "").strip()
+        if not file_name:
+            return None
+        idx = self._find_local_entry_index(file_name)
+        if idx is None:
+            return None
+        entries = _load_local_memory_entries(self.user_id)
+        return self._entry_to_record(entries[idx], include_content=True)
+
+    def list_files(self, folder: str | None = None) -> list[dict]:
+        want = (folder or "").strip().lower() if folder is not None else None
+        out: list[dict] = []
+        for entry in self._iter_local_intelligence_entries():
+            rec = self._entry_to_record(entry, include_content=False)
+            if want is not None and rec["folder"].lower() != want:
+                continue
+            out.append(rec)
+        try:
+            out.sort(key=lambda r: (r["folder"].lower(), r["name"].lower()))
+        except Exception:
+            pass
+        return out
+
+    def list_folders(self) -> list[str]:
+        seen: set[str] = set()
+        for entry in self._iter_local_intelligence_entries():
+            rec = self._entry_to_record(entry, include_content=False)
+            seen.add(rec["folder"])
+        return sorted(seen, key=str.lower)
+
+    def search_files(self, query: str) -> list[dict]:
+        q = (query or "").strip().lower()
+        if not q:
+            return []
+        matches: list[dict] = []
+        for entry in self._iter_local_intelligence_entries():
+            rec = self._entry_to_record(entry, include_content=True)
+            hay = " ".join(
+                [
+                    rec["name"],
+                    rec["folder"],
+                    rec["content"],
+                    " ".join(rec["tags"]),
+                ]
+            ).lower()
+            if q in hay:
+                matches.append(rec)
+        try:
+            matches.sort(key=lambda r: (r["folder"].lower(), r["name"].lower()))
+        except Exception:
+            pass
+        return matches
+
+    def get_summary(self) -> str:
+        by_folder: dict[str, list[str]] = {}
+        for entry in self._iter_local_intelligence_entries():
+            rec = self._entry_to_record(entry, include_content=False)
+            by_folder.setdefault(rec["folder"], []).append(rec["name"])
+        if not by_folder:
+            return "No intelligence files are filed yet."
+        lines: list[str] = []
+        for fld in sorted(by_folder.keys(), key=str.lower):
+            names = sorted(set(by_folder[fld]), key=str.lower)
+            lines.append(f"- {fld}: {', '.join(names)}")
+        return "Intelligence File Cabinet (folder → files):\n" + "\n".join(lines)
 
 
 def add_structured_memory(
@@ -533,6 +940,7 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_PERSON_PROFILE,
             CATEGORY_REFLECTION,
             CATEGORY_BRIEFING_HISTORY,
+            CATEGORY_INTELLIGENCE_FILE,
         ):
             continue
         general.append(m)
@@ -640,6 +1048,8 @@ def build_memory_summary_with_sections(
             reflection_entries.append((created, text))
             continue
         if cat == CATEGORY_BRIEFING_HISTORY:
+            continue
+        if cat == CATEGORY_INTELLIGENCE_FILE:
             continue
         general.append((created, text))
 
@@ -1131,6 +1541,7 @@ def build_system_prompt(
     computer_control_enabled: bool = False,
     device: str | None = None,
     location: dict | None = None,
+    intelligence_files_summary: str | None = None,
 ) -> str:
     """
     Persona + behavioral instructions + memory context.
@@ -1138,6 +1549,7 @@ def build_system_prompt(
     Stage 2 hints add explicit instructions for strategy, patterns, or profile.
     device: 'desktop' (Windows GUI), 'ios' (iPhone app), 'mobile_web' (browser), or None to omit device context.
     location: optional dict with latitude, longitude, optional place_name (from device); adds location awareness.
+    intelligence_files_summary: optional text index of Intelligence File Cabinet (folders → file names).
     Injects current date/time/timezone so Angel is always time-aware.
     """
     date_time_str = get_current_datetime_str()
@@ -1158,6 +1570,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Text and voice interface on mobile web.
 - Cloud deployment accessible from any device.
 - Sandboxed Python execution for computation and science: numpy, scipy, pandas, matplotlib (headless), sympy. You may embed a hidden ```python fenced block for the server to run (30s limit). That entire fence is removed before Tyler sees your message; stdout from a successful run is merged into your final natural-language reply in a silent server pass—Tyler never sees raw program output or a separate computed-results section. Never paste the same code again in plain text.
+- Intelligence File Cabinet: you file structured intelligence for Tyler into Mem0 (category intelligence_file) using dynamic folder names you choose—there is no fixed taxonomy.
 
 {date_time_str}
 """
@@ -1225,7 +1638,17 @@ Python code execution (server sandbox):
 - Libraries: numpy, scipy, pandas, matplotlib (Agg backend is automatic; prefer printed summaries over expecting images), sympy.
 - If execution fails, Tyler still will not see your code—briefly explain in prose what went wrong and, if useful, supply a corrected hidden block on the next turn.
 - Keep hidden scripts short and safe: avoid unnecessary network calls, file writes outside temp unless Tyler asked, or destructive operations.
+
+Intelligence File Cabinet (your filing system):
+- You maintain an Intelligence File Cabinet: structured files stored for Tyler, organized by folders you invent as an intelligence officer would. There are NO fixed folder names—you create folders dynamically from the nature of the material.
+- When you research or produce findings Tyler may want to retain, offer to save them to a file in a folder that fits (Tyler or the app can create/update files via the API; describe clearly what you recommend filing and where).
+- When Tyler mentions something important—facts, leads, plans, people, timelines, or decisions—consider suggesting they file it so nothing is lost.
+- You may use any folder label that makes sense. Examples of the kinds of folders you might create (purely illustrative, not a checklist): UAP Incidents, Whistleblowers, Government Programs, Active Investigations, Technology Analysis, People of Interest, Mission Log. These are only examples; create whatever folders fit Tyler's work and interests.
+- Files have names, folder paths, tags, and body text. Refer to what is already filed when it helps; use the live index below when present.
 """
+
+    if (intelligence_files_summary or "").strip():
+        persona += "\n" + (intelligence_files_summary or "").strip() + "\n"
 
     stage2 = """
 
@@ -2538,6 +2961,9 @@ class AngelCore:
         self.memory_client = build_memory_client()
         self.anthropic_client = create_anthropic_client()
         self._use_mem0_cloud = bool(os.getenv("MEM0_API_KEY"))
+        self.files_cabinet = FilesCabinet(
+            self.memory_client, self.user_id, self._use_mem0_cloud
+        )
 
     def set_computer_control_enabled(self, enabled: bool) -> None:
         """Toggle whether Angel is allowed to control the computer."""
@@ -2593,6 +3019,7 @@ class AngelCore:
             computer_control_enabled=cc_for_prompt,
             device=device,
             location=location,
+            intelligence_files_summary=self.files_cabinet.get_summary(),
         )
 
         cc_runtime = (
@@ -2892,6 +3319,8 @@ def main():
     print(f"{Fore.BLUE}Initializing memory and AI brain...{Style.RESET_ALL}")
     memory_client = build_memory_client()
     anthropic_client = create_anthropic_client()
+    use_mem0_cloud_main = bool(os.getenv("MEM0_API_KEY"))
+    files_cabinet = FilesCabinet(memory_client, user_id, use_mem0_cloud_main)
 
     # Load existing memories
     print(f"{Fore.BLUE}Fetching Angel's memories of you (if any)...{Style.RESET_ALL}")
@@ -2999,6 +3428,7 @@ def main():
             profile_hint=profile_hint,
             computer_control_enabled=False,
             device="desktop",
+            intelligence_files_summary=files_cabinet.get_summary(),
         )
 
         augmented_message = user_message
