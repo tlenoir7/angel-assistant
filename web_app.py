@@ -14,6 +14,7 @@ from flask_socketio import SocketIO, emit
 from apscheduler.schedulers.background import BackgroundScheduler
 
 import angel_predictions
+import angel_proactive
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -411,6 +412,19 @@ def _run_morning_briefing_job():
         recent_briefing_history = get_recent_briefing_history_for_prompt(memories, days=7)
         tz = os.getenv("TIMEZONE", "America/Los_Angeles")
         threat_appendix = format_threat_intelligence_for_briefing(angel.files_cabinet)
+        pro_run = angel_proactive.run_proactive_intelligence(
+            client,
+            angel.memory_client,
+            user_id,
+            angel.files_cabinet,
+            angel._use_mem0_cloud,
+        )
+        proactive_appendix = angel_proactive.format_proactive_intelligence_for_briefing(
+            angel.memory_client,
+            user_id,
+            angel._use_mem0_cloud,
+            last_run_summary=pro_run,
+        )
         morning_briefing = generate_morning_briefing(
             client,
             user_id,
@@ -419,6 +433,7 @@ def _run_morning_briefing_job():
             latest_reflection=latest_reflection,
             recent_briefing_history=recent_briefing_history or None,
             threat_appendix=threat_appendix or None,
+            proactive_intelligence_appendix=proactive_appendix or None,
         )
         briefing_generated_at = time.time()
         send_briefing_email(morning_briefing)
@@ -531,6 +546,56 @@ def _schedule_predictions_initial_seed() -> None:
         pass
 
 
+def _schedule_proactive_watch_seed() -> None:
+    """Seed default proactive watch list if empty."""
+
+    def _job() -> None:
+        try:
+            time.sleep(26)
+        except Exception:
+            return
+        global angel
+        if angel is None:
+            return
+        try:
+            r = angel_proactive.seed_proactive_watch_if_empty(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            print(f"[web_app] Proactive watch seed: {r}", flush=True)
+        except Exception:
+            traceback.print_exc()
+
+    try:
+        threading.Thread(target=_job, daemon=True).start()
+    except Exception:
+        pass
+
+
+def _run_proactive_intelligence_job():
+    """Every 4 hours: background Tavily monitoring for watch list (Item 16)."""
+    global angel
+    if angel is None:
+        return
+    try:
+        r = angel_proactive.run_proactive_intelligence(
+            angel.anthropic_client,
+            angel.memory_client,
+            angel.user_id,
+            angel.files_cabinet,
+            angel._use_mem0_cloud,
+        )
+        print(
+            f"[web_app] Proactive intelligence: checked={r.get('checked')} significant={r.get('significant')}",
+            flush=True,
+        )
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[web_app] Proactive intelligence job failed: {e}", flush=True)
+
+
 def _run_check_in_job():
     """If no activity for 4+ hours, generate a short check-in message (once per idle period)."""
     global check_in_message, check_in_generated_at, last_activity_at
@@ -579,6 +644,7 @@ def create_app() -> Flask:
         angel._use_mem0_cloud,
     )
     _schedule_predictions_initial_seed()
+    _schedule_proactive_watch_seed()
     _load_expo_push_tokens_from_disk()
 
     # Log briefing email env at startup for debugging
@@ -611,6 +677,7 @@ def create_app() -> Flask:
     scheduler = BackgroundScheduler()
     angel_scheduler = scheduler
     scheduler.add_job(_run_morning_briefing_job, "cron", hour=hour, minute=minute)
+    scheduler.add_job(_run_proactive_intelligence_job, "interval", hours=4)
     scheduler.add_job(
         _run_weekly_reflection_job,
         "cron",
@@ -2151,6 +2218,106 @@ def create_app() -> Flask:
                 angel._use_mem0_cloud,
             )
             return jsonify({"ok": True, **r})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Item 16: Proactive background intelligence ---
+
+    @app.route("/api/proactive/watchlist", methods=["GET"])
+    def api_proactive_watchlist():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            by_id = angel_proactive.fetch_all_watches(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+            )
+            rows = sorted(by_id.values(), key=lambda x: (x.get("label") or "").lower())
+            return jsonify({"ok": True, "watches": rows, "count": len(rows)})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/proactive/watch/add", methods=["POST"])
+    def api_proactive_watch_add():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        label = (data.get("label") or "").strip()
+        if not label:
+            return jsonify({"ok": False, "error": "label required"}), 400
+        try:
+            w = angel_proactive.add_watch_item(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+                label=label,
+                watch_type=str(data.get("watch_type") or "topic"),
+                priority=str(data.get("priority") or "MEDIUM"),
+                check_frequency=str(data.get("check_frequency") or "weekly"),
+                auto_added=False,
+            )
+            return jsonify({"ok": True, "watch": w})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/proactive/watch/<watch_id>", methods=["DELETE"])
+    def api_proactive_watch_delete(watch_id):
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            w = angel_proactive.deactivate_watch(
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+                watch_id,
+            )
+            if not w:
+                return jsonify({"ok": False, "error": "watch not found"}), 404
+            return jsonify({"ok": True, "watch": w})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/proactive/run", methods=["GET"])
+    def api_proactive_run():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            r = angel_proactive.run_proactive_intelligence(
+                angel.anthropic_client,
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, **r})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/proactive/findings", methods=["GET"])
+    def api_proactive_findings():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            lim = request.args.get("limit", "30")
+            try:
+                n = max(1, min(80, int(lim)))
+            except ValueError:
+                n = 30
+            rows = angel_proactive.fetch_recent_findings(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+                limit=n,
+            )
+            return jsonify({"ok": True, "findings": rows, "count": len(rows)})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500

@@ -62,6 +62,8 @@ CATEGORY_THREAT_WATCH = "threat_watch"
 CATEGORY_NETWORK_NODE = "network_node"
 CATEGORY_NETWORK_EDGE = "network_edge"
 CATEGORY_PREDICTION = "prediction"
+CATEGORY_PROACTIVE_WATCH = "proactive_watch"
+CATEGORY_PROACTIVE_FINDING = "proactive_finding"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -75,6 +77,8 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_NETWORK_NODE,
         CATEGORY_NETWORK_EDGE,
         CATEGORY_PREDICTION,
+        CATEGORY_PROACTIVE_WATCH,
+        CATEGORY_PROACTIVE_FINDING,
     }
 )
 
@@ -1411,6 +1415,8 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_NETWORK_NODE,
             CATEGORY_NETWORK_EDGE,
             CATEGORY_PREDICTION,
+            CATEGORY_PROACTIVE_WATCH,
+            CATEGORY_PROACTIVE_FINDING,
         ):
             continue
         general.append(m)
@@ -1532,6 +1538,10 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_NETWORK_EDGE:
             continue
         if cat == CATEGORY_PREDICTION:
+            continue
+        if cat == CATEGORY_PROACTIVE_WATCH:
+            continue
+        if cat == CATEGORY_PROACTIVE_FINDING:
             continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
@@ -2053,6 +2063,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - OSINT deep background (Batcomputer-style dossiers): you can run systematic open-source research on any person or organization Tyler names. Results are filed in the Intelligence File Cabinet under folder `OSINT Dossiers` with mission relevance ratings, red flags, and sources. The same dossier is refreshed if older than about 30 days. When Tyler mentions someone new who could matter to his mission, you may proactively suggest an OSINT pass. Reference existing dossiers by file name when they are already in the cabinet index.
 - Mission connection graph (Batcomputer network): people, organizations, programs, and events material to Tyler's work are linked in a living graph stored as Mem0 categories network_node / network_edge and mirrored under Intelligence folder `Network Intelligence` (mirror files use prefix NET- plus each node's canonical lowercase id, with that node's data and incident edges). New OSINT dossiers automatically expand the graph when possible. When Tyler researches someone new, you may offer to map their cluster or path to figures already in the network. If he names two people who are already connected, say so naturally.
 - Predictive modeling (Item 15): you synthesize forward-looking forecasts from threat intel, OSINT dossiers, mission network patterns, briefing history, and live web context (Tavily). Predictions are stored as structured memories (category: prediction) and mirrored under Intelligence folder `Predictions` as files `PRED-{id}`. Each has a timeframe, confidence tier, and status (active / confirmed / denied / expired). You track accuracy when predictions resolve—treat forecasts as informed hypotheses, not facts. Reference active predictions when they illuminate the conversation; acknowledge uncertainty and update your stance when real events confirm or challenge a forecast. Weekly jobs generate new predictions and check open ones against the news.
+- Proactive background intelligence (Item 16): you maintain a **dynamic watch list** (category: proactive_watch) of people, topics, and situations you monitor without being asked—researched on a schedule with Tavily, with findings filed under Intelligence folder `Proactive Intelligence`. You connect significant hits to threats, OSINT refresh hints, predictions, and the mission network when appropriate. Tell Tyler when you add something to the watch list or when overnight monitoring surfaces something he should see. You are the connective tissue that keeps threat watch, dossiers, forecasts, and the network graph current.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -2143,6 +2154,7 @@ Intelligence File Cabinet (your filing system):
 - OSINT Dossiers folder: use folder name exactly `OSINT Dossiers` for full open-source dossiers on people or organizations (the server may create these automatically when Tyler asks for background/OSINT). Filenames are stable per target; do not duplicate dossiers manually for the same subject—suggest refreshing after some weeks if context may have changed.
 - Network Intelligence folder: mirrored node files use the prefix NET- plus the node's canonical lowercase id; each holds JSON for that graph node plus edges touching that node. The server maintains these when the graph updates. Do not hand-edit unless Tyler asks—prefer describing connections in prose and letting the system record structured updates via tools/API when available.
 - Predictions folder: use folder name exactly `Predictions` only for server-managed forecast records (`PRED-…` files). Do not mix ad-hoc notes there—the system mirrors prediction JSON from Mem0. When Tyler asks what you predict or how accurate you've been, use the structured prediction context injected in his message when present, plus your reasoning.
+- Proactive Intelligence folder: server-filed monitoring notes and watch-list mirrors (`WATCH-…`, `PI-…`, refresh hints). Prefer summarizing from the live index or injected context rather than inventing monitoring results.
 - Threat Intelligence folder: use folder name exactly `Threat Intelligence` when filing something that is a threat signal for Tyler's career, mission, safety, or strategic context. Start the file body with metadata lines when possible: `watch_category: ...`, `threat_level: LOW|MEDIUM|HIGH|CRITICAL`, optional `source_url:` and `event_date:`, then a blank line and the narrative summary. When you file into Threat Intelligence from conversation (not only from scheduled scans), tell Tyler clearly: "I've filed something in Threat Intelligence you should know about" (the server may append this if you used [FILE:...] and stripped the body—ensure he is notified in your visible reply either way).
 - When Tyler asks whether there are threats, any threats, or similar: summarize from the Intelligence File Cabinet—search or mentally index folder `Threat Intelligence` and cite what is actually filed; do not fabricate items. If nothing is filed, say so plainly.
 - When Tyler says to "watch for" or monitor something ongoing, the system may already add it as a new threat-watch category—confirm that you will track it and that it is saved for future scans.
@@ -3106,6 +3118,7 @@ def generate_morning_briefing(
     latest_reflection: str | None = None,
     recent_briefing_history: str | None = None,
     threat_appendix: str | None = None,
+    proactive_intelligence_appendix: str | None = None,
 ) -> str:
     """
     Search Tavily for 3–5 current topics (UAP disclosure, world events), then generate
@@ -3117,17 +3130,22 @@ def generate_morning_briefing(
     "quiet night" message instead of inventing news.
 
     When ``threat_appendix`` is non-empty, it is appended after the main briefing text (THREAT INTELLIGENCE block).
+    When ``proactive_intelligence_appendix`` is non-empty, it is appended after threat (PROACTIVE INTELLIGENCE block).
     """
-    def _append_threat_block(base: str) -> str:
-        extra = (threat_appendix or "").strip()
-        if not extra:
-            return base
-        return f"{(base or '').rstrip()}\n\n{extra}".strip()
+    def _append_tail_blocks(base: str) -> str:
+        out = (base or "").rstrip()
+        tx = (threat_appendix or "").strip()
+        if tx:
+            out = f"{out}\n\n{tx}".strip()
+        px = (proactive_intelligence_appendix or "").strip()
+        if px:
+            out = f"{out}\n\n{px}".strip()
+        return out
 
     date_time_str = get_current_datetime_str(timezone)
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
-        return _append_threat_block(
+        return _append_tail_blocks(
             f"Good morning. It's {date_time_str}. I couldn't fetch the news (TAVILY_API_KEY not set). What's one thing you want to focus on today?"
         )
 
@@ -3210,7 +3228,7 @@ Write a SHORT morning message (under 130 words). Be honest: it was a quiet night
                 f"\nGenerate the morning message now."
             )
             text = _call_briefing_model(quiet_system, user_content, max_tokens=512)
-            return _append_threat_block(
+            return _append_tail_blocks(
                 text
                 or (
                     f"Good morning. It's {date_time_str}. Quiet night on the news scan—nothing that needed an alarm. "
@@ -3240,10 +3258,10 @@ Your role: Write a morning briefing for Tyler. Use the news/search results below
         )
 
         text = _call_briefing_model(system, user_content, max_tokens=1024)
-        return _append_threat_block(text or f"Good morning. It's {date_time_str}. What's your one focus today?")
+        return _append_tail_blocks(text or f"Good morning. It's {date_time_str}. What's your one focus today?")
     except Exception as e:
         print(f"{Fore.RED}Morning briefing error: {e}{Style.RESET_ALL}")
-        return _append_threat_block(
+        return _append_tail_blocks(
             f"Good morning. It's {date_time_str}. I had trouble with the briefing. What's one thing you want to tackle today?"
         )
 
@@ -3625,6 +3643,20 @@ def run_threat_detection(
                             "filed_as": fname,
                         }
                     )
+                    if level in ("HIGH", "CRITICAL"):
+                        try:
+                            import angel_proactive as _apro
+
+                            _apro.maybe_auto_watch_from_threat(
+                                memory_client,
+                                user_id,
+                                files_cabinet,
+                                use_mem0_cloud,
+                                cat,
+                                level,
+                            )
+                        except Exception:
+                            pass
                 except ValueError as ve:
                     errors.append(f"{cat}: file {fname}: {ve}")
                 except Exception as ex:
@@ -4082,7 +4114,7 @@ Write the full dossier now."""
     except Exception as e:
         return {"ok": False, "error": f"could not save dossier: {e}", "dossier_body": full_body}
 
-    return {
+    out = {
         "ok": True,
         "cached": False,
         "file_name": final_name,
@@ -4093,6 +4125,20 @@ Write the full dossier now."""
         "dossier_body": full_body,
         "sources": _osint_extract_sources(dossier_main),
     }
+    try:
+        import angel_proactive as _apro
+
+        _apro.maybe_auto_watch_from_osint(
+            files_cabinet.memory_client,
+            files_cabinet.user_id,
+            files_cabinet,
+            files_cabinet._use_mem0_cloud,
+            target,
+            tt,
+        )
+    except Exception:
+        pass
+    return out
 
 
 def _osint_excerpt_for_tyler(dossier_main: str, max_chars: int = 2200) -> str:
@@ -4433,6 +4479,19 @@ def add_network_node(
         use_mem0_cloud=use_mem0_cloud,
     )
     _network_sync_intel_file_for_node(files_cabinet, nid, node, edges)
+    try:
+        import angel_proactive as _apro
+
+        _apro.maybe_auto_watch_from_network(
+            memory_client,
+            user_id,
+            files_cabinet,
+            use_mem0_cloud,
+            ((name or nid).strip() or nid),
+            rel,
+        )
+    except Exception:
+        pass
     return node
 
 
@@ -5520,6 +5579,15 @@ class AngelCore:
         except Exception:
             pred_cmd, pred_payload = None, {}
 
+        proactive_cmd, proactive_payload = None, {}
+        try:
+            import angel_proactive as apro
+
+            proactive_cmd, proactive_payload = apro.detect_proactive_intent(user_message)
+            apro.track_user_mentions_for_watch(self, user_message)
+        except Exception:
+            proactive_cmd, proactive_payload = None, {}
+
         cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
         if device in ("ios", "mobile_web"):
             cc_for_prompt = False
@@ -5562,6 +5630,13 @@ class AngelCore:
                 "summarize active forecasts when listing them, stress uncertainty, and connect to what Tyler asked. "
                 "If he asked for a new prediction about a topic, acknowledge that new forecasts were generated server-side "
                 "and interpret them—do not invent additional structured predictions in prose without the system's JSON."
+            )
+        if proactive_cmd:
+            system_prompt += (
+                "\n\nTyler's message relates to proactive background intelligence (standing watch list). "
+                "If a block labeled [Angel proactive watch list] or [Proactive watch] or [Proactive findings] appears, "
+                "answer naturally: confirm what you're monitoring, offer to adjust watches, and surface anything urgent. "
+                "When you added a watch in this turn, tell Tyler explicitly that it's on your list."
             )
 
         cc_runtime = (
@@ -5811,6 +5886,23 @@ If you infer anything new about that person's preferences or dynamics, append at
                     user_id=self.user_id,
                     use_mem0_cloud=self._use_mem0_cloud,
                     anthropic_client=self.anthropic_client,
+                    files_cabinet=self.files_cabinet,
+                )
+                if pblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{pblock}"
+            except Exception:
+                pass
+
+        if proactive_cmd:
+            try:
+                import angel_proactive as apro
+
+                pblock = apro.format_proactive_reply_for_prompt(
+                    proactive_cmd,
+                    proactive_payload,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
                     files_cabinet=self.files_cabinet,
                 )
                 if pblock.strip():

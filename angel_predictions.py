@@ -482,6 +482,18 @@ Already ACTIVE predictions (do NOT duplicate or lightly rephrase the same thesis
             )
             saved.append(sp)
             by_id[pid] = sp
+            try:
+                import angel_proactive as _apro
+
+                _apro.maybe_auto_watch_from_prediction(
+                    memory_client,
+                    user_id,
+                    files_cabinet,
+                    use_mem0_cloud,
+                    sp.get("title") or title,
+                )
+            except Exception:
+                pass
         except Exception:
             continue
     return {"ok": True, "saved": saved, "skipped_duplicates": skipped, "count": len(saved)}
