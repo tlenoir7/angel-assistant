@@ -1,7 +1,3 @@
-import eventlet
-
-eventlet.monkey_patch()
-
 import base64
 import json
 import os
@@ -1290,7 +1286,10 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    # Production (Railway) and local: eventlet serves HTTP + WebSockets; no gunicorn.
+    # Local `python web_app.py` only — gunicorn + eventlet worker patches the stdlib itself.
+    import eventlet
+
+    eventlet.monkey_patch()
     socketio.run(
         app,
         host="0.0.0.0",
