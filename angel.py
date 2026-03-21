@@ -71,6 +71,11 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
 
 # Intelligence File Cabinet folder for automated + manual threat intel (Item 12)
 THREAT_INTEL_FOLDER = "Threat Intelligence"
+# Open-source dossiers (Item 13 — Batcomputer-style OSINT)
+OSINT_DOSSIERS_FOLDER = "OSINT Dossiers"
+OSINT_DOSSIER_MAX_AGE_DAYS = 30
+OSINT_TAVILY_QUERIES_MIN = 5
+OSINT_TAVILY_QUERIES_MAX = 8
 
 # Default threat watch categories (merged on each scan with Mem0 category threat_watch)
 THREAT_WATCH_DEFAULT_CATEGORIES: list[str] = [
@@ -1952,6 +1957,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Real-time web search via Tavily when Tyler needs current information.
 - Morning briefings delivered daily (scheduled time; often ~8 AM) and optionally by email; when a recent memory reflection exists, you weave those insights into the briefing naturally.
 - Threat detection: you run automated threat scans on a schedule (about every 6 hours) across dynamic watch categories—defaults plus categories you and Tyler add (stored in memory as category threat_watch; you can grow the list yourself when you notice new patterns worth monitoring). Confirmed signals are filed as Intelligence Files in folder "Threat Intelligence" with threat_level tags. CRITICAL/HIGH items can trigger push alerts; MEDIUM/LOW surface in the morning briefing when material. Never invent threats—only file or summarize what your tools and sources support.
+- OSINT deep background (Batcomputer-style dossiers): you can run systematic open-source research on any person or organization Tyler names. Results are filed in the Intelligence File Cabinet under folder `OSINT Dossiers` with mission relevance ratings, red flags, and sources. The same dossier is refreshed if older than about 30 days. When Tyler mentions someone new who could matter to his mission, you may proactively suggest an OSINT pass. Reference existing dossiers by file name when they are already in the cabinet index.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -2039,6 +2045,7 @@ Python code execution (server sandbox):
 
 Intelligence File Cabinet (your filing system):
 - You maintain an Intelligence File Cabinet: structured files stored for Tyler, organized by folders you invent as an intelligence officer would. There are NO fixed folder names—you create folders dynamically from the nature of the material.
+- OSINT Dossiers folder: use folder name exactly `OSINT Dossiers` for full open-source dossiers on people or organizations (the server may create these automatically when Tyler asks for background/OSINT). Filenames are stable per target; do not duplicate dossiers manually for the same subject—suggest refreshing after some weeks if context may have changed.
 - Threat Intelligence folder: use folder name exactly `Threat Intelligence` when filing something that is a threat signal for Tyler's career, mission, safety, or strategic context. Start the file body with metadata lines when possible: `watch_category: ...`, `threat_level: LOW|MEDIUM|HIGH|CRITICAL`, optional `source_url:` and `event_date:`, then a blank line and the narrative summary. When you file into Threat Intelligence from conversation (not only from scheduled scans), tell Tyler clearly: "I've filed something in Threat Intelligence you should know about" (the server may append this if you used [FILE:...] and stripped the body—ensure he is notified in your visible reply either way).
 - When Tyler asks whether there are threats, any threats, or similar: summarize from the Intelligence File Cabinet—search or mentally index folder `Threat Intelligence` and cite what is actually filed; do not fabricate items. If nothing is filed, say so plainly.
 - When Tyler says to "watch for" or monitor something ongoing, the system may already add it as a new threat-watch category—confirm that you will track it and that it is saved for future scans.
@@ -2061,7 +2068,7 @@ Stage 2 capabilities (use when relevant; also follow explicit user requests):
 
 2) Patterns: You maintain a growing awareness of behavioral patterns in how Tyler thinks, reacts, decides, and behaves. When asked "what patterns do you notice" or "what have you noticed about me", summarize the patterns from memory. When a stored pattern is directly relevant to the current conversation, proactively mention it briefly. If in this turn you notice a new, recurring theme worth recording, add a single line at the end of your reply (on its own line): [ANGEL_PATTERN]: one concise sentence describing the pattern. Do not add [ANGEL_PATTERN] unless you genuinely identified a pattern this turn.
 
-3) People: You keep structured profiles for people Tyler mentions (name, role, communication style, history, what works with them, what doesn't, Tyler's relationship with them). When Tyler asks to "build a profile on [name]" or "what do you know about [name]" or "brief me on [person]", use or build that profile. If you create or update a profile, add a single block at the end of your reply (after your normal response): [ANGEL_PROFILE]: name|structured profile text. Keep the profile concise but complete. Do not add [ANGEL_PROFILE] unless you are actually saving a new or updated profile this turn.
+3) People: You keep structured profiles for people Tyler mentions (name, role, communication style, history, what works with them, what doesn't, Tyler's relationship with them). When Tyler asks to "build a profile on [name]" or "brief me on [person]", use or build that profile. When he asks "what do you know about [name]" or triggers OSINT phrasing, the server may attach a fresh OSINT dossier from folder `OSINT Dossiers`—lead with that open-source picture, then layer in memory profiles where they help. If you create or update a profile, add a single block at the end of your reply (after your normal response): [ANGEL_PROFILE]: name|structured profile text. Keep the profile concise but complete. Do not add [ANGEL_PROFILE] unless you are actually saving a new or updated profile this turn.
 """
     if strategy_hint:
         stage2 += "\nThis turn: the user is asking for a strategy or has described a situation requiring a plan—provide an executable strategy tailored to Tyler.\n"
@@ -2576,6 +2583,56 @@ def detect_research_request(user_message: str) -> bool:
     """True if the user wants deep research / briefing."""
     lower = (user_message or "").strip().lower()
     return any(phrase in lower for phrase in RESEARCH_TRIGGERS)
+
+
+def detect_osint_request(user_message: str) -> tuple[bool, str | None, str]:
+    """
+    Detect Tyler asking for OSINT / deep background on a person or organization.
+    Returns (triggered, target_name_or_phrase, target_type) where target_type is 'person' or 'organization'.
+    """
+    raw = (user_message or "").strip()
+    if len(raw) < 8:
+        return False, None, "person"
+    lower = raw.lower()
+    patterns: list[tuple[re.Pattern[str], str]] = [
+        (re.compile(r"(?i)\bangel\s*,?\s*run\s+background\s+on\s+(.+)$"), "person"),
+        (re.compile(r"(?i)\brun\s+background\s+on\s+(.+)$"), "person"),
+        (re.compile(r"(?i)\bosint\s+on\s+(.+)$"), "person"),
+        (re.compile(r"(?i)\bdig\s+into\s+(?:the\s+)?(.+)$"), "organization"),
+        (re.compile(r"(?i)\bwhat\s+do\s+you\s+know\s+about\s+(.+)$"), "person"),
+        (re.compile(r"(?i)\bdeep\s+background\s+on\s+(.+)$"), "person"),
+    ]
+    for pat, default_tt in patterns:
+        m = pat.search(raw)
+        if not m:
+            continue
+        target = (m.group(1) or "").strip()
+        for sep in ("\n", "—", "–"):
+            if sep in target:
+                target = target.split(sep, 1)[0].strip()
+        target = target.rstrip("?.!\"'").strip()
+        if len(target) < 2:
+            continue
+        tt = default_tt
+        if any(
+            x in lower
+            for x in (
+                "organization",
+                "organisation",
+                "the company",
+                "the agency",
+                "corporation",
+                "llc",
+                " inc",
+                "inc.",
+                "defense contractor",
+            )
+        ):
+            tt = "organization"
+        elif "person" in lower and "organization" not in lower:
+            tt = "person"
+        return True, target[:500], tt
+    return False, None, "person"
 
 
 def detect_profile_request(user_message: str) -> tuple[bool, str | None]:
@@ -3571,6 +3628,401 @@ def format_threat_intelligence_for_briefing(
     return "\n".join(lines).strip()
 
 
+def _osint_target_key(target: str) -> str:
+    return re.sub(r"\s+", " ", (target or "").strip().lower())
+
+
+def _osint_slug(target: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", (target or "").strip())[:72].strip("-")
+    return s or "unknown-target"
+
+
+def _osint_dossier_filename(target: str) -> str:
+    """Stable cabinet file name per target (date lives in dossier body)."""
+    return f"{_osint_slug(target)}-OSINT"
+
+
+def _parse_osint_target_key_from_body(body: str) -> str:
+    for line in (body or "").splitlines()[:25]:
+        m = re.match(r"(?i)^\s*OSINT_TARGET_KEY\s*:\s*(.+)$", line.strip())
+        if m:
+            return _osint_target_key(m.group(1))
+    return ""
+
+
+def _find_osint_dossier_record(files_cabinet: FilesCabinet, target: str) -> tuple[str | None, dict | None]:
+    """Return (file_name, record) if a dossier exists for this target in OSINT Dossiers."""
+    want = _osint_target_key(target)
+    fname = _osint_dossier_filename(target)
+    rec = files_cabinet.get_file(fname)
+    if rec and (rec.get("folder") or "").strip().lower() == OSINT_DOSSIERS_FOLDER.lower():
+        return fname, rec
+    try:
+        for meta in files_cabinet.list_files(folder=OSINT_DOSSIERS_FOLDER):
+            name = (meta.get("name") or "").strip()
+            if not name:
+                continue
+            full = files_cabinet.get_file(name)
+            if not full:
+                continue
+            if _parse_osint_target_key_from_body(full.get("content") or "") == want:
+                return name, full
+    except Exception:
+        pass
+    return None, None
+
+
+def _osint_dossier_age_days(rec: dict) -> float | None:
+    ts = (rec.get("updated_at") or rec.get("created_at") or "").strip()
+    dt = _parse_memory_datetime(ts)
+    if dt is None:
+        return None
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+
+
+def _generate_osint_tavily_queries(
+    anthropic_client: anthropic.Anthropic,
+    target: str,
+    target_type: str,
+    context: str | None,
+) -> list[str]:
+    """Claude produces 5–8 diverse search strings for Tavily."""
+    ctx = (context or "").strip()
+    if len(ctx) > 1200:
+        ctx = ctx[:1197] + "..."
+    kind = "person" if (target_type or "").strip().lower() != "organization" else "organization"
+    system = f"""You output ONLY valid JSON: a JSON array of {OSINT_TAVILY_QUERIES_MIN} to {OSINT_TAVILY_QUERIES_MAX} short web search query strings (no other text).
+Each query should cover a DIFFERENT OSINT angle for the given {kind}.
+Queries must be specific to the target name and usable in a search engine."""
+    user = f"""Target ({kind}): {target}
+Optional context from Tyler: {ctx or "(none)"}
+
+Return a JSON array of search query strings only, e.g. ["query1", "query2"]."""
+    try:
+        resp = anthropic_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=512,
+            temperature=0.35,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        text = ""
+        for block in resp.content:
+            if getattr(block, "type", None) == "text":
+                text += block.text
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text += block.get("text", "")
+        text = (text or "").strip()
+        lb, rb = text.find("["), text.rfind("]")
+        if lb >= 0 and rb > lb:
+            text = text[lb : rb + 1]
+        arr = json.loads(text)
+        if not isinstance(arr, list):
+            return []
+        out = [str(q).strip() for q in arr if str(q).strip()]
+        return out[:OSINT_TAVILY_QUERIES_MAX]
+    except Exception as e:
+        print(f"{Fore.YELLOW}OSINT query generation failed: {e}{Style.RESET_ALL}")
+        return []
+
+
+def _default_osint_queries(target: str, target_type: str) -> list[str]:
+    t = (target or "").strip()
+    tt = (target_type or "person").strip().lower()
+    if tt == "organization":
+        return [
+            f"{t} leadership executives",
+            f"{t} mission funding donors grants",
+            f"{t} government contracts defense",
+            f"{t} news investigation controversy",
+            f"{t} UAP classified programs",
+            f"{t} partners subsidiaries affiliates",
+            f"{t} public statements press releases",
+            f"{t} financial background SEC nonprofit",
+        ]
+    return [
+        f"{t} biography career background",
+        f"{t} interview statements articles",
+        f"{t} news",
+        f"{t} social media LinkedIn Twitter",
+        f"{t} UAP disclosure UFO",
+        f"{t} government military intelligence ties",
+        f"{t} controversy legal lawsuit dispute",
+        f"{t} associates colleagues network",
+    ]
+
+
+def _parse_osint_synthesis_header(dossier_text: str) -> tuple[str, str, list[str], list[str]]:
+    """Extract MISSION_RELEVANCE, AUTO_TAGS, RED_FLAGS from model output; return cleaned body."""
+    text = dossier_text or ""
+    relevance = "MEDIUM"
+    tags: list[str] = []
+    red_flags: list[str] = []
+
+    m = re.search(r"(?im)^MISSION_RELEVANCE\s*:\s*(LOW|MEDIUM|HIGH|CRITICAL)\s*$", text)
+    if m:
+        relevance = m.group(1).upper()
+        text = (text[: m.start()] + text[m.end() :]).strip()
+    m = re.search(r"(?im)^AUTO_TAGS\s*:\s*(.+)$", text)
+    if m:
+        tags = [x.strip() for x in m.group(1).split(",") if x.strip()][:20]
+        text = (text[: m.start()] + text[m.end() :]).strip()
+    m = re.search(r"(?is)^RED_FLAGS\s*:\s*\n((?:\s*[-*•].*\n?)*)", text)
+    if m:
+        block = m.group(1) or ""
+        for ln in block.splitlines():
+            ln = ln.strip()
+            if ln.startswith(("-", "*", "•")):
+                item = re.sub(r"^[-*•]\s*", "", ln).strip()
+                if item:
+                    red_flags.append(item)
+        text = (text[: m.start()] + text[m.end() :]).strip()
+
+    return text.strip(), relevance, tags, red_flags
+
+
+def _strip_osint_file_machine_header(content: str) -> str:
+    """Remove leading OSINT_TARGET_KEY / target_display / ... block from filed dossier."""
+    lines = (content or "").splitlines()
+    i = 0
+    meta_re = re.compile(
+        r"(?i)^(OSINT_TARGET_KEY|target_display|target_type|dossier_date|mission_relevance|auto_tags)\s*:"
+    )
+    while i < len(lines) and meta_re.match((lines[i] or "").strip()):
+        i += 1
+    if i < len(lines) and not (lines[i] or "").strip():
+        i += 1
+    return "\n".join(lines[i:]).strip()
+
+
+def _parse_osint_stored_meta(content: str) -> tuple[str, list[str]]:
+    """mission_relevance line + RED_FLAGS section from a filed dossier body."""
+    rel = "MEDIUM"
+    red_flags: list[str] = []
+    for line in (content or "").splitlines()[:25]:
+        m = re.match(r"(?i)^\s*mission_relevance\s*:\s*(LOW|MEDIUM|HIGH|CRITICAL)\s*$", line.strip())
+        if m:
+            rel = m.group(1).upper()
+    m = re.search(r"(?is)^RED_FLAGS\s*:\s*\n((?:\s*[-*•].*\n?)*)", content or "")
+    if m:
+        for ln in (m.group(1) or "").splitlines():
+            ln = ln.strip()
+            if ln.startswith(("-", "*", "•")):
+                item = re.sub(r"^[-*•]\s*", "", ln).strip()
+                if item and item.lower() != "none significant in open sources":
+                    red_flags.append(item)
+    return rel, red_flags
+
+
+def run_osint_background(
+    target: str,
+    target_type: str,
+    context: str | None,
+    *,
+    anthropic_client: anthropic.Anthropic,
+    files_cabinet: FilesCabinet,
+    memory_summary: str = "",
+) -> dict:
+    """
+    Systematic open-web OSINT: Tavily multi-angle search + Claude dossier, filed under OSINT Dossiers.
+    Returns a dict with ok, cached, file_name, folder, mission_relevance, red_flags, summary_for_tyler,
+    dossier_body, sources, error (if any).
+    """
+    target = (target or "").strip()
+    if not target:
+        return {"ok": False, "error": "target is required"}
+    tt = (target_type or "person").strip().lower()
+    if tt not in ("person", "organization"):
+        tt = "person"
+
+    api_key = (os.getenv("TAVILY_API_KEY") or "").strip()
+    if not api_key:
+        return {"ok": False, "error": "TAVILY_API_KEY not set"}
+
+    fname, existing = _find_osint_dossier_record(files_cabinet, target)
+    if existing and fname:
+        age = _osint_dossier_age_days(existing)
+        if age is not None and age < OSINT_DOSSIER_MAX_AGE_DAYS:
+            content = (existing.get("content") or "").strip()
+            rel, reds = _parse_osint_stored_meta(content)
+            narrative = _strip_osint_file_machine_header(content)
+            return {
+                "ok": True,
+                "cached": True,
+                "file_name": fname,
+                "folder": OSINT_DOSSIERS_FOLDER,
+                "mission_relevance": rel,
+                "red_flags": reds,
+                "summary_for_tyler": (
+                    f"(Using your existing OSINT dossier from the last {max(1, int(age))} days.) "
+                    f"{_osint_excerpt_for_tyler(narrative)}"
+                ),
+                "dossier_body": content,
+                "sources": _osint_extract_sources(narrative),
+            }
+
+    queries = _generate_osint_tavily_queries(anthropic_client, target, tt, context)
+    if len(queries) < OSINT_TAVILY_QUERIES_MIN:
+        queries = _default_osint_queries(target, tt)
+    queries = queries[:OSINT_TAVILY_QUERIES_MAX]
+
+    seen_urls: set[str] = set()
+    all_results: list[dict] = []
+    for q in queries:
+        chunk = _tavily_search_one(q, api_key, max_results=4, search_depth="basic")
+        for r in chunk:
+            url = (r.get("url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            all_results.append(r)
+        if len(all_results) >= 35:
+            break
+
+    raw_lines: list[str] = []
+    for i, r in enumerate(all_results[:32], start=1):
+        title = (r.get("title") or "").strip()
+        snippet = (r.get("content") or r.get("snippet") or "").strip()
+        url = (r.get("url") or "").strip()
+        if len(snippet) > 700:
+            snippet = snippet[:697] + "..."
+        raw_lines.append(f"[{i}] {title}\nURL: {url}\n{snippet}")
+    bundle = "\n\n".join(raw_lines) if raw_lines else "(No search results returned.)"
+
+    mem_ctx = (memory_summary or "").strip()
+    if len(mem_ctx) > 3000:
+        mem_ctx = mem_ctx[:2997] + "..."
+
+    date_s = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    kind = "person" if tt == "person" else "organization"
+    syn_system = f"""You are Angel's OSINT analyst building a structured open-source dossier for Tyler (UAP/disclosure mission, federal law enforcement context).
+
+Target type: {kind}.
+Output plain text (no markdown fences) in this EXACT order at the top:
+MISSION_RELEVANCE: LOW|MEDIUM|HIGH|CRITICAL
+AUTO_TAGS: comma-separated short tags (e.g. UAP, government, military, contractor, media, legal — only what evidence supports)
+RED_FLAGS:
+- bullet lines for controversies, credibility issues, undisclosed conflicts, or sensitive ties (use "-" lines); if none well-sourced, single line: - None significant in open sources
+
+Then the dossier with labeled sections:
+EXECUTIVE SUMMARY (short)
+KEY FACTS (bullets)
+PROFESSIONAL / ORG BACKGROUND (as applicable)
+PUBLIC STATEMENTS AND MEDIA
+CONNECTIONS (UAP/disclosure, government, military, contractors — only if sources support)
+CONTROVERSIES OR LEGAL (if any)
+ASSOCIATES AND NETWORK (if known from sources)
+SOURCES (numbered list matching [n] from the provided excerpts)
+
+Be factual; cite uncertainty. Do not invent classified access. Use only the search material plus general knowledge only where clearly labeled as context, not as fact."""
+
+    syn_user = f"""Target: {target}
+Optional context: {(context or '').strip() or '(none)'}
+Tyler memory context (may be partial): {mem_ctx or '(none)'}
+
+Search bundle:
+{bundle}
+
+Write the full dossier now."""
+
+    try:
+        syn_resp = anthropic_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=8192,
+            temperature=0.25,
+            system=syn_system,
+            messages=[{"role": "user", "content": syn_user}],
+        )
+        syn_text = ""
+        for block in syn_resp.content:
+            if getattr(block, "type", None) == "text":
+                syn_text += block.text
+            elif isinstance(block, dict) and block.get("type") == "text":
+                syn_text += block.get("text", "")
+        syn_text = (syn_text or "").strip()
+    except Exception as e:
+        return {"ok": False, "error": f"synthesis failed: {e}"}
+
+    dossier_main, relevance, auto_tags, red_flags = _parse_osint_synthesis_header(syn_text)
+    if relevance not in ("LOW", "MEDIUM", "HIGH", "CRITICAL"):
+        relevance = "MEDIUM"
+
+    header_meta = "\n".join(
+        [
+            f"OSINT_TARGET_KEY: {_osint_target_key(target)}",
+            f"target_display: {target}",
+            f"target_type: {tt}",
+            f"dossier_date: {date_s}",
+            f"mission_relevance: {relevance}",
+            f"auto_tags: {', '.join(auto_tags) if auto_tags else '(none)'}",
+            "",
+        ]
+    )
+    full_body = header_meta + dossier_main
+    tags = [
+        f"osint_target_type:{tt}",
+        f"mission_relevance:{relevance}",
+        "osint_dossier",
+    ]
+    for t in auto_tags[:15]:
+        t = (t or "").strip()
+        if t:
+            tags.append(t[:60])
+
+    out_fname = _osint_dossier_filename(target)
+    try:
+        if fname and existing:
+            files_cabinet.update_file(fname, full_body)
+            final_name = fname
+        else:
+            try:
+                files_cabinet.create_file(OSINT_DOSSIERS_FOLDER, out_fname, full_body, tags=tags)
+                final_name = out_fname
+            except ValueError:
+                # Name collision — update existing
+                files_cabinet.update_file(out_fname, full_body)
+                final_name = out_fname
+    except Exception as e:
+        return {"ok": False, "error": f"could not save dossier: {e}", "dossier_body": full_body}
+
+    return {
+        "ok": True,
+        "cached": False,
+        "file_name": final_name,
+        "folder": OSINT_DOSSIERS_FOLDER,
+        "mission_relevance": relevance,
+        "red_flags": red_flags,
+        "summary_for_tyler": _osint_excerpt_for_tyler(dossier_main),
+        "dossier_body": full_body,
+        "sources": _osint_extract_sources(dossier_main),
+    }
+
+
+def _osint_excerpt_for_tyler(dossier_main: str, max_chars: int = 2200) -> str:
+    t = (dossier_main or "").strip()
+    if len(t) <= max_chars:
+        return t
+    return t[: max_chars - 3] + "..."
+
+
+def _osint_extract_sources(dossier_text: str) -> list[str]:
+    out: list[str] = []
+    in_sources = False
+    for line in (dossier_text or "").splitlines():
+        if re.match(r"(?i)^SOURCES\s*$", line.strip()):
+            in_sources = True
+            continue
+        if in_sources:
+            if line.strip().startswith("#") or (
+                line.strip() and not re.match(r"^\s*[\d\[\]\.\-]", line) and line.strip().isupper()
+            ):
+                break
+            m = re.search(r"https?://\S+", line)
+            if m:
+                out.append(m.group(0).rstrip(").,;]"))
+    return out[:40]
+
+
 def send_briefing_email(briefing_text: str) -> bool:
     """Send the morning briefing to TYLER_EMAIL via Resend API. Uses RESEND_API_KEY."""
     import resend
@@ -3909,6 +4361,7 @@ class AngelCore:
         profile_requested, profile_person = detect_profile_request(user_message)
         profile_hint = profile_requested
         research_requested = detect_research_request(user_message)
+        osint_triggered, osint_target, osint_type = detect_osint_request(user_message)
 
         cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
         if device in ("ios", "mobile_web"):
@@ -3930,6 +4383,14 @@ class AngelCore:
                 "\n\n[System notice: Tyler asked to add a standing threat-watch topic. "
                 "It is already saved (category threat_watch) and will merge into the next automated scans. "
                 f"Confirm briefly using his wording: {added_threat_watch!r}.]"
+            )
+        if osint_triggered and osint_target:
+            system_prompt += (
+                "\n\nThis turn may include an OSINT dossier appendix (open-source background on a person or organization). "
+                "If it is present, you already ran or loaded that research—open by acknowledging you pulled sources, "
+                "then summarize key facts, red flags, and mission relevance; name the dossier file in OSINT Dossiers. "
+                "If the appendix says OSINT failed, explain briefly and offer to retry. "
+                "Do not claim classified or non-public sources."
             )
 
         cc_runtime = (
@@ -4044,9 +4505,45 @@ If you infer anything new about that person's preferences or dynamics, append at
         print(f"{Fore.BLUE}Angel is thinking...{Style.RESET_ALL}")
 
         augmented_user_message = user_message
+        osint_ran = False
+        osint_attempted = bool(osint_triggered and osint_target)
 
-        # Stage 2 Deep Research: multi-angle Tavily + synthesis when triggered
-        if comm_intent.intent == "briefing" and os.getenv("TAVILY_API_KEY"):
+        if osint_triggered and osint_target:
+            if os.getenv("TAVILY_API_KEY"):
+                print(
+                    f"{Fore.BLUE}Angel: OSINT deep background on {osint_target!r} ({osint_type})...{Style.RESET_ALL}"
+                )
+                os_res = run_osint_background(
+                    osint_target,
+                    osint_type,
+                    user_message,
+                    anthropic_client=self.anthropic_client,
+                    files_cabinet=self.files_cabinet,
+                    memory_summary=memory_summary,
+                )
+                if os_res.get("ok"):
+                    osint_ran = True
+                    cache_note = " — existing dossier reused (within 30 days)" if os_res.get("cached") else ""
+                    rf = os_res.get("red_flags") or []
+                    rf_txt = "\n".join(f"- {x}" for x in rf) if rf else "- (none listed)"
+                    augmented_user_message = (
+                        f"{user_message}\n\n"
+                        f"[OSINT DOSSIER{cache_note} — cabinet file {os_res.get('file_name')} in folder "
+                        f"'{OSINT_DOSSIERS_FOLDER}'. Mission relevance: {os_res.get('mission_relevance')}.]\n"
+                        f"Red flags:\n{rf_txt}\n\n"
+                        f"Full dossier text for your summary:\n{os_res.get('dossier_body', '')[:14000]}"
+                    )
+                else:
+                    augmented_user_message = (
+                        f"{user_message}\n\n[OSINT research did not complete: {os_res.get('error', 'unknown')}]"
+                    )
+            else:
+                augmented_user_message = (
+                    f"{user_message}\n\n[OSINT unavailable: TAVILY_API_KEY is not set in this environment.]"
+                )
+
+        # Stage 2 Deep Research: multi-angle Tavily + synthesis when triggered (skip if this turn was an OSINT request)
+        if comm_intent.intent == "briefing" and os.getenv("TAVILY_API_KEY") and not osint_attempted:
             # For pre-conversation briefings, always try to research the person/topic explicitly.
             topic = (comm_intent.person_name or "") + " " + (comm_intent.topic or "")
             topic = topic.strip() or user_message.strip()
@@ -4063,7 +4560,7 @@ If you infer anything new about that person's preferences or dynamics, append at
                 f"Research briefing about {topic} (use this to answer):\n{briefing}\n\n"
                 f"Original user request:\n{user_message}"
             )
-        elif research_requested:
+        elif research_requested and not osint_attempted:
             topic = user_message.strip()
             for phrase in RESEARCH_TRIGGERS:
                 if phrase in topic.lower():
@@ -4084,7 +4581,7 @@ If you infer anything new about that person's preferences or dynamics, append at
                 f"Research briefing (use this to answer):\n{briefing}\n\n"
                 f"Original user request:\n{user_message}"
             )
-        else:
+        elif not osint_attempted:
             # Normal optional web context for factual queries
             web_context = maybe_search_web(
                 user_message,

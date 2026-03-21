@@ -37,6 +37,8 @@ from angel import (
     add_threat_category,
     run_threat_detection,
     format_threat_intelligence_for_briefing,
+    OSINT_DOSSIERS_FOLDER,
+    run_osint_background,
 )
 
 try:
@@ -1566,6 +1568,76 @@ def create_app() -> Flask:
                     "default_count": len(THREAT_WATCH_DEFAULT_CATEGORIES),
                 }
             )
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Item 13: OSINT deep background dossiers ---
+
+    @app.route("/api/osint/research", methods=["POST"])
+    def api_osint_research():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        target = (data.get("target") or "").strip()
+        tt = (data.get("target_type") or "person").strip().lower()
+        if tt not in ("person", "organization"):
+            tt = "person"
+        context = data.get("context")
+        if context is not None and not isinstance(context, str):
+            context = str(context)
+        if not target:
+            return jsonify({"ok": False, "error": "JSON body must include non-empty 'target'."}), 400
+        try:
+            client = create_anthropic_client()
+            memories = angel._fetch_combined_memories()
+            memory_summary = build_memory_summary_with_sections(
+                memories, None, omit_reflection_section=True
+            )
+            result = run_osint_background(
+                target,
+                tt,
+                context,
+                anthropic_client=client,
+                files_cabinet=angel.files_cabinet,
+                memory_summary=memory_summary,
+            )
+            if result.get("dossier_body"):
+                result = dict(result)
+                result["dossier_body"] = _sanitize_text(str(result["dossier_body"]))
+            if result.get("summary_for_tyler"):
+                result["summary_for_tyler"] = _sanitize_text(str(result["summary_for_tyler"]))
+            code = 200 if result.get("ok") else 502
+            return jsonify({"ok": bool(result.get("ok")), **result}), code
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/osint/dossiers", methods=["GET"])
+    def api_osint_dossiers():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            recs = angel.files_cabinet.list_files(folder=OSINT_DOSSIERS_FOLDER)
+            return jsonify({"ok": True, "folder": OSINT_DOSSIERS_FOLDER, "dossiers": recs})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/osint/dossier/<path:name>", methods=["GET"])
+    def api_osint_dossier_get(name):
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        fname = (name or "").strip()
+        if not fname:
+            return jsonify({"ok": False, "error": "Missing dossier name."}), 400
+        try:
+            rec = angel.files_cabinet.get_file(fname)
+            if not rec:
+                return jsonify({"ok": False, "error": f"No file named {fname!r}."}), 404
+            if (rec.get("folder") or "").strip().lower() != OSINT_DOSSIERS_FOLDER.lower():
+                return jsonify({"ok": False, "error": "Not an OSINT dossier file."}), 404
+            return jsonify({"ok": True, "dossier": rec})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
