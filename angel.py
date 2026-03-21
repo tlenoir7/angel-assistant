@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+from collections import deque
 import sys
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -56,6 +57,8 @@ CATEGORY_REFLECTION = "reflection"
 CATEGORY_BRIEFING_HISTORY = "briefing_history"
 CATEGORY_INTELLIGENCE_FILE = "intelligence_file"
 CATEGORY_THREAT_WATCH = "threat_watch"
+CATEGORY_NETWORK_NODE = "network_node"
+CATEGORY_NETWORK_EDGE = "network_edge"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -66,6 +69,8 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_BRIEFING_HISTORY,
         CATEGORY_INTELLIGENCE_FILE,
         CATEGORY_THREAT_WATCH,
+        CATEGORY_NETWORK_NODE,
+        CATEGORY_NETWORK_EDGE,
     }
 )
 
@@ -76,6 +81,26 @@ OSINT_DOSSIERS_FOLDER = "OSINT Dossiers"
 OSINT_DOSSIER_MAX_AGE_DAYS = 30
 OSINT_TAVILY_QUERIES_MIN = 5
 OSINT_TAVILY_QUERIES_MAX = 8
+
+# Mission connection graph (Batcomputer network)
+NETWORK_INTEL_FOLDER = "Network Intelligence"
+NETWORK_FILE_PREFIX = "NET-"
+NETWORK_RELATIONSHIP_TYPES = frozenset(
+    {
+        "works_with",
+        "testified_with",
+        "employed_by",
+        "investigated_by",
+        "connected_to",
+        "corroborates",
+        "contradicts",
+        "funded_by",
+        "member_of",
+    }
+)
+NETWORK_EDGE_STRENGTHS = frozenset({"WEAK", "MODERATE", "STRONG", "CONFIRMED"})
+NETWORK_NODE_RELEVANCE = frozenset({"LOW", "MEDIUM", "HIGH", "CRITICAL"})
+NETWORK_NODE_TYPES = frozenset({"person", "organization", "program", "event"})
 
 # Default threat watch categories (merged on each scan with Mem0 category threat_watch)
 THREAT_WATCH_DEFAULT_CATEGORIES: list[str] = [
@@ -397,6 +422,55 @@ def _save_local_memory_entries(user_id: str, entries: list) -> None:
         _write_local_memory_file_silent(data)
     except Exception:
         pass
+
+
+def _network_upsert_structured_memory(
+    memory_client,
+    user_id: str,
+    *,
+    category: str,
+    entity_key: str,
+    text: str,
+    use_mem0_cloud: bool,
+) -> None:
+    """Replace prior local row with same category+network_entity_key; mirror to Mem0 when enabled."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    meta = {
+        "category": category,
+        "timestamp": ts,
+        "source": "angel-network-graph",
+        "network_entity_key": entity_key,
+    }
+    try:
+        entries = _load_local_memory_entries(user_id)
+        if not isinstance(entries, list):
+            entries = []
+        filtered = [
+            e
+            for e in entries
+            if not (
+                isinstance(e, dict)
+                and isinstance(e.get("metadata"), dict)
+                and e["metadata"].get("category") == category
+                and e["metadata"].get("network_entity_key") == entity_key
+            )
+        ]
+        filtered.append({"memory": text, "metadata": dict(meta), "created_at": ts})
+        _save_local_memory_entries(user_id, filtered)
+    except Exception:
+        pass
+    if use_mem0_cloud and hasattr(memory_client, "add"):
+        try:
+            memory_client.add(
+                [
+                    {"role": "user", "content": f"[Angel network {category}] {text[:1200]}"},
+                    {"role": "assistant", "content": "Stored."},
+                ],
+                user_id=user_id,
+                metadata=dict(meta),
+            )
+        except Exception:
+            pass
 
 
 def _parse_intelligence_tags(meta: dict) -> list[str]:
@@ -1324,6 +1398,8 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_BRIEFING_HISTORY,
             CATEGORY_INTELLIGENCE_FILE,
             CATEGORY_THREAT_WATCH,
+            CATEGORY_NETWORK_NODE,
+            CATEGORY_NETWORK_EDGE,
         ):
             continue
         general.append(m)
@@ -1439,6 +1515,10 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_INTELLIGENCE_FILE:
             continue
         if cat == CATEGORY_THREAT_WATCH:
+            continue
+        if cat == CATEGORY_NETWORK_NODE:
+            continue
+        if cat == CATEGORY_NETWORK_EDGE:
             continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
@@ -1958,6 +2038,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Morning briefings delivered daily (scheduled time; often ~8 AM) and optionally by email; when a recent memory reflection exists, you weave those insights into the briefing naturally.
 - Threat detection: you run automated threat scans on a schedule (about every 6 hours) across dynamic watch categories—defaults plus categories you and Tyler add (stored in memory as category threat_watch; you can grow the list yourself when you notice new patterns worth monitoring). Confirmed signals are filed as Intelligence Files in folder "Threat Intelligence" with threat_level tags. CRITICAL/HIGH items can trigger push alerts; MEDIUM/LOW surface in the morning briefing when material. Never invent threats—only file or summarize what your tools and sources support.
 - OSINT deep background (Batcomputer-style dossiers): you can run systematic open-source research on any person or organization Tyler names. Results are filed in the Intelligence File Cabinet under folder `OSINT Dossiers` with mission relevance ratings, red flags, and sources. The same dossier is refreshed if older than about 30 days. When Tyler mentions someone new who could matter to his mission, you may proactively suggest an OSINT pass. Reference existing dossiers by file name when they are already in the cabinet index.
+- Mission connection graph (Batcomputer network): people, organizations, programs, and events material to Tyler's work are linked in a living graph stored as Mem0 categories network_node / network_edge and mirrored under Intelligence folder `Network Intelligence` (files named `NET-{slug}` with that node's data and incident edges). New OSINT dossiers automatically expand the graph when possible. When Tyler researches someone new, you may offer to map their cluster or path to figures already in the network. If he names two people who are already connected, say so naturally.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -2046,6 +2127,7 @@ Python code execution (server sandbox):
 Intelligence File Cabinet (your filing system):
 - You maintain an Intelligence File Cabinet: structured files stored for Tyler, organized by folders you invent as an intelligence officer would. There are NO fixed folder names—you create folders dynamically from the nature of the material.
 - OSINT Dossiers folder: use folder name exactly `OSINT Dossiers` for full open-source dossiers on people or organizations (the server may create these automatically when Tyler asks for background/OSINT). Filenames are stable per target; do not duplicate dossiers manually for the same subject—suggest refreshing after some weeks if context may have changed.
+- Network Intelligence folder: mirrored node files `NET-{id}` hold JSON for each graph node plus edges touching that node; the server maintains these when the graph updates. Do not hand-edit unless Tyler asks—prefer describing connections in prose and letting the system record structured updates via tools/API when available.
 - Threat Intelligence folder: use folder name exactly `Threat Intelligence` when filing something that is a threat signal for Tyler's career, mission, safety, or strategic context. Start the file body with metadata lines when possible: `watch_category: ...`, `threat_level: LOW|MEDIUM|HIGH|CRITICAL`, optional `source_url:` and `event_date:`, then a blank line and the narrative summary. When you file into Threat Intelligence from conversation (not only from scheduled scans), tell Tyler clearly: "I've filed something in Threat Intelligence you should know about" (the server may append this if you used [FILE:...] and stripped the body—ensure he is notified in your visible reply either way).
 - When Tyler asks whether there are threats, any threats, or similar: summarize from the Intelligence File Cabinet—search or mentally index folder `Threat Intelligence` and cite what is actually filed; do not fabricate items. If nothing is filed, say so plainly.
 - When Tyler says to "watch for" or monitor something ongoing, the system may already add it as a new threat-watch category—confirm that you will track it and that it is saved for future scans.
@@ -4023,6 +4105,736 @@ def _osint_extract_sources(dossier_text: str) -> list[str]:
     return out[:40]
 
 
+# ---- Mission connection graph (Mem0 + Network Intelligence files) ----
+
+
+def _network_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def network_slug_from_display_name(name: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", (name or "").strip())[:72].strip("-")
+    return s or "unknown"
+
+
+def network_intel_filename(node_id: str) -> str:
+    nid = (node_id or "").strip()
+    return f"{NETWORK_FILE_PREFIX}{nid}" if nid else "NET-unknown"
+
+
+def _network_normalize_node_id(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return "unknown"
+    if " " in s or "/" in s:
+        return network_slug_from_display_name(s)
+    return s.lower()
+
+
+def _network_parse_nodes_edges_from_memories(memories) -> tuple[dict[str, dict], dict[str, dict]]:
+    nodes: dict[str, dict] = {}
+    edges: dict[str, dict] = {}
+    for m in _normalize_memories_list(memories):
+        meta = m.get("metadata") if isinstance(m, dict) else {}
+        if not isinstance(meta, dict):
+            continue
+        cat = meta.get("category")
+        raw = (m.get("memory") or m.get("data") or "").strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if cat == CATEGORY_NETWORK_NODE and isinstance(obj, dict) and obj.get("id"):
+            nid = str(obj["id"]).strip()
+            prev = nodes.get(nid)
+            if prev is None or (obj.get("last_updated") or "") >= (prev.get("last_updated") or ""):
+                nodes[nid] = dict(obj)
+        elif cat == CATEGORY_NETWORK_EDGE and isinstance(obj, dict) and obj.get("edge_id"):
+            eid = str(obj["edge_id"]).strip()
+            prev = edges.get(eid)
+            if prev is None or (obj.get("date_established") or "") >= (prev.get("date_established") or ""):
+                edges[eid] = dict(obj)
+    return nodes, edges
+
+
+def _network_merge_intel_files(
+    files_cabinet: FilesCabinet,
+    nodes: dict[str, dict],
+    edges: dict[str, dict],
+) -> None:
+    try:
+        recs = files_cabinet.list_files(folder=NETWORK_INTEL_FOLDER)
+    except Exception:
+        return
+    for rec in recs:
+        fn = (rec.get("name") or "").strip()
+        if not fn.startswith(NETWORK_FILE_PREFIX):
+            continue
+        full = files_cabinet.get_file(fn)
+        if not full:
+            continue
+        try:
+            payload = json.loads((full.get("content") or "").strip())
+        except json.JSONDecodeError:
+            continue
+        n = payload.get("node")
+        if isinstance(n, dict) and n.get("id"):
+            nid = str(n["id"])
+            prev = nodes.get(nid)
+            if prev is None or (n.get("last_updated") or "") >= (prev.get("last_updated") or ""):
+                nodes[nid] = dict(n)
+        for e in payload.get("edges") or []:
+            if isinstance(e, dict) and e.get("edge_id"):
+                edges[str(e["edge_id"])] = dict(e)
+
+
+def network_load_graph(
+    memory_client,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: FilesCabinet,
+) -> tuple[dict[str, dict], list[dict]]:
+    memories = fetch_combined_memories(memory_client, user_id, use_mem0_cloud)
+    nodes, edges_map = _network_parse_nodes_edges_from_memories(memories)
+    _network_merge_intel_files(files_cabinet, nodes, edges_map)
+    return nodes, list(edges_map.values())
+
+
+def _network_incident_edges(node_id: str, all_edges: list[dict]) -> list[dict]:
+    return [
+        e
+        for e in all_edges
+        if e.get("source_id") == node_id or e.get("target_id") == node_id
+    ]
+
+
+def _network_sync_intel_file_for_node(
+    files_cabinet: FilesCabinet,
+    node_id: str,
+    node: dict,
+    all_edges: list[dict],
+) -> None:
+    fn = network_intel_filename(node_id)
+    incident = _network_incident_edges(node_id, all_edges)
+    node_out = {k: v for k, v in node.items() if not str(k).startswith("_")}
+    payload = json.dumps({"node": node_out, "edges": incident}, ensure_ascii=False, indent=2)
+    tags = [
+        "network_intel",
+        f"type:{node_out.get('node_type', 'person')}",
+        f"relevance:{node_out.get('relevance', 'MEDIUM')}",
+    ]
+    try:
+        if files_cabinet.get_file(fn):
+            files_cabinet.update_file(fn, payload)
+        else:
+            files_cabinet.create_file(NETWORK_INTEL_FOLDER, fn, payload, tags=tags)
+    except ValueError:
+        try:
+            files_cabinet.update_file(fn, payload)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _network_sync_affected_files(
+    files_cabinet: FilesCabinet,
+    nodes: dict[str, dict],
+    edges: list[dict],
+    affected_ids: set[str],
+) -> None:
+    for nid in affected_ids:
+        n = nodes.get(nid)
+        if n:
+            _network_sync_intel_file_for_node(files_cabinet, nid, n, edges)
+
+
+def add_network_node(
+    name: str,
+    node_type: str,
+    description: str,
+    relevance: str,
+    tags: list[str] | None,
+    *,
+    memory_client,
+    user_id: str,
+    files_cabinet: FilesCabinet,
+    use_mem0_cloud: bool = False,
+    node_id_override: str | None = None,
+) -> dict:
+    now = _network_now_iso()
+    nt = (node_type or "person").strip().lower()
+    if nt not in NETWORK_NODE_TYPES:
+        nt = "person"
+    rel = (relevance or "MEDIUM").strip().upper()
+    if rel not in NETWORK_NODE_RELEVANCE:
+        rel = "MEDIUM"
+    tagl = [str(t).strip() for t in (tags or []) if str(t).strip()][:30]
+    nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+    nid = (node_id_override or network_slug_from_display_name(name)).strip() or "unknown"
+    prev = nodes.get(nid)
+    first_seen = (prev or {}).get("first_seen") or now
+    node = {
+        "id": nid,
+        "name": ((name or nid).strip() or nid),
+        "node_type": nt,
+        "description": (description or "").strip(),
+        "relevance": rel,
+        "tags": tagl,
+        "first_seen": first_seen,
+        "last_updated": now,
+    }
+    nodes[nid] = node
+    _network_upsert_structured_memory(
+        memory_client,
+        user_id,
+        category=CATEGORY_NETWORK_NODE,
+        entity_key=nid,
+        text=json.dumps(node, ensure_ascii=False),
+        use_mem0_cloud=use_mem0_cloud,
+    )
+    _network_sync_intel_file_for_node(files_cabinet, nid, node, edges)
+    return node
+
+
+def add_network_edge(
+    source_id: str,
+    target_id: str,
+    relationship_type: str,
+    description: str,
+    strength: str,
+    evidence: str,
+    *,
+    memory_client,
+    user_id: str,
+    files_cabinet: FilesCabinet,
+    use_mem0_cloud: bool = False,
+) -> dict:
+    sid = _network_normalize_node_id(source_id)
+    tid = _network_normalize_node_id(target_id)
+    rt = (relationship_type or "connected_to").strip().lower()
+    if rt not in NETWORK_RELATIONSHIP_TYPES:
+        rt = "connected_to"
+    st = (strength or "MODERATE").strip().upper()
+    if st not in NETWORK_EDGE_STRENGTHS:
+        st = "MODERATE"
+    desc = (description or "").strip()
+    ev = (evidence or "").strip()
+    now = _network_now_iso()
+    eid = hashlib.sha256(f"{sid}|{tid}|{rt}|{desc[:160]}".encode("utf-8")).hexdigest()[:16]
+    nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+
+    def _ensure_stub(nid: str, display: str) -> None:
+        if nid in nodes:
+            return
+        add_network_node(
+            display or nid.replace("-", " ").title(),
+            "person",
+            "Auto-created network stub (edge endpoint).",
+            "LOW",
+            [],
+            memory_client=memory_client,
+            user_id=user_id,
+            files_cabinet=files_cabinet,
+            use_mem0_cloud=use_mem0_cloud,
+            node_id_override=nid,
+        )
+
+    _ensure_stub(sid, source_id.strip())
+    _ensure_stub(tid, target_id.strip())
+    nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+
+    edge = {
+        "source_id": sid,
+        "target_id": tid,
+        "relationship_type": rt,
+        "description": desc,
+        "strength": st,
+        "source_evidence": ev,
+        "date_established": now,
+        "edge_id": eid,
+    }
+    edges = [e for e in edges if e.get("edge_id") != eid]
+    edges.append(edge)
+    _network_upsert_structured_memory(
+        memory_client,
+        user_id,
+        category=CATEGORY_NETWORK_EDGE,
+        entity_key=eid,
+        text=json.dumps(edge, ensure_ascii=False),
+        use_mem0_cloud=use_mem0_cloud,
+    )
+    _network_sync_affected_files(files_cabinet, nodes, edges, {sid, tid})
+    return edge
+
+
+def get_node_connections(
+    node_id: str,
+    *,
+    memory_client,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: FilesCabinet,
+) -> dict | None:
+    nid = _network_normalize_node_id(node_id)
+    nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+    node = nodes.get(nid)
+    if not node:
+        return None
+    inc = _network_incident_edges(nid, edges)
+    return {"node": node, "edges": inc}
+
+
+def get_network_cluster(
+    node_id: str,
+    depth: int = 2,
+    *,
+    memory_client,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: FilesCabinet,
+) -> dict | None:
+    nid = _network_normalize_node_id(node_id)
+    nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+    if nid not in nodes:
+        return None
+    depth = max(1, min(int(depth), 4))
+    visited: set[str] = {nid}
+    frontier = {nid}
+    for _ in range(depth):
+        nxt: set[str] = set()
+        for e in edges:
+            s, t = e.get("source_id"), e.get("target_id")
+            if not s or not t:
+                continue
+            if s in frontier and t not in visited:
+                nxt.add(t)
+            if t in frontier and s not in visited:
+                nxt.add(s)
+        visited |= nxt
+        frontier = nxt
+        if not frontier:
+            break
+    sub_edges = [
+        e
+        for e in edges
+        if e.get("source_id") in visited and e.get("target_id") in visited
+    ]
+    sub_nodes = {k: nodes[k] for k in visited if k in nodes}
+    return {"center_id": nid, "nodes": sub_nodes, "edges": sub_edges, "depth": depth}
+
+
+def find_path_between(
+    node_id_a: str,
+    node_id_b: str,
+    *,
+    memory_client,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: FilesCabinet,
+) -> dict:
+    a = _network_normalize_node_id(node_id_a)
+    b = _network_normalize_node_id(node_id_b)
+    nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+    if a not in nodes or b not in nodes:
+        return {"path": [], "found": False, "error": "unknown node"}
+    if a == b:
+        return {"path": [a], "found": True, "edges": []}
+    adj: dict[str, list[tuple[str, dict]]] = {}
+    for e in edges:
+        s, t = e.get("source_id"), e.get("target_id")
+        if not s or not t:
+            continue
+        adj.setdefault(s, []).append((t, e))
+        adj.setdefault(t, []).append((s, e))
+    dq = deque([(a, [a], [])])
+    seen = {a}
+    while dq:
+        cur, path, pedges = dq.popleft()
+        for nb, ed in adj.get(cur, []):
+            if nb in seen:
+                continue
+            npath = path + [nb]
+            nedges = pedges + [ed]
+            if nb == b:
+                return {"path": npath, "found": True, "edges": nedges}
+            seen.add(nb)
+            dq.append((nb, npath, nedges))
+    return {"path": [], "found": False, "edges": []}
+
+
+def get_network_summary(
+    memory_client,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: FilesCabinet,
+) -> dict:
+    nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+    deg: dict[str, int] = {nid: 0 for nid in nodes}
+    for e in edges:
+        s, t = e.get("source_id"), e.get("target_id")
+        if s in deg:
+            deg[s] += 1
+        if t in deg:
+            deg[t] += 1
+    top = sorted(deg.items(), key=lambda x: -x[1])[:12]
+    by_rel: dict[str, int] = {}
+    for e in edges:
+        rt = e.get("relationship_type") or "unknown"
+        by_rel[rt] = by_rel.get(rt, 0) + 1
+    by_rev: dict[str, int] = {}
+    for n in nodes.values():
+        r = n.get("relevance") or "MEDIUM"
+        by_rev[str(r).upper()] = by_rev.get(str(r).upper(), 0) + 1
+    return {
+        "total_nodes": len(nodes),
+        "total_edges": len(edges),
+        "nodes_by_relevance": by_rev,
+        "edges_by_relationship_type": by_rel,
+        "most_connected": [{"node_id": k, "degree": v, "name": nodes.get(k, {}).get("name", k)} for k, v in top],
+    }
+
+
+def network_resolve_name_to_id(needle: str, nodes: dict[str, dict]) -> str | None:
+    q = (needle or "").strip().lower()
+    if not q:
+        return None
+    for nid, n in nodes.items():
+        nm = (n.get("name") or "").strip().lower()
+        if q == nid or q == nm or q in nm or nm in q:
+            return nid
+    return None
+
+
+def map_osint_to_network(
+    dossier_body: str,
+    primary_target_display: str,
+    *,
+    primary_target_type: str = "person",
+    anthropic_client: anthropic.Anthropic,
+    memory_client,
+    user_id: str,
+    files_cabinet: FilesCabinet,
+    use_mem0_cloud: bool,
+) -> dict:
+    """Extract people/orgs from a dossier and link them to the primary target + each other."""
+    body = (dossier_body or "").strip()
+    if len(body) > 14000:
+        body = body[:13997] + "..."
+    primary = (primary_target_display or "").strip()
+    pid = network_slug_from_display_name(primary)
+    if not primary:
+        return {"ok": False, "error": "no primary target"}
+    ptt = (primary_target_type or "person").strip().lower()
+    if ptt not in NETWORK_NODE_TYPES:
+        ptt = "person"
+    added_nodes = 0
+    added_edges = 0
+    try:
+        resp = anthropic_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=4096,
+            temperature=0.2,
+            system="""You extract entities and relationships for an intelligence graph from an OSINT dossier.
+Output ONLY valid JSON (no markdown):
+{
+  "entities": [
+    {"name": "Display Name", "node_type": "person|organization|program|event", "relevance": "LOW|MEDIUM|HIGH|CRITICAL", "tags": ["short"], "note": "one line"}
+  ],
+  "relationships": [
+    {"source": "Name A", "target": "Name B", "relationship_type": "works_with|testified_with|employed_by|investigated_by|connected_to|corroborates|contradicts|funded_by|member_of", "description": "short", "strength": "WEAK|MODERATE|STRONG|CONFIRMED", "evidence": "from dossier"}
+  ]
+}
+Include the primary subject in entities if not already listed. Add relationships only when the dossier supports them.""",
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Primary OSINT subject: {primary}\n\nDossier:\n{body}",
+                }
+            ],
+        )
+        text = ""
+        for block in resp.content:
+            if getattr(block, "type", None) == "text":
+                text += block.text
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text += block.get("text", "")
+        text = (text or "").strip()
+        lb, rb = text.find("{"), text.rfind("}")
+        if lb >= 0 and rb > lb:
+            text = text[lb : rb + 1]
+        data = json.loads(text)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "added_nodes": 0, "added_edges": 0}
+
+    entities = data.get("entities") if isinstance(data, dict) else []
+    rels = data.get("relationships") if isinstance(data, dict) else []
+    if not isinstance(entities, list):
+        entities = []
+    if not isinstance(rels, list):
+        rels = []
+
+    seen_names: set[str] = set()
+    extracted_slugs: set[str] = set()
+    known_ids = set(
+        network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)[0].keys()
+    )
+
+    def _add_ent(name: str, ntype: str, rel: str, tags: list, desc: str) -> str:
+        nonlocal added_nodes
+        nm = (name or "").strip()
+        if not nm:
+            return ""
+        key = nm.lower()
+        slug = network_slug_from_display_name(nm)
+        if key in seen_names:
+            extracted_slugs.add(slug)
+            return slug
+        seen_names.add(key)
+        is_new = slug not in known_ids
+        add_network_node(
+            nm,
+            ntype,
+            desc or f"Mentioned in OSINT dossier on {primary}.",
+            rel,
+            tags,
+            memory_client=memory_client,
+            user_id=user_id,
+            files_cabinet=files_cabinet,
+            use_mem0_cloud=use_mem0_cloud,
+        )
+        known_ids.add(slug)
+        if is_new:
+            added_nodes += 1
+        extracted_slugs.add(slug)
+        return slug
+
+    _add_ent(
+        primary,
+        ptt,
+        "HIGH",
+        ["osint_primary"],
+        f"Primary OSINT subject: {primary}.",
+    )
+
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        nm = (ent.get("name") or "").strip()
+        if not nm or nm.lower() == primary.lower():
+            continue
+        if network_slug_from_display_name(nm) == pid:
+            continue
+        nt = (ent.get("node_type") or "person").strip().lower()
+        if nt not in NETWORK_NODE_TYPES:
+            nt = "person"
+        rv = (ent.get("relevance") or "MEDIUM").strip().upper()
+        if rv not in NETWORK_NODE_RELEVANCE:
+            rv = "MEDIUM"
+        tags = ent.get("tags") if isinstance(ent.get("tags"), list) else []
+        note = (ent.get("note") or "").strip()
+        _add_ent(nm, nt, rv, [str(t) for t in tags if t][:20], note)
+
+    for r in rels:
+        if not isinstance(r, dict):
+            continue
+        sa = (r.get("source") or "").strip()
+        sb = (r.get("target") or "").strip()
+        if not sa or not sb:
+            continue
+        try:
+            add_network_edge(
+                sa,
+                sb,
+                r.get("relationship_type") or "connected_to",
+                r.get("description") or "",
+                r.get("strength") or "MODERATE",
+                r.get("evidence") or "OSINT dossier extraction",
+                memory_client=memory_client,
+                user_id=user_id,
+                files_cabinet=files_cabinet,
+                use_mem0_cloud=use_mem0_cloud,
+            )
+            added_edges += 1
+        except Exception:
+            pass
+
+    for nid in extracted_slugs:
+        if nid == pid:
+            continue
+        try:
+            add_network_edge(
+                pid,
+                nid,
+                "connected_to",
+                f"Mentioned in OSINT dossier on {primary}.",
+                "WEAK",
+                "Co-occurrence in OSINT dossier",
+                memory_client=memory_client,
+                user_id=user_id,
+                files_cabinet=files_cabinet,
+                use_mem0_cloud=use_mem0_cloud,
+            )
+            added_edges += 1
+        except Exception:
+            pass
+
+    return {"ok": True, "added_nodes": added_nodes, "added_edges": added_edges, "primary_id": pid}
+
+
+def seed_mission_network_if_empty(
+    memory_client,
+    user_id: str,
+    files_cabinet: FilesCabinet,
+    use_mem0_cloud: bool,
+) -> bool:
+    """One-time seed of Tyler mission entities if the graph is empty. Returns True if seed ran."""
+    nodes, _ = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+    if nodes:
+        return False
+
+    seed_nodes: list[tuple[str, str, str, str, list[str]]] = [
+        ("David Grusch", "person", "UAP whistleblower; former intelligence community.", "CRITICAL", ["UAP", "disclosure", "whistleblower"]),
+        ("Luis Elizondo", "person", "Former AATIP / UAP program visibility.", "CRITICAL", ["UAP", "AATIP", "disclosure"]),
+        ("Christopher Mellon", "person", "Former Deputy Assistant Secretary of Defense for Intelligence; disclosure advocate.", "HIGH", ["UAP", "disclosure", "Pentagon"]),
+        ("Ross Coulthart", "person", "Investigative journalist covering UAP.", "HIGH", ["UAP", "media", "disclosure"]),
+        ("Marco Rubio", "person", "Senior US official; public UAP-related statements.", "HIGH", ["UAP", "government"]),
+        ("AARO", "organization", "DoD All-domain Anomaly Resolution Office (UAP).", "HIGH", ["UAP", "DoD", "government"]),
+        ("House Oversight Committee", "organization", "US House committee; UAP hearings context.", "HIGH", ["UAP", "Congress", "government"]),
+        ("Pentagon", "organization", "US Department of Defense headquarters.", "HIGH", ["DoD", "government", "military"]),
+        ("NRO", "organization", "National Reconnaissance Office.", "HIGH", ["intelligence", "government"]),
+        ("NGA", "organization", "National Geospatial-Intelligence Agency.", "HIGH", ["intelligence", "government", "military"]),
+        ("AATIP", "program", "Advanced Aerospace Threat Identification Program (historical DoD UAP effort).", "HIGH", ["UAP", "DoD", "program"]),
+    ]
+    for name, nt, desc, rel, tags in seed_nodes:
+        add_network_node(
+            name,
+            nt,
+            desc,
+            rel,
+            tags,
+            memory_client=memory_client,
+            user_id=user_id,
+            files_cabinet=files_cabinet,
+            use_mem0_cloud=use_mem0_cloud,
+        )
+
+    def e(a, b, rt, desc, st="STRONG", ev="Mission seed graph"):
+        add_network_edge(
+            a, b, rt, desc, st, ev,
+            memory_client=memory_client,
+            user_id=user_id,
+            files_cabinet=files_cabinet,
+            use_mem0_cloud=use_mem0_cloud,
+        )
+
+    gid = network_slug_from_display_name
+    e("David Grusch", "NRO", "connected_to", "Open-source mission context link.", ev="Seed data")
+    e("David Grusch", "NGA", "connected_to", "Open-source mission context link.", ev="Seed data")
+    e("David Grusch", "AARO", "connected_to", "UAP oversight / reporting context.", ev="Seed data")
+    e("David Grusch", "House Oversight Committee", "testified_with", "Congressional UAP hearing context.", "CONFIRMED", "Seed data")
+    e("Luis Elizondo", "Pentagon", "employed_by", "Former DoD context.", "STRONG", "Seed data")
+    e("Luis Elizondo", "AATIP", "member_of", "Program association (open sources).", "STRONG", "Seed data")
+    e("Luis Elizondo", "David Grusch", "corroborates", "Disclosure-adjacent narrative alignment (OSINT).", "MODERATE", "Seed data")
+    e("Christopher Mellon", "Pentagon", "employed_by", "Former DASD(I) role (historical).", "STRONG", "Seed data")
+    e("Christopher Mellon", "Luis Elizondo", "works_with", "Advocacy / public UAP work.", "MODERATE", "Seed data")
+    e("Christopher Mellon", "David Grusch", "corroborates", "Disclosure ecosystem.", "MODERATE", "Seed data")
+    e("Ross Coulthart", "Luis Elizondo", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
+    e("Ross Coulthart", "David Grusch", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
+    e("Ross Coulthart", "Christopher Mellon", "connected_to", "Media / public commentary.", "MODERATE", "Seed data")
+    e("Marco Rubio", "AARO", "connected_to", "Public statements on UAP governance.", "WEAK", "Seed data")
+    e("Marco Rubio", "House Oversight Committee", "member_of", "Congressional role (historical/current cycles vary).", "MODERATE", "Seed data")
+    return True
+
+
+def detect_network_command(user_message: str) -> tuple[str | None, dict]:
+    """
+    Returns (command, payload) where command is summary | cluster | path | connections.
+    """
+    raw = (user_message or "").strip()
+    if not raw:
+        return None, {}
+    lower = raw.lower()
+    if re.search(r"(?i)\bshow\s+me\s+the\s+network\b", lower) or re.search(
+        r"(?i)\bmission\s+network\s+summary\b", lower
+    ):
+        return "summary", {}
+
+    m = re.search(r"(?i)\bmap\s+connections\s+(?:for|on)\s+(.+)$", raw)
+    if m:
+        return "cluster", {"name": m.group(1).strip().rstrip("?.!")}
+
+    m = re.search(r"(?i)\bwho\s+does\s+(.+?)\s+know\b", raw)
+    if m:
+        return "connections", {"name": m.group(1).strip().rstrip("?.!")}
+
+    m = re.search(
+        r"(?i)\bhow\s+is\s+(.+?)\s+connected\s+to\s+(.+)$",
+        raw,
+    )
+    if m:
+        return "path", {"from_name": m.group(1).strip(), "to_name": m.group(2).strip().rstrip("?.!")}
+
+    return None, {}
+
+
+def format_network_command_result_for_prompt(
+    command: str,
+    payload: dict,
+    *,
+    memory_client,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: FilesCabinet,
+) -> str:
+    nodes, _ = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+    if command == "summary":
+        s = get_network_summary(memory_client, user_id, use_mem0_cloud, files_cabinet)
+        return f"[Mission network summary]\n{json.dumps(s, indent=2, ensure_ascii=False)[:8000]}"
+    if command == "cluster":
+        nid = network_resolve_name_to_id(payload.get("name") or "", nodes)
+        if not nid:
+            return f"[Network] No node matched {payload.get('name')!r}."
+        cl = get_network_cluster(
+            nid,
+            depth=2,
+            memory_client=memory_client,
+            user_id=user_id,
+            use_mem0_cloud=use_mem0_cloud,
+            files_cabinet=files_cabinet,
+        )
+        return f"[Network cluster from {nid} depth=2]\n{json.dumps(cl, indent=2, ensure_ascii=False)[:8000]}"
+    if command == "connections":
+        nid = network_resolve_name_to_id(payload.get("name") or "", nodes)
+        if not nid:
+            return f"[Network] No node matched {payload.get('name')!r}."
+        c = get_node_connections(
+            nid,
+            memory_client=memory_client,
+            user_id=user_id,
+            use_mem0_cloud=use_mem0_cloud,
+            files_cabinet=files_cabinet,
+        )
+        return f"[Connections for {nid}]\n{json.dumps(c, indent=2, ensure_ascii=False)[:8000]}"
+    if command == "path":
+        a = network_resolve_name_to_id(payload.get("from_name") or "", nodes)
+        b = network_resolve_name_to_id(payload.get("to_name") or "", nodes)
+        if not a or not b:
+            return f"[Network] Could not resolve path endpoints (from={payload!r})."
+        p = find_path_between(
+            a,
+            b,
+            memory_client=memory_client,
+            user_id=user_id,
+            use_mem0_cloud=use_mem0_cloud,
+            files_cabinet=files_cabinet,
+        )
+        return f"[Shortest path {a} → {b}]\n{json.dumps(p, indent=2, ensure_ascii=False)[:8000]}"
+    return ""
+
+
 def send_briefing_email(briefing_text: str) -> bool:
     """Send the morning briefing to TYLER_EMAIL via Resend API. Uses RESEND_API_KEY."""
     import resend
@@ -4362,6 +5174,7 @@ class AngelCore:
         profile_hint = profile_requested
         research_requested = detect_research_request(user_message)
         osint_triggered, osint_target, osint_type = detect_osint_request(user_message)
+        net_cmd, net_payload = detect_network_command(user_message)
 
         cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
         if device in ("ios", "mobile_web"):
@@ -4391,6 +5204,12 @@ class AngelCore:
                 "then summarize key facts, red flags, and mission relevance; name the dossier file in OSINT Dossiers. "
                 "If the appendix says OSINT failed, explain briefly and offer to retry. "
                 "Do not claim classified or non-public sources."
+            )
+        if net_cmd:
+            system_prompt += (
+                "\n\nTyler asked about the mission connection graph (Batcomputer network). "
+                "If a JSON block labeled [Mission network …] appears in the user message, summarize it in plain language "
+                "and offer to explore clusters or paths further."
             )
 
         cc_runtime = (
@@ -4523,6 +5342,26 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if os_res.get("ok"):
                     osint_ran = True
+                    net_map_note = ""
+                    if not os_res.get("cached"):
+                        try:
+                            nm = map_osint_to_network(
+                                os_res.get("dossier_body") or "",
+                                osint_target,
+                                primary_target_type=osint_type,
+                                anthropic_client=self.anthropic_client,
+                                memory_client=self.memory_client,
+                                user_id=self.user_id,
+                                files_cabinet=self.files_cabinet,
+                                use_mem0_cloud=self._use_mem0_cloud,
+                            )
+                            if nm.get("ok"):
+                                net_map_note = (
+                                    f"\n[Mission network updated from this dossier: +{nm.get('added_nodes', 0)} nodes, "
+                                    f"+{nm.get('added_edges', 0)} edges.]"
+                                )
+                        except Exception:
+                            pass
                     cache_note = " — existing dossier reused (within 30 days)" if os_res.get("cached") else ""
                     rf = os_res.get("red_flags") or []
                     rf_txt = "\n".join(f"- {x}" for x in rf) if rf else "- (none listed)"
@@ -4532,6 +5371,7 @@ If you infer anything new about that person's preferences or dynamics, append at
                         f"'{OSINT_DOSSIERS_FOLDER}'. Mission relevance: {os_res.get('mission_relevance')}.]\n"
                         f"Red flags:\n{rf_txt}\n\n"
                         f"Full dossier text for your summary:\n{os_res.get('dossier_body', '')[:14000]}"
+                        f"{net_map_note}"
                     )
                 else:
                     augmented_user_message = (
@@ -4595,6 +5435,18 @@ If you infer anything new about that person's preferences or dynamics, append at
                 augmented_user_message = (
                     f"{web_context}\n\nOriginal user question:\n{user_message}"
                 )
+
+        if net_cmd:
+            nblock = format_network_command_result_for_prompt(
+                net_cmd,
+                net_payload,
+                memory_client=self.memory_client,
+                user_id=self.user_id,
+                use_mem0_cloud=self._use_mem0_cloud,
+                files_cabinet=self.files_cabinet,
+            )
+            if nblock.strip():
+                augmented_user_message = f"{augmented_user_message}\n\n{nblock}"
 
         model = "claude-haiku-4-5" if self.use_voice else "claude-sonnet-4-5"
         reply = call_claude(

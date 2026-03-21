@@ -39,6 +39,16 @@ from angel import (
     format_threat_intelligence_for_briefing,
     OSINT_DOSSIERS_FOLDER,
     run_osint_background,
+    NETWORK_INTEL_FOLDER,
+    add_network_node,
+    add_network_edge,
+    get_node_connections,
+    get_network_cluster,
+    find_path_between,
+    get_network_summary,
+    map_osint_to_network,
+    seed_mission_network_if_empty,
+    network_load_graph,
 )
 
 try:
@@ -434,6 +444,16 @@ def create_app() -> Flask:
     angel = AngelCore(user_id=user_id, use_voice=True)
     # Warm up memories once on startup
     angel.load_initial_memory_summary()
+    try:
+        if seed_mission_network_if_empty(
+            angel.memory_client,
+            angel.user_id,
+            angel.files_cabinet,
+            angel._use_mem0_cloud,
+        ):
+            print("[web_app] Seeded mission connection graph (first-time empty graph).", flush=True)
+    except Exception as e:
+        print(f"[web_app] Mission network seed skipped: {e}", flush=True)
     _load_expo_push_tokens_from_disk()
 
     # Log briefing email env at startup for debugging
@@ -1602,6 +1622,23 @@ def create_app() -> Flask:
                 files_cabinet=angel.files_cabinet,
                 memory_summary=memory_summary,
             )
+            if result.get("ok") and not result.get("cached") and result.get("dossier_body"):
+                try:
+                    nm = map_osint_to_network(
+                        str(result["dossier_body"]),
+                        target,
+                        primary_target_type=tt,
+                        anthropic_client=client,
+                        memory_client=angel.memory_client,
+                        user_id=angel.user_id,
+                        files_cabinet=angel.files_cabinet,
+                        use_mem0_cloud=angel._use_mem0_cloud,
+                    )
+                    result = dict(result)
+                    result["network_mapping"] = nm
+                except Exception as nex:
+                    result = dict(result)
+                    result["network_mapping_error"] = str(nex)
             if result.get("dossier_body"):
                 result = dict(result)
                 result["dossier_body"] = _sanitize_text(str(result["dossier_body"]))
@@ -1638,6 +1675,166 @@ def create_app() -> Flask:
             if (rec.get("folder") or "").strip().lower() != OSINT_DOSSIERS_FOLDER.lower():
                 return jsonify({"ok": False, "error": "Not an OSINT dossier file."}), 404
             return jsonify({"ok": True, "dossier": rec})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Mission connection graph (network_node / network_edge + Network Intelligence files) ---
+
+    @app.route("/api/network/summary", methods=["GET"])
+    def api_network_summary():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            s = get_network_summary(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+                angel.files_cabinet,
+            )
+            return jsonify({"ok": True, **s})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/network/nodes", methods=["GET"])
+    def api_network_nodes():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            nodes, _ = network_load_graph(
+                angel.memory_client,
+                angel.user_id,
+                angel._use_mem0_cloud,
+                angel.files_cabinet,
+            )
+            return jsonify({"ok": True, "nodes": list(nodes.values())})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/network/node/<path:node_id>", methods=["GET"])
+    def api_network_node_get(node_id):
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            data = get_node_connections(
+                node_id,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            if not data:
+                return jsonify({"ok": False, "error": f"Unknown node {node_id!r}."}), 404
+            return jsonify({"ok": True, **data})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/network/cluster/<path:node_id>", methods=["GET"])
+    def api_network_cluster_get(node_id):
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        depth = request.args.get("depth", "2")
+        try:
+            d = int(depth)
+        except ValueError:
+            d = 2
+        try:
+            cl = get_network_cluster(
+                node_id,
+                depth=d,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            if not cl:
+                return jsonify({"ok": False, "error": f"Unknown node {node_id!r}."}), 404
+            return jsonify({"ok": True, "cluster": cl})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/network/path", methods=["GET"])
+    def api_network_path():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        a = (request.args.get("from") or request.args.get("from_id") or "").strip()
+        b = (request.args.get("to") or request.args.get("to_id") or "").strip()
+        if not a or not b:
+            return jsonify({"ok": False, "error": "Query params 'from' and 'to' (node ids) required."}), 400
+        try:
+            p = find_path_between(
+                a,
+                b,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify({"ok": True, **p})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/network/node/add", methods=["POST"])
+    def api_network_node_add():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "JSON 'name' required."}), 400
+        nt = (data.get("node_type") or "person").strip().lower()
+        desc = (data.get("description") or "").strip()
+        rel = (data.get("relevance") or "MEDIUM").strip().upper()
+        tags = data.get("tags")
+        if tags is not None and not isinstance(tags, list):
+            tags = [str(tags)]
+        try:
+            nid_raw = (data.get("id") or data.get("node_id") or "").strip() or None
+            node = add_network_node(
+                name,
+                nt,
+                desc,
+                rel,
+                tags,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                files_cabinet=angel.files_cabinet,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                node_id_override=nid_raw,
+            )
+            return jsonify({"ok": True, "node": node})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/network/edge/add", methods=["POST"])
+    def api_network_edge_add():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        src = (data.get("source_id") or data.get("source") or "").strip()
+        tgt = (data.get("target_id") or data.get("target") or "").strip()
+        if not src or not tgt:
+            return jsonify({"ok": False, "error": "source_id and target_id required."}), 400
+        try:
+            edge = add_network_edge(
+                src,
+                tgt,
+                data.get("relationship_type") or "connected_to",
+                data.get("description") or "",
+                data.get("strength") or "MODERATE",
+                data.get("source_evidence") or data.get("evidence") or "",
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                files_cabinet=angel.files_cabinet,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, "edge": edge})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
