@@ -1,5 +1,3 @@
-from gevent import monkey; monkey.patch_all()
-
 import base64
 import json
 import os
@@ -46,7 +44,7 @@ check_in_generated_at = None
 last_activity_at = time.time()
 angel = None
 
-# Flask-SocketIO (initialized in create_app; gevent worker required in production — see Procfile)
+# Flask-SocketIO (initialized in create_app; async_mode threading + gunicorn --threads — see Procfile)
 socketio: SocketIO | None = None
 # sid -> {"device": str, "turns": list[tuple[str, str]]} for multi-turn Claude context
 SOCKET_SESSIONS: dict[str, dict] = {}
@@ -348,7 +346,7 @@ def create_app() -> Flask:
     socketio = SocketIO(
         app,
         cors_allowed_origins=os.getenv("SOCKETIO_CORS", "*"),
-        async_mode="gevent",
+        async_mode="threading",
         logger=os.getenv("SOCKETIO_DEBUG", "").lower() in ("1", "true", "yes"),
         engineio_logger=os.getenv("SOCKETIO_DEBUG", "").lower() in ("1", "true", "yes"),
     )
@@ -1288,7 +1286,7 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    # Local `python web_app.py` — gevent monkey_patch runs at module import above.
+    # Local `python web_app.py` (production uses gunicorn; see Procfile).
     socketio.run(
         app,
         host="0.0.0.0",

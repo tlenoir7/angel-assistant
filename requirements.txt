@@ -1,8 +1,6 @@
 flask
 flask-socketio>=5.6.0
 python-socketio>=5.16.0
-gevent>=24.0.0
-gevent-websocket>=0.10.1
 gunicorn
 anthropic
 mem0ai
