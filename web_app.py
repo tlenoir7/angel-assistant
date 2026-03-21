@@ -47,7 +47,7 @@ from angel import (
     find_path_between,
     get_network_summary,
     map_osint_to_network,
-    seed_mission_network_if_empty,
+    schedule_mission_network_seed_background,
     network_load_graph,
 )
 
@@ -444,16 +444,12 @@ def create_app() -> Flask:
     angel = AngelCore(user_id=user_id, use_voice=True)
     # Warm up memories once on startup
     angel.load_initial_memory_summary()
-    try:
-        if seed_mission_network_if_empty(
-            angel.memory_client,
-            angel.user_id,
-            angel.files_cabinet,
-            angel._use_mem0_cloud,
-        ):
-            print("[web_app] Seeded mission connection graph (first-time empty graph).", flush=True)
-    except Exception as e:
-        print(f"[web_app] Mission network seed skipped: {e}", flush=True)
+    schedule_mission_network_seed_background(
+        angel.memory_client,
+        angel.user_id,
+        angel.files_cabinet,
+        angel._use_mem0_cloud,
+    )
     _load_expo_push_tokens_from_disk()
 
     # Log briefing email env at startup for debugging

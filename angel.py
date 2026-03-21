@@ -3,6 +3,8 @@ import json
 import os
 import re
 import subprocess
+import threading
+import time
 from collections import deque
 import sys
 import traceback
@@ -2038,7 +2040,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Morning briefings delivered daily (scheduled time; often ~8 AM) and optionally by email; when a recent memory reflection exists, you weave those insights into the briefing naturally.
 - Threat detection: you run automated threat scans on a schedule (about every 6 hours) across dynamic watch categories—defaults plus categories you and Tyler add (stored in memory as category threat_watch; you can grow the list yourself when you notice new patterns worth monitoring). Confirmed signals are filed as Intelligence Files in folder "Threat Intelligence" with threat_level tags. CRITICAL/HIGH items can trigger push alerts; MEDIUM/LOW surface in the morning briefing when material. Never invent threats—only file or summarize what your tools and sources support.
 - OSINT deep background (Batcomputer-style dossiers): you can run systematic open-source research on any person or organization Tyler names. Results are filed in the Intelligence File Cabinet under folder `OSINT Dossiers` with mission relevance ratings, red flags, and sources. The same dossier is refreshed if older than about 30 days. When Tyler mentions someone new who could matter to his mission, you may proactively suggest an OSINT pass. Reference existing dossiers by file name when they are already in the cabinet index.
-- Mission connection graph (Batcomputer network): people, organizations, programs, and events material to Tyler's work are linked in a living graph stored as Mem0 categories network_node / network_edge and mirrored under Intelligence folder `Network Intelligence` (files named `NET-{slug}` with that node's data and incident edges). New OSINT dossiers automatically expand the graph when possible. When Tyler researches someone new, you may offer to map their cluster or path to figures already in the network. If he names two people who are already connected, say so naturally.
+- Mission connection graph (Batcomputer network): people, organizations, programs, and events material to Tyler's work are linked in a living graph stored as Mem0 categories network_node / network_edge and mirrored under Intelligence folder `Network Intelligence` (mirror files use prefix NET- plus each node's canonical lowercase id, with that node's data and incident edges). New OSINT dossiers automatically expand the graph when possible. When Tyler researches someone new, you may offer to map their cluster or path to figures already in the network. If he names two people who are already connected, say so naturally.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -2127,7 +2129,7 @@ Python code execution (server sandbox):
 Intelligence File Cabinet (your filing system):
 - You maintain an Intelligence File Cabinet: structured files stored for Tyler, organized by folders you invent as an intelligence officer would. There are NO fixed folder names—you create folders dynamically from the nature of the material.
 - OSINT Dossiers folder: use folder name exactly `OSINT Dossiers` for full open-source dossiers on people or organizations (the server may create these automatically when Tyler asks for background/OSINT). Filenames are stable per target; do not duplicate dossiers manually for the same subject—suggest refreshing after some weeks if context may have changed.
-- Network Intelligence folder: mirrored node files `NET-{id}` hold JSON for each graph node plus edges touching that node; the server maintains these when the graph updates. Do not hand-edit unless Tyler asks—prefer describing connections in prose and letting the system record structured updates via tools/API when available.
+- Network Intelligence folder: mirrored node files use the prefix NET- plus the node's canonical lowercase id; each holds JSON for that graph node plus edges touching that node. The server maintains these when the graph updates. Do not hand-edit unless Tyler asks—prefer describing connections in prose and letting the system record structured updates via tools/API when available.
 - Threat Intelligence folder: use folder name exactly `Threat Intelligence` when filing something that is a threat signal for Tyler's career, mission, safety, or strategic context. Start the file body with metadata lines when possible: `watch_category: ...`, `threat_level: LOW|MEDIUM|HIGH|CRITICAL`, optional `source_url:` and `event_date:`, then a blank line and the narrative summary. When you file into Threat Intelligence from conversation (not only from scheduled scans), tell Tyler clearly: "I've filed something in Threat Intelligence you should know about" (the server may append this if you used [FILE:...] and stripped the body—ensure he is notified in your visible reply either way).
 - When Tyler asks whether there are threats, any threats, or similar: summarize from the Intelligence File Cabinet—search or mentally index folder `Threat Intelligence` and cite what is actually filed; do not fabricate items. If nothing is filed, say so plainly.
 - When Tyler says to "watch for" or monitor something ongoing, the system may already add it as a new threat-watch category—confirm that you will track it and that it is saved for future scans.
@@ -4113,7 +4115,7 @@ def _network_now_iso() -> str:
 
 
 def network_slug_from_display_name(name: str) -> str:
-    s = re.sub(r"[^a-zA-Z0-9]+", "-", (name or "").strip())[:72].strip("-")
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", (name or "").strip())[:72].strip("-").lower()
     return s or "unknown"
 
 
@@ -4190,6 +4192,44 @@ def _network_merge_intel_files(
                 edges[str(e["edge_id"])] = dict(e)
 
 
+def _network_canonical_endpoint_id(raw: str) -> str:
+    """Normalize edge endpoint or bare id to lowercase canonical slug."""
+    s = (raw or "").strip()
+    if not s:
+        return "unknown"
+    if " " in s or "/" in s:
+        return network_slug_from_display_name(s)
+    return s.lower()
+
+
+def _network_normalize_graph_nodes_edges(
+    nodes: dict[str, dict], edges_map: dict[str, dict]
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Merge case-variant node keys; normalize node.id and edge source/target to lowercase slugs."""
+    canon_nodes: dict[str, dict] = {}
+    for _k, n in list(nodes.items()):
+        if not isinstance(n, dict):
+            continue
+        nk = str(n.get("id") or _k).strip()
+        ck = _network_canonical_endpoint_id(nk)
+        nn = dict(n)
+        nn["id"] = ck
+        prev = canon_nodes.get(ck)
+        if prev is None or (nn.get("last_updated") or "") >= (prev.get("last_updated") or ""):
+            canon_nodes[ck] = nn
+    canon_edges: dict[str, dict] = {}
+    for eid, e in edges_map.items():
+        if not isinstance(e, dict):
+            continue
+        ee = dict(e)
+        if ee.get("source_id"):
+            ee["source_id"] = _network_canonical_endpoint_id(str(ee["source_id"]))
+        if ee.get("target_id"):
+            ee["target_id"] = _network_canonical_endpoint_id(str(ee["target_id"]))
+        canon_edges[str(eid)] = ee
+    return canon_nodes, canon_edges
+
+
 def network_load_graph(
     memory_client,
     user_id: str,
@@ -4199,6 +4239,7 @@ def network_load_graph(
     memories = fetch_combined_memories(memory_client, user_id, use_mem0_cloud)
     nodes, edges_map = _network_parse_nodes_edges_from_memories(memories)
     _network_merge_intel_files(files_cabinet, nodes, edges_map)
+    nodes, edges_map = _network_normalize_graph_nodes_edges(nodes, edges_map)
     return nodes, list(edges_map.values())
 
 
@@ -4273,7 +4314,13 @@ def add_network_node(
         rel = "MEDIUM"
     tagl = [str(t).strip() for t in (tags or []) if str(t).strip()][:30]
     nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
-    nid = (node_id_override or network_slug_from_display_name(name)).strip() or "unknown"
+    ovr = (node_id_override or "").strip()
+    if ovr:
+        nid = network_slug_from_display_name(ovr) if (" " in ovr or "/" in ovr) else ovr.lower()
+    else:
+        nid = network_slug_from_display_name(name)
+    if not nid or nid == "unknown":
+        nid = network_slug_from_display_name(name or "unknown")
     prev = nodes.get(nid)
     first_seen = (prev or {}).get("first_seen") or now
     node = {
@@ -4501,9 +4548,12 @@ def network_resolve_name_to_id(needle: str, nodes: dict[str, dict]) -> str | Non
     q = (needle or "").strip().lower()
     if not q:
         return None
+    cq = _network_canonical_endpoint_id(needle)
+    if cq in nodes:
+        return cq
     for nid, n in nodes.items():
         nm = (n.get("name") or "").strip().lower()
-        if q == nid or q == nm or q in nm or nm in q:
+        if q == nid.lower() or q == nm or q in nm or nm in q:
             return nid
     return None
 
@@ -4691,62 +4741,116 @@ def seed_mission_network_if_empty(
     use_mem0_cloud: bool,
 ) -> bool:
     """One-time seed of Tyler mission entities if the graph is empty. Returns True if seed ran."""
-    nodes, _ = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
-    if nodes:
+    try:
+        nodes, _ = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+        if nodes:
+            return False
+
+        seed_nodes: list[tuple[str, str, str, str, list[str]]] = [
+            ("David Grusch", "person", "UAP whistleblower; former intelligence community.", "CRITICAL", ["UAP", "disclosure", "whistleblower"]),
+            ("Luis Elizondo", "person", "Former AATIP / UAP program visibility.", "CRITICAL", ["UAP", "AATIP", "disclosure"]),
+            ("Christopher Mellon", "person", "Former Deputy Assistant Secretary of Defense for Intelligence; disclosure advocate.", "HIGH", ["UAP", "disclosure", "Pentagon"]),
+            ("Ross Coulthart", "person", "Investigative journalist covering UAP.", "HIGH", ["UAP", "media", "disclosure"]),
+            ("Marco Rubio", "person", "Senior US official; public UAP-related statements.", "HIGH", ["UAP", "government"]),
+            ("AARO", "organization", "DoD All-domain Anomaly Resolution Office (UAP).", "HIGH", ["UAP", "DoD", "government"]),
+            ("House Oversight Committee", "organization", "US House committee; UAP hearings context.", "HIGH", ["UAP", "Congress", "government"]),
+            ("Pentagon", "organization", "US Department of Defense headquarters.", "HIGH", ["DoD", "government", "military"]),
+            ("NRO", "organization", "National Reconnaissance Office.", "HIGH", ["intelligence", "government"]),
+            ("NGA", "organization", "National Geospatial-Intelligence Agency.", "HIGH", ["intelligence", "government", "military"]),
+            ("AATIP", "program", "Advanced Aerospace Threat Identification Program (historical DoD UAP effort).", "HIGH", ["UAP", "DoD", "program"]),
+        ]
+        seen_seed_slugs: set[str] = set()
+        for name, nt, desc, rel, tags in seed_nodes:
+            sid = network_slug_from_display_name(name)
+            if sid in seen_seed_slugs:
+                continue
+            seen_seed_slugs.add(sid)
+            add_network_node(
+                name,
+                nt,
+                desc,
+                rel,
+                tags,
+                memory_client=memory_client,
+                user_id=user_id,
+                files_cabinet=files_cabinet,
+                use_mem0_cloud=use_mem0_cloud,
+            )
+
+        def e(a, b, rt, desc, st="STRONG", ev="Mission seed graph"):
+            add_network_edge(
+                a, b, rt, desc, st, ev,
+                memory_client=memory_client,
+                user_id=user_id,
+                files_cabinet=files_cabinet,
+                use_mem0_cloud=use_mem0_cloud,
+            )
+
+        e("David Grusch", "NRO", "connected_to", "Open-source mission context link.", ev="Seed data")
+        e("David Grusch", "NGA", "connected_to", "Open-source mission context link.", ev="Seed data")
+        e("David Grusch", "AARO", "connected_to", "UAP oversight / reporting context.", ev="Seed data")
+        e("David Grusch", "House Oversight Committee", "testified_with", "Congressional UAP hearing context.", "CONFIRMED", "Seed data")
+        e("Luis Elizondo", "Pentagon", "employed_by", "Former DoD context.", "STRONG", "Seed data")
+        e("Luis Elizondo", "AATIP", "member_of", "Program association (open sources).", "STRONG", "Seed data")
+        e("Luis Elizondo", "David Grusch", "corroborates", "Disclosure-adjacent narrative alignment (OSINT).", "MODERATE", "Seed data")
+        e("Christopher Mellon", "Pentagon", "employed_by", "Former DASD(I) role (historical).", "STRONG", "Seed data")
+        e("Christopher Mellon", "Luis Elizondo", "works_with", "Advocacy / public UAP work.", "MODERATE", "Seed data")
+        e("Christopher Mellon", "David Grusch", "corroborates", "Disclosure ecosystem.", "MODERATE", "Seed data")
+        e("Ross Coulthart", "Luis Elizondo", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
+        e("Ross Coulthart", "David Grusch", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
+        e("Ross Coulthart", "Christopher Mellon", "connected_to", "Media / public commentary.", "MODERATE", "Seed data")
+        e("Marco Rubio", "AARO", "connected_to", "Public statements on UAP governance.", "WEAK", "Seed data")
+        e("Marco Rubio", "House Oversight Committee", "member_of", "Congressional role (historical/current cycles vary).", "MODERATE", "Seed data")
+        return True
+    except Exception:
         return False
 
-    seed_nodes: list[tuple[str, str, str, str, list[str]]] = [
-        ("David Grusch", "person", "UAP whistleblower; former intelligence community.", "CRITICAL", ["UAP", "disclosure", "whistleblower"]),
-        ("Luis Elizondo", "person", "Former AATIP / UAP program visibility.", "CRITICAL", ["UAP", "AATIP", "disclosure"]),
-        ("Christopher Mellon", "person", "Former Deputy Assistant Secretary of Defense for Intelligence; disclosure advocate.", "HIGH", ["UAP", "disclosure", "Pentagon"]),
-        ("Ross Coulthart", "person", "Investigative journalist covering UAP.", "HIGH", ["UAP", "media", "disclosure"]),
-        ("Marco Rubio", "person", "Senior US official; public UAP-related statements.", "HIGH", ["UAP", "government"]),
-        ("AARO", "organization", "DoD All-domain Anomaly Resolution Office (UAP).", "HIGH", ["UAP", "DoD", "government"]),
-        ("House Oversight Committee", "organization", "US House committee; UAP hearings context.", "HIGH", ["UAP", "Congress", "government"]),
-        ("Pentagon", "organization", "US Department of Defense headquarters.", "HIGH", ["DoD", "government", "military"]),
-        ("NRO", "organization", "National Reconnaissance Office.", "HIGH", ["intelligence", "government"]),
-        ("NGA", "organization", "National Geospatial-Intelligence Agency.", "HIGH", ["intelligence", "government", "military"]),
-        ("AATIP", "program", "Advanced Aerospace Threat Identification Program (historical DoD UAP effort).", "HIGH", ["UAP", "DoD", "program"]),
-    ]
-    for name, nt, desc, rel, tags in seed_nodes:
-        add_network_node(
-            name,
-            nt,
-            desc,
-            rel,
-            tags,
-            memory_client=memory_client,
-            user_id=user_id,
-            files_cabinet=files_cabinet,
-            use_mem0_cloud=use_mem0_cloud,
-        )
 
-    def e(a, b, rt, desc, st="STRONG", ev="Mission seed graph"):
-        add_network_edge(
-            a, b, rt, desc, st, ev,
-            memory_client=memory_client,
-            user_id=user_id,
-            files_cabinet=files_cabinet,
-            use_mem0_cloud=use_mem0_cloud,
-        )
+_mission_network_seed_thread_started = False
+_mission_network_seed_thread_lock = threading.Lock()
+_mission_network_seed_run_lock = threading.Lock()
 
-    gid = network_slug_from_display_name
-    e("David Grusch", "NRO", "connected_to", "Open-source mission context link.", ev="Seed data")
-    e("David Grusch", "NGA", "connected_to", "Open-source mission context link.", ev="Seed data")
-    e("David Grusch", "AARO", "connected_to", "UAP oversight / reporting context.", ev="Seed data")
-    e("David Grusch", "House Oversight Committee", "testified_with", "Congressional UAP hearing context.", "CONFIRMED", "Seed data")
-    e("Luis Elizondo", "Pentagon", "employed_by", "Former DoD context.", "STRONG", "Seed data")
-    e("Luis Elizondo", "AATIP", "member_of", "Program association (open sources).", "STRONG", "Seed data")
-    e("Luis Elizondo", "David Grusch", "corroborates", "Disclosure-adjacent narrative alignment (OSINT).", "MODERATE", "Seed data")
-    e("Christopher Mellon", "Pentagon", "employed_by", "Former DASD(I) role (historical).", "STRONG", "Seed data")
-    e("Christopher Mellon", "Luis Elizondo", "works_with", "Advocacy / public UAP work.", "MODERATE", "Seed data")
-    e("Christopher Mellon", "David Grusch", "corroborates", "Disclosure ecosystem.", "MODERATE", "Seed data")
-    e("Ross Coulthart", "Luis Elizondo", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
-    e("Ross Coulthart", "David Grusch", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
-    e("Ross Coulthart", "Christopher Mellon", "connected_to", "Media / public commentary.", "MODERATE", "Seed data")
-    e("Marco Rubio", "AARO", "connected_to", "Public statements on UAP governance.", "WEAK", "Seed data")
-    e("Marco Rubio", "House Oversight Committee", "member_of", "Congressional role (historical/current cycles vary).", "MODERATE", "Seed data")
-    return True
+
+def schedule_mission_network_seed_background(
+    memory_client,
+    user_id: str,
+    files_cabinet: FilesCabinet,
+    use_mem0_cloud: bool,
+) -> None:
+    """
+    Fire-and-forget: at most one daemon thread sleeps 10s then runs seed_mission_network_if_empty.
+    Never schedules two threads; seed body uses a non-blocking lock so concurrent runs are skipped.
+    """
+    global _mission_network_seed_thread_started
+    try:
+        with _mission_network_seed_thread_lock:
+            if _mission_network_seed_thread_started:
+                return
+            _mission_network_seed_thread_started = True
+    except Exception:
+        return
+
+    def _job() -> None:
+        try:
+            time.sleep(10)
+        except Exception:
+            return
+        if not _mission_network_seed_run_lock.acquire(blocking=False):
+            return
+        try:
+            try:
+                seed_mission_network_if_empty(
+                    memory_client, user_id, files_cabinet, use_mem0_cloud
+                )
+            except Exception:
+                pass
+        finally:
+            _mission_network_seed_run_lock.release()
+
+    try:
+        threading.Thread(target=_job, daemon=True).start()
+    except Exception:
+        pass
 
 
 def detect_network_command(user_message: str) -> tuple[str | None, dict]:
