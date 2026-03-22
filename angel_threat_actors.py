@@ -154,7 +154,7 @@ def _threat_actor_upsert_memory(
             except TypeError:
                 memory_client.add(messages, user_id=user_id, metadata=dict(meta))
     except Exception as e:
-        _log.warning(
+        _log.debug(
             "threat actor Mem0 add failed (local JSON already saved) actor_id=%s: %s",
             actor_id,
             e,

@@ -260,14 +260,14 @@ class Mem0CloudClient:
             if resp.status_code not in (200, 204):
                 resp.raise_for_status()
         except requests.exceptions.Timeout:
-            _mem0_log.warning("Mem0 delete timeout memory_id=%s…", mid[:24])
+            _mem0_log.debug("Mem0 delete timeout memory_id=%s…", mid[:24])
         except requests.exceptions.HTTPError as e:
             code = getattr(e.response, "status_code", None) if e.response is not None else None
             if code == 404:
                 return
-            _mem0_log.warning("Mem0 delete HTTP %s memory_id=%s…: %s", code, mid[:24], e)
+            _mem0_log.debug("Mem0 delete HTTP %s memory_id=%s…: %s", code, mid[:24], e)
         except requests.exceptions.RequestException as e:
-            _mem0_log.warning("Mem0 delete failed memory_id=%s…: %s", mid[:24], e)
+            _mem0_log.debug("Mem0 delete failed memory_id=%s…: %s", mid[:24], e)
 
 
 # Monkey-patch Mem0's Anthropic LLM so it does not send top_p (Anthropic forbids
@@ -699,7 +699,7 @@ class FilesCabinet:
                 try:
                     self.memory_client.delete_memory(mid)
                 except Exception as e:
-                    _mem0_log.warning("FilesCabinet Mem0 delete id=%s…: %s", mid[:24], e)
+                    _mem0_log.debug("FilesCabinet Mem0 delete id=%s…: %s", mid[:24], e)
                 return
             # Fallback: search cloud memories by file_name
             if not isinstance(self.memory_client, Mem0CloudClient):
@@ -710,7 +710,7 @@ class FilesCabinet:
             try:
                 raw = self.memory_client.get_all(user_id=self.user_id)
             except Exception as e:
-                _mem0_log.warning("FilesCabinet Mem0 delete scan get_all: %s", e)
+                _mem0_log.debug("FilesCabinet Mem0 delete scan get_all: %s", e)
                 return
             results = raw.get("results") if isinstance(raw, dict) else raw
             if not isinstance(results, list):
@@ -730,9 +730,9 @@ class FilesCabinet:
                     try:
                         self.memory_client.delete_memory(rid)
                     except Exception as e:
-                        _mem0_log.warning("FilesCabinet Mem0 delete fallback id=%s…: %s", rid[:24], e)
+                        _mem0_log.debug("FilesCabinet Mem0 delete fallback id=%s…: %s", rid[:24], e)
         except Exception as e:
-            _mem0_log.warning("FilesCabinet _delete_mem0_for_entry: %s", e)
+            _mem0_log.debug("FilesCabinet _delete_mem0_for_entry: %s", e)
 
     def create_file(
         self,
@@ -5085,7 +5085,7 @@ def _purge_mem0_network_graph_memories(
                     deleted += 1
                     found_any = True
                 except Exception as e:
-                    _mem0_log.warning(
+                    _mem0_log.debug(
                         "purge network graph Mem0 delete skipped id=%s…: %s",
                         str(rid)[:24],
                         e,
@@ -5253,25 +5253,28 @@ def seed_mission_network_if_empty(
                 "Seed data",
             ),
         ]
+        _mr_stored: list[dict[str, str | None]] = []
         for src_raw, tgt_raw, rt, desc, st, ev in _mr_edges:
             sid = _network_normalize_node_id(src_raw)
             tid = _network_normalize_node_id(tgt_raw)
-            _mission_graph_log.info(
-                "seed_mission_network_if_empty: Marco Rubio edge input %r -> %r (%s) "
-                "normalized source_id=%s target_id=%s",
-                src_raw,
-                tgt_raw,
-                rt,
-                sid,
-                tid,
-            )
             edge_out = e(src_raw, tgt_raw, rt, desc, st, ev)
-            _mission_graph_log.info(
-                "seed_mission_network_if_empty: Marco Rubio edge stored edge_id=%s source_id=%s target_id=%s",
-                edge_out.get("edge_id"),
-                edge_out.get("source_id"),
-                edge_out.get("target_id"),
+            _mr_stored.append(
+                {
+                    "edge_id": edge_out.get("edge_id"),
+                    "source_id": edge_out.get("source_id"),
+                    "target_id": edge_out.get("target_id"),
+                    "rel": rt,
+                }
             )
+        _mission_graph_log.info(
+            "seed_mission_network_if_empty: Marco Rubio cluster complete, %d edges stored",
+            len(_mr_stored),
+        )
+        _mission_graph_log.debug(
+            "seed_mission_network_if_empty: Marco Rubio edge_ids=%s detail=%s",
+            [x.get("edge_id") for x in _mr_stored],
+            _mr_stored,
+        )
         return True
     except Exception:
         _mission_graph_log.exception("seed_mission_network_if_empty failed")

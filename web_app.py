@@ -108,6 +108,7 @@ def _network_reset_worker(
     use_mem0_cloud: bool,
 ) -> None:
     """Runs in a daemon thread; never raises."""
+    print("[network_reset_worker] thread START", flush=True)
     summary: dict | None = None
     err: str | None = None
     try:
@@ -117,12 +118,21 @@ def _network_reset_worker(
             files_cabinet,
             use_mem0_cloud,
         )
+        print(
+            "[network_reset_worker] reset_mission_network_and_reseed RETURNED "
+            f"ok={summary.get('ok') if isinstance(summary, dict) else None!r} "
+            f"nodes_after={summary.get('nodes_after') if isinstance(summary, dict) else None} "
+            f"edges_after={summary.get('edges_after') if isinstance(summary, dict) else None}",
+            flush=True,
+        )
     except Exception as ex:
         err = str(ex)
+        print(f"[network_reset_worker] reset_mission_network_and_reseed RAISED: {err!r}", flush=True)
         traceback.print_exc()
     finally:
+        print("[network_reset_worker] finally block ENTER", flush=True)
         now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        _log.info(
+        _log.debug(
             "network reset worker: thread completing (summary=%s err=%s)",
             "ok" if isinstance(summary, dict) and summary.get("ok") else None,
             err,
@@ -130,6 +140,11 @@ def _network_reset_worker(
         try:
             with _network_reset_lock:
                 _network_reset_status["in_progress"] = False
+                print(
+                    "[network_reset_worker] set in_progress=False "
+                    f"last_reset_at={now} summary_type={type(summary).__name__}",
+                    flush=True,
+                )
                 _network_reset_status["last_reset_at"] = now
                 if isinstance(summary, dict):
                     _network_reset_status["last_success"] = bool(summary.get("ok"))
@@ -142,17 +157,20 @@ def _network_reset_worker(
                     _network_reset_status["last_edges_after"] = None
                     _network_reset_status["last_error"] = err or "reset thread failed"
         except Exception as ex:
+            print(f"[network_reset_worker] EXCEPTION updating status dict: {ex!r}", flush=True)
             _log.exception("network reset worker: failed to update status dict: %s", ex)
             try:
                 with _network_reset_lock:
                     _network_reset_status["in_progress"] = False
+                    print("[network_reset_worker] set in_progress=False (fallback after status dict error)", flush=True)
                     _network_reset_status["last_error"] = (
                         _network_reset_status.get("last_error") or str(ex)
                     )
             except Exception:
+                print("[network_reset_worker] EXCEPTION in fallback in_progress=False", flush=True)
                 _log.exception("network reset worker: could not force in_progress=False")
         else:
-            _log.info("network reset worker: status updated; in_progress=False at %s", now)
+            _log.debug("network reset worker: status updated; in_progress=False at %s", now)
 
 
 # Expo push: in-memory + push_tokens.json (same directory as this module)
