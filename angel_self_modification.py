@@ -12,11 +12,9 @@ import threading
 from datetime import UTC, datetime
 from typing import Any
 
-SELF_MOD_FOLDER = "Self Modifications"
+from angel import CATEGORY_SELF_OBSERVATION, CATEGORY_SELF_MODIFICATION
 
-# Lazy-bound from angel on first use
-CATEGORY_SELF_OBSERVATION = "self_observation"
-CATEGORY_SELF_MODIFICATION = "self_modification"
+SELF_MOD_FOLDER = "Self Modifications"
 
 _FORBIDDEN_SUBSTRINGS = (
     "remove capability",
@@ -29,6 +27,31 @@ _FORBIDDEN_SUBSTRINGS = (
     "core values",
     "override your values",
 )
+
+def _memory_category_from_item(m: dict) -> str | None:
+    """
+    Category string for a memory row — same logical field as angel.add_structured_memory uses.
+    Handles Mem0 shapes: metadata dict, metadata as JSON string, or top-level category.
+    """
+    if not isinstance(m, dict):
+        return None
+    meta = m.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    c = meta.get("category")
+    if c is None:
+        c = meta.get("Category")
+    if c is None:
+        c = m.get("category")
+    if c is not None and str(c).strip():
+        return str(c).strip()
+    return None
+
 
 _STOPWORDS = frozenset(
     """
@@ -123,6 +146,11 @@ def record_turn_observation(
     """Heuristic observation for this turn; stored as category self_observation (compact)."""
     from angel import add_structured_memory
 
+    print(
+        "[selfmod] add_structured_memory (observation) category_passed="
+        f"{CATEGORY_SELF_OBSERVATION!r} — must equal angel.CATEGORY_SELF_OBSERVATION",
+        flush=True,
+    )
     u = (user_message or "").strip()
     if not u:
         return
@@ -189,15 +217,29 @@ def _normalize_memories(memories: Any) -> list[dict]:
 
 def iter_self_modifications(memories: list) -> list[dict[str, Any]]:
     """Latest record per modification_id (Mem0 may store multiple versions)."""
-    from angel import CATEGORY_SELF_MODIFICATION as _sm_cat
-
     n_in = len(memories) if isinstance(memories, list) else 0
+    norm = _normalize_memories(memories)
+    sample_cats: list[str | None] = []
+    for m in norm[:24]:
+        if isinstance(m, dict):
+            sample_cats.append(_memory_category_from_item(m))
+        else:
+            sample_cats.append(None)
+    print(
+        "[selfmod] iter_self_modifications: filter_category="
+        f"{CATEGORY_SELF_MODIFICATION!r} (angel.CATEGORY_SELF_MODIFICATION) "
+        f"sample_categories_first_rows={sample_cats!r}",
+        flush=True,
+    )
+
     by_id: dict[str, dict[str, Any]] = {}
     n_cat = 0
     n_parse_fail = 0
-    for m in _normalize_memories(memories):
-        meta = m.get("metadata") if isinstance(m, dict) else {}
-        if not isinstance(meta, dict) or meta.get("category") != _sm_cat:
+    for m in norm:
+        if not isinstance(m, dict):
+            continue
+        cat = _memory_category_from_item(m)
+        if cat != CATEGORY_SELF_MODIFICATION:
             continue
         n_cat += 1
         raw = (m.get("memory") or m.get("data") or "").strip()
@@ -220,7 +262,7 @@ def iter_self_modifications(memories: list) -> list[dict[str, Any]]:
             continue
     print(
         f"[selfmod] iter_self_modifications: raw_memories={n_in} "
-        f"category_self_modification={n_cat} parse_fail={n_parse_fail} unique_ids={len(by_id)}",
+        f"rows_matching_self_modification_category={n_cat} parse_fail={n_parse_fail} unique_ids={len(by_id)}",
         flush=True,
     )
     return list(by_id.values())
@@ -241,15 +283,18 @@ def _save_modification_memory(
     mid = (record.get("modification_id") or "").strip()
     title = (record.get("title") or "").strip()
     print(f"[selfmod] saving proposal: {mid!r} {title!r}", flush=True)
+    print(
+        "[selfmod] add_structured_memory (proposal) category_passed="
+        f"{CATEGORY_SELF_MODIFICATION!r} — must equal angel.CATEGORY_SELF_MODIFICATION",
+        flush=True,
+    )
 
     def _count_self_mod_rows() -> int:
         try:
             return sum(
                 1
                 for e in _load_local_memory_entries(user_id)
-                if isinstance(e, dict)
-                and isinstance(e.get("metadata"), dict)
-                and e["metadata"].get("category") == CATEGORY_SELF_MODIFICATION
+                if isinstance(e, dict) and _memory_category_from_item(e) == CATEGORY_SELF_MODIFICATION
             )
         except Exception:
             return -1
@@ -547,10 +592,9 @@ def run_self_modification_analysis(
     memories = fetch_combined_memories(memory_client, user_id, use_mem0_cloud)
     filtered: list = []
     for m in _normalize_memories(memories):
-        meta = m.get("metadata") if isinstance(m, dict) else {}
-        if not isinstance(meta, dict):
+        if not isinstance(m, dict):
             continue
-        cat = meta.get("category")
+        cat = _memory_category_from_item(m)
         if cat in (CATEGORY_SELF_OBSERVATION, CATEGORY_SELF_MODIFICATION, CATEGORY_REFLECTION):
             continue
         filtered.append(m)
@@ -558,11 +602,13 @@ def run_self_modification_analysis(
     summary = build_memory_summary_with_sections(filtered, user_message=None)
     obs_lines: list[str] = []
     for m in _normalize_memories(memories):
-        meta = m.get("metadata") if isinstance(m, dict) else {}
-        if isinstance(meta, dict) and meta.get("category") == CATEGORY_SELF_OBSERVATION:
-            raw = (m.get("memory") or m.get("data") or "").strip()
-            if raw:
-                obs_lines.append(raw[:500])
+        if not isinstance(m, dict):
+            continue
+        if _memory_category_from_item(m) != CATEGORY_SELF_OBSERVATION:
+            continue
+        raw = (m.get("memory") or m.get("data") or "").strip()
+        if raw:
+            obs_lines.append(raw[:500])
     obs_blob = "\n".join(obs_lines[-40:])
 
     system = """You are Angel's Stage 6 self-modification planner.
@@ -683,10 +729,10 @@ def seed_initial_self_modification(
 
     filtered: list = []
     for m in _normalize_memories(mem):
-        meta = m.get("metadata") if isinstance(m, dict) else {}
-        if not isinstance(meta, dict):
+        if not isinstance(m, dict):
             continue
-        if meta.get("category") in (CATEGORY_SELF_OBSERVATION, CATEGORY_SELF_MODIFICATION):
+        cat = _memory_category_from_item(m)
+        if cat in (CATEGORY_SELF_OBSERVATION, CATEGORY_SELF_MODIFICATION):
             continue
         filtered.append(m)
     summary = build_memory_summary_with_sections(filtered, user_message=None)
@@ -763,8 +809,9 @@ def api_list_observations(memory_client, user_id: str, use_mem0_cloud: bool, lim
     mem = fetch_combined_memories(memory_client, user_id, use_mem0_cloud)
     out: list[dict] = []
     for m in _normalize_memories(mem):
-        meta = m.get("metadata") if isinstance(m, dict) else {}
-        if not isinstance(meta, dict) or meta.get("category") != CATEGORY_SELF_OBSERVATION:
+        if not isinstance(m, dict):
+            continue
+        if _memory_category_from_item(m) != CATEGORY_SELF_OBSERVATION:
             continue
         raw = (m.get("memory") or m.get("data") or "").strip()
         out.append(

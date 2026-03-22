@@ -51,6 +51,8 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 LOCAL_MEMORY_FILE = BASE_DIR / "tyler_memories.json"
+# Serialize concurrent read/modify/write of tyler_memories.json (append vs list vs replace).
+_LOCAL_MEMORY_FILE_LOCK = threading.RLock()
 _WHISPER_MODEL = None
 TAVILY_API_URL = "https://api.tavily.com/search"
 MEM0_API_BASE_URL = "https://api.mem0.ai"
@@ -363,8 +365,8 @@ def _memory_text_for_debug(item) -> str:
 _EMPTY_LOCAL_MEMORY_DOC: dict = {"memories": [], "users": {}}
 
 
-def _write_local_memory_file_silent(data: dict) -> None:
-    """Persist tyler_memories.json; swallow errors (never raise to callers)."""
+def _write_local_memory_file_silent_impl(data: dict) -> None:
+    """Write tyler_memories.json (caller must hold lock)."""
     try:
         LOCAL_MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOCAL_MEMORY_FILE.open("w", encoding="utf-8") as f:
@@ -373,11 +375,16 @@ def _write_local_memory_file_silent(data: dict) -> None:
         pass
 
 
-def _load_local_memory_file_data() -> dict:
+def _write_local_memory_file_silent(data: dict) -> None:
+    """Persist tyler_memories.json; swallow errors (never raise to callers)."""
+    with _LOCAL_MEMORY_FILE_LOCK:
+        _write_local_memory_file_silent_impl(data)
+
+
+def _load_local_memory_file_data_impl() -> dict:
     """
-    Read and normalize tyler_memories.json. Never raises; never logs.
-    Missing file: return empty doc (no write until something is saved).
-    Empty, invalid JSON, or wrong types: reinitialize to _EMPTY_LOCAL_MEMORY_DOC and rewrite.
+    Read and normalize tyler_memories.json (caller must hold lock).
+    Never raises; never logs.
     """
     try:
         if not LOCAL_MEMORY_FILE.exists():
@@ -385,17 +392,17 @@ def _load_local_memory_file_data() -> dict:
 
         raw = LOCAL_MEMORY_FILE.read_text(encoding="utf-8")
         if not raw.strip():
-            _write_local_memory_file_silent(dict(_EMPTY_LOCAL_MEMORY_DOC))
+            _write_local_memory_file_silent_impl(dict(_EMPTY_LOCAL_MEMORY_DOC))
             return dict(_EMPTY_LOCAL_MEMORY_DOC)
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            _write_local_memory_file_silent(dict(_EMPTY_LOCAL_MEMORY_DOC))
+            _write_local_memory_file_silent_impl(dict(_EMPTY_LOCAL_MEMORY_DOC))
             return dict(_EMPTY_LOCAL_MEMORY_DOC)
 
         if not isinstance(data, dict):
-            _write_local_memory_file_silent(dict(_EMPTY_LOCAL_MEMORY_DOC))
+            _write_local_memory_file_silent_impl(dict(_EMPTY_LOCAL_MEMORY_DOC))
             return dict(_EMPTY_LOCAL_MEMORY_DOC)
 
         if "memories" in data and not isinstance(data.get("memories"), list):
@@ -409,15 +416,26 @@ def _load_local_memory_file_data() -> dict:
         return data
     except Exception:
         try:
-            _write_local_memory_file_silent(dict(_EMPTY_LOCAL_MEMORY_DOC))
+            _write_local_memory_file_silent_impl(dict(_EMPTY_LOCAL_MEMORY_DOC))
         except Exception:
             pass
         return dict(_EMPTY_LOCAL_MEMORY_DOC)
 
 
+def _load_local_memory_file_data() -> dict:
+    """
+    Read and normalize tyler_memories.json. Never raises; never logs.
+    Missing file: return empty doc (no write until something is saved).
+    Empty, invalid JSON, or wrong types: reinitialize to _EMPTY_LOCAL_MEMORY_DOC and rewrite.
+    """
+    with _LOCAL_MEMORY_FILE_LOCK:
+        return _load_local_memory_file_data_impl()
+
+
 def _load_local_memories(user_id: str):
     try:
-        data = _load_local_memory_file_data()
+        with _LOCAL_MEMORY_FILE_LOCK:
+            data = _load_local_memory_file_data_impl()
         users = data.get("users", {})
         if not isinstance(users, dict):
             return []
@@ -430,23 +448,24 @@ def _load_local_memories(user_id: str):
 def _append_local_memory(user_id: str, memory_text: str, metadata: dict) -> bool:
     """Append one memory row to tyler_memories.json. Returns True if written."""
     try:
-        data = _load_local_memory_file_data()
-        users = data.setdefault("users", {})
-        if not isinstance(users, dict):
-            users = {}
-            data["users"] = users
-        user_memories = users.setdefault(user_id, [])
-        if not isinstance(user_memories, list):
-            user_memories = []
-            users[user_id] = user_memories
-        user_memories.append(
-            {
-                "memory": memory_text,
-                "metadata": metadata,
-                "created_at": metadata.get("timestamp"),
-            }
-        )
-        _write_local_memory_file_silent(data)
+        with _LOCAL_MEMORY_FILE_LOCK:
+            data = _load_local_memory_file_data_impl()
+            users = data.setdefault("users", {})
+            if not isinstance(users, dict):
+                users = {}
+                data["users"] = users
+            user_memories = users.setdefault(user_id, [])
+            if not isinstance(user_memories, list):
+                user_memories = []
+                users[user_id] = user_memories
+            user_memories.append(
+                {
+                    "memory": memory_text,
+                    "metadata": metadata,
+                    "created_at": metadata.get("timestamp"),
+                }
+            )
+            _write_local_memory_file_silent_impl(data)
         return True
     except Exception:
         return False
@@ -478,12 +497,13 @@ def _memory_dedupe_key(m: dict) -> str | None:
 def _load_local_memory_entries(user_id: str) -> list:
     """Return the raw list of memory entry dicts for user_id from tyler_memories.json."""
     try:
-        data = _load_local_memory_file_data()
-        users = data.get("users", {})
-        if not isinstance(users, dict):
-            return []
-        arr = users.get(user_id, [])
-        return arr if isinstance(arr, list) else []
+        with _LOCAL_MEMORY_FILE_LOCK:
+            data = _load_local_memory_file_data_impl()
+            users = data.get("users", {})
+            if not isinstance(users, dict):
+                return []
+            arr = users.get(user_id, [])
+            return arr if isinstance(arr, list) else []
     except Exception:
         return []
 
@@ -491,13 +511,14 @@ def _load_local_memory_entries(user_id: str) -> list:
 def _save_local_memory_entries(user_id: str, entries: list) -> None:
     """Replace the on-disk memory list for user_id (full file rewrite)."""
     try:
-        data = _load_local_memory_file_data()
-        users = data.setdefault("users", {})
-        if not isinstance(users, dict):
-            users = {}
-            data["users"] = users
-        users[user_id] = entries
-        _write_local_memory_file_silent(data)
+        with _LOCAL_MEMORY_FILE_LOCK:
+            data = _load_local_memory_file_data_impl()
+            users = data.setdefault("users", {})
+            if not isinstance(users, dict):
+                users = {}
+                data["users"] = users
+            users[user_id] = entries
+            _write_local_memory_file_silent_impl(data)
     except Exception:
         pass
 
@@ -521,21 +542,28 @@ def _network_upsert_structured_memory(
         "network_entity_key": entity_key,
     }
     try:
-        entries = _load_local_memory_entries(user_id)
-        if not isinstance(entries, list):
-            entries = []
-        filtered = [
-            e
-            for e in entries
-            if not (
-                isinstance(e, dict)
-                and isinstance(e.get("metadata"), dict)
-                and e["metadata"].get("category") == category
-                and e["metadata"].get("network_entity_key") == entity_key
-            )
-        ]
-        filtered.append({"memory": text, "metadata": dict(meta), "created_at": ts})
-        _save_local_memory_entries(user_id, filtered)
+        with _LOCAL_MEMORY_FILE_LOCK:
+            data = _load_local_memory_file_data_impl()
+            users = data.setdefault("users", {})
+            if not isinstance(users, dict):
+                users = {}
+                data["users"] = users
+            entries = users.get(user_id, [])
+            if not isinstance(entries, list):
+                entries = []
+            filtered = [
+                e
+                for e in entries
+                if not (
+                    isinstance(e, dict)
+                    and isinstance(e.get("metadata"), dict)
+                    and e["metadata"].get("category") == category
+                    and e["metadata"].get("network_entity_key") == entity_key
+                )
+            ]
+            filtered.append({"memory": text, "metadata": dict(meta), "created_at": ts})
+            users[user_id] = filtered
+            _write_local_memory_file_silent_impl(data)
     except Exception:
         pass
     if skip_mem0:
