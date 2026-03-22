@@ -100,6 +100,46 @@ _network_reset_status: dict = {
 
 _log = logging.getLogger(__name__)
 
+
+def _log_startup_seed_summary(name: str, r: object) -> None:
+    """One short stdout line per seed job — avoids huge dicts (Railway 500 logs/sec)."""
+    if not isinstance(r, dict):
+        print(f"[web_app] {name}: {r!r}", flush=True)
+        return
+    if name == "Initial predictions seed":
+        saved = r.get("saved")
+        n = len(saved) if isinstance(saved, list) else None
+        ids: list[str] = []
+        if isinstance(saved, list):
+            for item in saved[:12]:
+                if isinstance(item, dict):
+                    pid = item.get("prediction_id")
+                    if pid:
+                        ids.append(str(pid)[:10])
+        print(
+            f"[web_app] {name}: ok={r.get('ok')} count={r.get('count')} "
+            f"seeded={r.get('seeded')} skipped_dup={r.get('skipped_duplicates')} "
+            f"saved_n={n} prediction_id_prefixes={ids}",
+            flush=True,
+        )
+        return
+    parts: list[str] = []
+    for k in (
+        "ok",
+        "seeded",
+        "added",
+        "total",
+        "total_cases",
+        "count",
+        "ensured",
+        "skipped_duplicates",
+        "force_reseed",
+    ):
+        if k in r:
+            parts.append(f"{k}={r[k]!r}")
+    print(f"[web_app] {name}: " + " ".join(parts), flush=True)
+
+
 _RESET_WATCHDOG_SEC = 120.0
 
 
@@ -137,7 +177,7 @@ def _network_reset_worker(
     use_mem0_cloud: bool,
 ) -> None:
     """Runs in a daemon thread; never raises."""
-    print("[network_reset_worker] thread START", flush=True)
+    _log.debug("[network_reset_worker] thread START")
     summary: dict | None = None
     err: str | None = None
     reset_timer = threading.Timer(_RESET_WATCHDOG_SEC, _network_reset_timeout_handler)
@@ -166,7 +206,7 @@ def _network_reset_worker(
             reset_timer.cancel()
         except Exception:
             pass
-        print("[network_reset_worker] finally block ENTER", flush=True)
+        _log.debug("[network_reset_worker] finally block ENTER")
         now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         _log.debug(
             "network reset worker: thread completing (summary=%s err=%s)",
@@ -176,10 +216,10 @@ def _network_reset_worker(
         try:
             with _network_reset_lock:
                 _network_reset_status["in_progress"] = False
-                print(
-                    "[network_reset_worker] set in_progress=False "
-                    f"last_reset_at={now} summary_type={type(summary).__name__}",
-                    flush=True,
+                _log.debug(
+                    "[network_reset_worker] set in_progress=False last_reset_at=%s summary_type=%s",
+                    now,
+                    type(summary).__name__,
                 )
                 _network_reset_status["last_reset_at"] = now
                 if isinstance(summary, dict):
@@ -734,7 +774,7 @@ def _schedule_predictions_initial_seed() -> None:
                 angel.files_cabinet,
                 angel._use_mem0_cloud,
             )
-            print(f"[web_app] Initial predictions seed: {r}", flush=True)
+            _log_startup_seed_summary("Initial predictions seed", r)
         except Exception:
             traceback.print_exc()
 
@@ -762,7 +802,7 @@ def _schedule_proactive_watch_seed() -> None:
                 angel.files_cabinet,
                 angel._use_mem0_cloud,
             )
-            print(f"[web_app] Proactive watch seed: {r}", flush=True)
+            _log_startup_seed_summary("Proactive watch seed", r)
         except Exception:
             traceback.print_exc()
 
@@ -790,7 +830,7 @@ def _schedule_foreign_watch_seed() -> None:
                 angel.files_cabinet,
                 angel._use_mem0_cloud,
             )
-            print(f"[web_app] Foreign watch seed: {r}", flush=True)
+            _log_startup_seed_summary("Foreign watch seed", r)
         except Exception:
             traceback.print_exc()
 
@@ -847,7 +887,7 @@ def _schedule_environmental_map_seed() -> None:
                 angel.files_cabinet,
                 angel._use_mem0_cloud,
             )
-            print(f"[web_app] Environmental map seed: {r}", flush=True)
+            _log_startup_seed_summary("Environmental map seed", r)
         except Exception:
             traceback.print_exc()
 
@@ -875,7 +915,7 @@ def _schedule_biological_intelligence_seed() -> None:
                 angel.files_cabinet,
                 angel._use_mem0_cloud,
             )
-            print(f"[web_app] Biological intelligence seed: {r}", flush=True)
+            _log_startup_seed_summary("Biological intelligence seed", r)
         except Exception:
             traceback.print_exc()
 
@@ -903,7 +943,7 @@ def _schedule_historical_archives_seed() -> None:
                 angel.files_cabinet,
                 angel._use_mem0_cloud,
             )
-            print(f"[web_app] Historical archives seed: {r}", flush=True)
+            _log_startup_seed_summary("Historical archives seed", r)
         except Exception:
             traceback.print_exc()
 

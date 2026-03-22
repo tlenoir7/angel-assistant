@@ -5196,13 +5196,13 @@ def reset_mission_network_and_reseed(
             force=True,
             timeout_seconds=90.0,
         )
-        nodes, edges = network_load_graph(
-            memory_client, user_id, use_mem0_cloud, files_cabinet
-        )
+        # Local counts only — avoid fetch_combined_memories (Mem0 get_all) here; it can
+        # exceed the web_app reset watchdog (120s) and is redundant right after local-first seed.
+        nodes, edges = network_load_graph_local_only(user_id, files_cabinet)
         out["nodes_after"] = len(nodes)
         out["edges_after"] = len(edges)
         print(
-            f"[reset] step 4: seed complete, nodes={out['nodes_after']} edges={out['edges_after']}",
+            f"[reset] step 4: seed complete, nodes={out['nodes_after']} edges={out['edges_after']} (local)",
             flush=True,
         )
         print("[reset] step 5: returning result", flush=True)
@@ -5411,7 +5411,7 @@ def _seed_mission_network_if_empty_core(
     else:
         print("[seed] skip Mem0 background sync (cloud off)", flush=True)
 
-    _mission_graph_log.info("seed_mission_network_if_empty: mission graph seed finished successfully")
+    _mission_graph_log.debug("seed_mission_network_if_empty: mission graph seed finished successfully")
     return True
 
 
