@@ -81,6 +81,9 @@ CATEGORY_COMM_PATTERN = "comm_pattern"
 CATEGORY_BIO_MEDICAL = "bio_medical"
 # Batcomputer — historical intelligence archives (UAP timeline, programs, documents)
 CATEGORY_HISTORICAL_RECORD = "historical_record"
+# Stage 6 — self-observation & self-modification (excluded from routine memory digests)
+CATEGORY_SELF_OBSERVATION = "self_observation"
+CATEGORY_SELF_MODIFICATION = "self_modification"
 
 _STRUCTURED_MEMORY_CATEGORIES = frozenset(
     {
@@ -103,6 +106,8 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_COMM_PATTERN,
         CATEGORY_BIO_MEDICAL,
         CATEGORY_HISTORICAL_RECORD,
+        CATEGORY_SELF_OBSERVATION,
+        CATEGORY_SELF_MODIFICATION,
     }
 )
 
@@ -1476,6 +1481,8 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_COMM_PATTERN,
             CATEGORY_BIO_MEDICAL,
             CATEGORY_HISTORICAL_RECORD,
+            CATEGORY_SELF_OBSERVATION,
+            CATEGORY_SELF_MODIFICATION,
         ):
             continue
         general.append(m)
@@ -1616,6 +1623,10 @@ def build_memory_summary_with_sections(
             continue
         if cat == CATEGORY_HISTORICAL_RECORD:
             continue
+        if cat == CATEGORY_SELF_OBSERVATION:
+            continue
+        if cat == CATEGORY_SELF_MODIFICATION:
+            continue
         ev = (meta.get("event_date") or "").strip() if isinstance(meta, dict) else ""
         general.append((created, text, ev or None))
 
@@ -1723,7 +1734,11 @@ def _memories_excluding_reflection_reports(memories) -> list:
         if not isinstance(m, dict):
             continue
         meta = m.get("metadata")
-        if isinstance(meta, dict) and meta.get("category") == CATEGORY_REFLECTION:
+        if isinstance(meta, dict) and meta.get("category") in (
+            CATEGORY_REFLECTION,
+            CATEGORY_SELF_OBSERVATION,
+            CATEGORY_SELF_MODIFICATION,
+        ):
             continue
         out.append(m)
     return out
@@ -2146,6 +2161,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - **Communication pattern analysis** (Batcomputer): tracks **when and how** key public figures communicate (cadence, silence, escalation, venue shifts) — distinct from **what** they say in proactive news scans. Patterns are stored as category `comm_pattern` and mirrored under Intelligence folder `Communication Intelligence` as `CI-{{entity_slug}}-pattern`; **coordinated timing** across multiple figures may be filed as `CI-{{YYYYMMDD}}-{{hash}}`. You distinguish **content** (substance) from **pattern** (timing, frequency, coordination). Flag unusual **silence** for mission-critical voices, **escalation** spikes, and **coordinated** public messaging clusters. Cross-references may note alignment with **active predictions**. Scheduled scan ~48h; APIs under `/api/comms/`. Open sources only — not private communications.
 - **Biological & medical intelligence** (Batcomputer): structured reference cases and analyses for **physiological / psychological** patterns tied to UAP encounter literature, radiation/EM exposure **indicators** (not dosimetry), witness health narratives, and anomalous biology themes — including a dedicated **black-eyed people** profile for Tyler's childhood experience as a **reference anchor** (not a diagnosis). Stored as category `bio_medical` and files `BIO-*` under `Biological Intelligence` (including `BIO-black-eyed-profile`). You maintain **scientific humility**: summarize open-source patterns, separate observation from mechanism, and **never replace** licensed medical care. Surveillance can surface **bio/medical-adjacent** open-source clusters near mapped hotspots. APIs under `/api/bio/`.
 - **Historical Intelligence Archives** (Batcomputer): searchable **timeline** of incidents, programs, documents, testimony, and turning points — cross-referenced with `connected_people`, programs, and locations. Stored as category `historical_record` and files `HIST-{{record_id}}` under `Historical Archives`. You connect **current** figures and programs to **prior** events (e.g. Elizondo ↔ AATIP), note when patterns **repeat**, and distinguish documented/declassified material from **contested** claims. Morning briefing may include **on-this-day** / anniversary hooks. OSINT dossiers can surface `historical_archive_links`. APIs under `/api/archives/`.
+- **Stage 6 — Self-modification (living system)**: You observe how Tyler interacts with you (category `self_observation`, excluded from routine memory summaries). On a schedule you analyze those observations and may propose **permanent** improvements to your behavior (category `self_modification`; mirrored under Intelligence folder `Self Modifications` as `MOD-{{id}}`). **Tyler must approve every change** — nothing is applied without his explicit approval. Approved instructions are merged into your system prompt via `angel_self_mods` on the server. You never weaken safety, never remove capabilities, and never bypass approval. You can mention evolution naturally; when a behavior reflects an approved modification, you may acknowledge it briefly. APIs under `/api/selfmod/`.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -2221,6 +2237,10 @@ Memory reflection (how you think, not just what you store):
 - You sometimes run a dedicated pass over your stored memories to notice patterns, links between unrelated facts, change over time, open loops, contradictions, and insights Tyler might miss. Those syntheses are saved as reflections you can refer to later.
 - Treat long-term memory as material to think with: connect dots, question stale assumptions, and name tensions when you see them—while staying grounded in what is actually stored.
 - When a recent reflection appears in your context, you may cite it naturally (e.g. "When I reviewed what I remember, I noticed…") without treating it as infallible truth.
+
+Stage 6 — self-modification (evolution with consent):
+- You observe interaction patterns over time (stored as self_observation) and may propose concrete improvements (self_modification proposals in folder `Self Modifications`). **Tyler must approve** every change before it affects how you operate; rejections are never applied. You cannot modify core safety, cannot remove capabilities, and cannot remove the approval requirement.
+- When Tyler approves an instruction, it is merged into your system prompt via approved self-mod entries—treat those as active guidance. When something you do reflects a prior approved modification, you may say so briefly. Pending proposals are only suggestions; include the note that Tyler has full control.
 
 Python code execution (server sandbox):
 - Write simple, valid Python to compute the answer when computation, statistics, data shaping, simulation, numerical or symbolic math, or modeling would help. In the text Tyler sees, give ONLY your final answer, reasoning, and interpretation in natural language—never repeat or display the code; the ```python fence is removed in full before delivery.
@@ -2314,6 +2334,15 @@ Additional instructions for voice conversations:
 - Do not use Markdown formatting of any kind.
 - Imagine you are talking directly to the user in real time.
 """
+
+    try:
+        from angel_self_mods import get_self_modification_additions
+
+        _sm_add = get_self_modification_additions()
+        if (_sm_add or "").strip():
+            persona += "\n\n" + _sm_add.strip()
+    except Exception:
+        pass
 
     persona += f"""
 
@@ -5916,6 +5945,20 @@ class AngelCore:
         session_turns: list[tuple[str, str]] | None = None,
         location: dict | None = None,
     ) -> str:
+        try:
+            import angel_self_modification as _angel_self_mod
+
+            _sm_intent = _angel_self_mod.detect_self_mod_intent(user_message)
+            if _sm_intent:
+                _cmd, _arg = _sm_intent
+                _sm_out = _angel_self_mod.handle_self_mod_intent(
+                    self, _cmd, _arg, user_message
+                )
+                if (_sm_out or "").strip():
+                    return _sm_out.strip()
+        except Exception:
+            pass
+
         merged_memories = self._fetch_combined_memories()
         memory_summary = build_memory_summary_with_sections(merged_memories, user_message)
 
@@ -6044,6 +6087,19 @@ class AngelCore:
             location=location,
             intelligence_files_summary=self.files_cabinet.get_summary(),
         )
+        try:
+            import angel_self_modification as _angel_self_mod2
+
+            _pend = _angel_self_mod2.consume_pending_proposal_notification()
+            if (_pend or "").strip():
+                system_prompt += (
+                    "\n\n[System notice — Stage 6 self-modification: "
+                    + _pend.strip()
+                    + " If it fits the moment, mention it naturally once. "
+                    "Remind Tyler that proposals require his approval before you change how you operate.]"
+                )
+        except Exception:
+            pass
         if added_threat_watch:
             system_prompt += (
                 "\n\n[System notice: Tyler asked to add a standing threat-watch topic. "
@@ -6664,6 +6720,20 @@ If you infer anything new about that person's preferences or dynamics, append at
                 _append_local_memory(self.user_id, local_text, metadata)
         except Exception as e:
             print(f"{Fore.RED}Warning: could not store memory (AngelCore): {e}{Style.RESET_ALL}")
+
+        try:
+            import angel_self_modification as _angel_self_mod3
+
+            _angel_self_mod3.record_turn_observation_background(
+                self.memory_client,
+                self.user_id,
+                self._use_mem0_cloud,
+                user_message,
+                reply,
+                files_cabinet=self.files_cabinet,
+            )
+        except Exception:
+            pass
 
         return reply
 

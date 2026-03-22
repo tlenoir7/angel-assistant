@@ -134,6 +134,8 @@ def _log_startup_seed_summary(name: str, r: object) -> None:
         "ensured",
         "skipped_duplicates",
         "force_reseed",
+        "reason",
+        "error",
     ):
         if k in r:
             parts.append(f"{k}={r[k]!r}")
@@ -953,6 +955,61 @@ def _schedule_historical_archives_seed() -> None:
         pass
 
 
+def _schedule_self_modification_seed() -> None:
+    """Stage 6: seed 2–3 insightful self-mod proposals from existing memory (first run)."""
+
+    def _job() -> None:
+        try:
+            time.sleep(52)
+        except Exception:
+            return
+        global angel
+        if angel is None:
+            return
+        try:
+            import angel_self_modification as asm
+
+            r = asm.seed_initial_self_modification(
+                angel.anthropic_client,
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            _log_startup_seed_summary("Self modification seed", r)
+        except Exception:
+            traceback.print_exc()
+
+    try:
+        threading.Thread(target=_job, daemon=True).start()
+    except Exception:
+        pass
+
+
+def _run_weekly_self_modification_job() -> None:
+    """Sunday 6:30 AM (TIMEZONE): analyze self_observation entries and propose modifications."""
+    global angel
+    if angel is None:
+        return
+    try:
+        import angel_self_modification as asm
+
+        r = asm.run_self_modification_analysis(
+            angel.anthropic_client,
+            angel.memory_client,
+            angel.user_id,
+            angel.files_cabinet,
+            angel._use_mem0_cloud,
+        )
+        print(
+            f"[web_app] Weekly self-modification analysis: ok={r.get('ok')} count={r.get('count')}",
+            flush=True,
+        )
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[web_app] Weekly self-modification analysis failed: {e}", flush=True)
+
+
 def _run_communication_patterns_job() -> None:
     """Every 48h: open-source communication cadence / coordination analysis for watched figures."""
 
@@ -1055,6 +1112,7 @@ def create_app() -> Flask:
     _schedule_environmental_map_seed()
     _schedule_biological_intelligence_seed()
     _schedule_historical_archives_seed()
+    _schedule_self_modification_seed()
     _load_expo_push_tokens_from_disk()
 
     # Log briefing email env at startup for debugging
@@ -1094,6 +1152,14 @@ def create_app() -> Flask:
         day_of_week="sun",
         hour=6,
         minute=0,
+        timezone=sched_tz,
+    )
+    scheduler.add_job(
+        _run_weekly_self_modification_job,
+        "cron",
+        day_of_week="sun",
+        hour=6,
+        minute=30,
         timezone=sched_tz,
     )
     scheduler.add_job(
@@ -3933,6 +3999,135 @@ def create_app() -> Flask:
                     "chars": len(text),
                 }
             )
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/selfmod/observations", methods=["GET"])
+    def api_selfmod_observations():
+        """Recent self_observation entries (Stage 6)."""
+        global angel
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            import angel_self_modification as asm
+
+            limit = int(request.args.get("limit", 50))
+            obs = asm.api_list_observations(
+                angel.memory_client, angel.user_id, angel._use_mem0_cloud, limit=limit
+            )
+            return jsonify({"status": "ok", "observations": obs})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/selfmod/proposals", methods=["GET"])
+    def api_selfmod_proposals():
+        """All self_modification records (latest per id)."""
+        global angel
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            import angel_self_modification as asm
+
+            props = asm.api_list_proposals(
+                angel.memory_client, angel.user_id, angel._use_mem0_cloud
+            )
+            return jsonify({"status": "ok", "proposals": props})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/selfmod/applied", methods=["GET"])
+    def api_selfmod_applied():
+        """Tyler-approved modifications applied via angel_self_mods_data.json."""
+        try:
+            from angel_self_mods import list_applied_records
+
+            return jsonify({"status": "ok", "applied": list_applied_records()})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/selfmod/approve", methods=["POST"])
+    def api_selfmod_approve():
+        global angel
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        mid = (data.get("modification_id") or "").strip()
+        if not mid:
+            return jsonify({"error": "missing modification_id"}), 400
+        try:
+            import angel_self_modification as asm
+
+            text = asm.handle_self_mod_intent(angel, "approve", mid, f"approve {mid}")
+            return jsonify({"status": "ok", "message": _sanitize_text(text)})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/selfmod/reject", methods=["POST"])
+    def api_selfmod_reject():
+        global angel
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        mid = (data.get("modification_id") or "").strip()
+        if not mid:
+            return jsonify({"error": "missing modification_id"}), 400
+        try:
+            import angel_self_modification as asm
+
+            text = asm.handle_self_mod_intent(angel, "reject", mid, f"reject {mid}")
+            return jsonify({"status": "ok", "message": _sanitize_text(text)})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/selfmod/revert", methods=["POST"])
+    def api_selfmod_revert():
+        """Revert an applied modification (same logic as chat: revert [id or title])."""
+        global angel
+        if angel is None:
+            return jsonify({"ok": False, "error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        mid = (data.get("modification_id") or "").strip()
+        if not mid:
+            return jsonify({"ok": False, "error": "missing modification_id"}), 400
+        try:
+            import angel_self_modification as asm
+
+            r = asm.revert_self_modification(angel, mid)
+            if r.get("ok"):
+                return jsonify(
+                    {
+                        "ok": True,
+                        "modification_id": r.get("modification_id"),
+                        "message": _sanitize_text(str(r.get("message") or "")),
+                    }
+                )
+            return jsonify({"ok": False, "error": _sanitize_text(str(r.get("error") or ""))}), 400
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": _sanitize_text(str(e))}), 500
+
+    @app.route("/api/selfmod/generate", methods=["POST"])
+    def api_selfmod_generate():
+        global angel
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            import angel_self_modification as asm
+
+            r = asm.run_self_modification_analysis(
+                angel.anthropic_client,
+                angel.memory_client,
+                angel.user_id,
+                angel.files_cabinet,
+                angel._use_mem0_cloud,
+            )
+            return jsonify({"status": "ok" if r.get("ok") else "error", **r})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"status": "error", "error": str(e)}), 500
