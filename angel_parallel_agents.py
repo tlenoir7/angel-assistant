@@ -205,6 +205,8 @@ def _synthesize(
     shared_context: str,
     tasks: list[AgentTask],
     memory_excerpt: str,
+    agent_phase_sec: float,
+    estimated_sequential_sec: float,
 ) -> str:
     from angel import call_claude
 
@@ -215,14 +217,23 @@ def _synthesize(
             f"Status: {t.status}\n"
             f"{t.result or t.error or ''}\n"
         )
+    n = len(tasks)
+    roles_csv = ", ".join(t.agent_role for t in tasks) if tasks else "(none)"
     system = (
         "You are Angel coordinating parallel specialist agents for Tyler. "
         "Merge their outputs into one coherent intelligence report. "
         "Resolve contradictions cautiously; note corroboration; flag highest-priority findings. "
-        "Use clear headings; be concise but substantive. Open sources only."
+        "Use clear headings; be concise but substantive. Open sources only.\n\n"
+        "Begin your response by briefly noting that you ran parallel analysis, how many agents, "
+        "the specialist roles involved, the wall-clock time for the parallel agent phase "
+        f"(~{agent_phase_sec:.1f}s), and how that compares to estimated sequential processing "
+        f"(~{estimated_sequential_sec:.0f}s for {n} agents). "
+        "Then provide the full synthesis."
     )
     user = (
         f"Topic / focus: {topic}\n\n"
+        f"Coordination metadata: {n} agents ({roles_csv}); parallel agent phase ~{agent_phase_sec:.1f}s; "
+        f"estimated sequential wall time ~{estimated_sequential_sec:.0f}s.\n\n"
         f"Shared context:\n{shared_context[:4000]}\n\n"
         f"Memory excerpt:\n{memory_excerpt[:2000]}\n\n"
         "Agent outputs:\n"
@@ -315,6 +326,8 @@ def run_parallel_agents(
                 slot[idx] = tt
         ordered = [s for s in slot if s is not None]
 
+    agent_phase_sec = time.perf_counter() - t0
+    seq_est = float(len(ordered) * 48)
     topic = sc[:500]
     synthesis = _synthesize(
         anthropic_client,
@@ -322,10 +335,11 @@ def run_parallel_agents(
         shared_context=sc,
         tasks=ordered,
         memory_excerpt=memory_excerpt,
+        agent_phase_sec=agent_phase_sec,
+        estimated_sequential_sec=seq_est,
     )
 
     elapsed = time.perf_counter() - t0
-    seq_est = float(len(ordered) * 48)
     return {
         "ok": True,
         "results": [t.to_dict() for t in ordered],

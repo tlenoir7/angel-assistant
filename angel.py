@@ -6582,13 +6582,25 @@ If you infer anything new about that person's preferences or dynamics, append at
                     user_id=self.user_id,
                 )
                 if pr.get("ok"):
-                    tnote = pr.get("time_saved_note") or ""
-                    n_ag = pr.get("agents_used", 0)
+                    n_ag = int(pr.get("agents_used") or 0)
+                    results = pr.get("results") or []
+                    roles_fmt = (
+                        ", ".join(
+                            (r.get("agent_role") or "general")
+                            for r in results
+                        )
+                        if results
+                        else "general"
+                    )
+                    total_s = float(pr.get("total_time") or 0.0)
+                    seq_est = float(
+                        pr.get("estimated_sequential_time_sec") or 0.0
+                    )
                     augmented_user_message = (
-                        f"Running parallel analysis across {n_ag} specialized agents…\n\n"
+                        f"Running parallel analysis across {n_ag} specialized agents "
+                        f"({roles_fmt}) — completed in {total_s:.1f}s "
+                        f"(vs ~{seq_est:.0f}s estimated sequential).\n\n"
                         f"{user_message}\n\n"
-                        f"[Parallel multi-agent analysis: {n_ag} agents, "
-                        f"~{pr.get('total_time', 0):.1f}s wall time. {tnote}]\n\n"
                         f"{pr.get('synthesis', '')}"
                     )
                     parallel_done = True
