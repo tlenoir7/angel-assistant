@@ -122,7 +122,7 @@ def _threat_actor_upsert_memory(
         filtered.append({"memory": text, "metadata": dict(meta), "created_at": ts})
         ang._save_local_memory_entries(user_id, filtered)
     except Exception as e:
-        _log.exception("threat actor local JSON save failed actor_id=%s: %s", actor_id, e)
+        _log.debug("threat actor local JSON save failed actor_id=%s: %s", actor_id, e)
         return
 
     # 2) Mem0 cloud — best effort; 10s timeout on HTTP client when available.

@@ -5108,6 +5108,7 @@ def reset_mission_network_and_reseed(
     Recovery: delete Network Intelligence mirror files only, then force a full mission seed.
     Skips slow Mem0 cloud deletes — nodes/edges are upserted in place (canonical JSON also on disk).
     """
+    print("[reset] step 1: deleting Network Intelligence files", flush=True)
     out: dict = {
         "ok": True,
         "intel_files_deleted": 0,
@@ -5133,6 +5134,8 @@ def reset_mission_network_and_reseed(
             except Exception:
                 pass
 
+        print(f"[reset] step 2: files deleted, count={out['intel_files_deleted']}", flush=True)
+        print("[reset] step 3: calling seed_mission_network_if_empty force=True", flush=True)
         out["seed_ran"] = seed_mission_network_if_empty(
             memory_client,
             user_id,
@@ -5145,7 +5148,14 @@ def reset_mission_network_and_reseed(
         )
         out["nodes_after"] = len(nodes)
         out["edges_after"] = len(edges)
+        print(
+            f"[reset] step 4: seed complete, nodes={out['nodes_after']} edges={out['edges_after']}",
+            flush=True,
+        )
+        print("[reset] step 5: returning result", flush=True)
     except Exception as e:
+        print(f"[reset] EXCEPTION before step 5: {e!r}", flush=True)
+        traceback.print_exc()
         out["ok"] = False
         out["error"] = str(e)
     return out
@@ -5266,15 +5276,13 @@ def seed_mission_network_if_empty(
                     "rel": rt,
                 }
             )
-        _mission_graph_log.info(
-            "seed_mission_network_if_empty: Marco Rubio cluster complete, %d edges stored",
-            len(_mr_stored),
-        )
         _mission_graph_log.debug(
-            "seed_mission_network_if_empty: Marco Rubio edge_ids=%s detail=%s",
+            "seed_mission_network_if_empty: Marco Rubio cluster %d edges edge_ids=%s detail=%s",
+            len(_mr_stored),
             [x.get("edge_id") for x in _mr_stored],
             _mr_stored,
         )
+        _mission_graph_log.info("seed_mission_network_if_empty: mission graph seed finished successfully")
         return True
     except Exception:
         _mission_graph_log.exception("seed_mission_network_if_empty failed")

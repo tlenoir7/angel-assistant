@@ -100,6 +100,35 @@ _network_reset_status: dict = {
 
 _log = logging.getLogger(__name__)
 
+_RESET_WATCHDOG_SEC = 120.0
+
+
+def _network_reset_timeout_handler() -> None:
+    """If reset_mission_network_and_reseed hangs past the watchdog, unblock API clients."""
+    print(
+        "[network_reset_worker] TIMER %.0fs elapsed — forcing in_progress=False (reset may still be running)"
+        % _RESET_WATCHDOG_SEC,
+        flush=True,
+    )
+    try:
+        with _network_reset_lock:
+            if _network_reset_status.get("in_progress"):
+                _network_reset_status["in_progress"] = False
+                _network_reset_status["last_success"] = False
+                _network_reset_status["last_reset_at"] = (
+                    datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                )
+                prev_err = _network_reset_status.get("last_error")
+                _network_reset_status["last_error"] = prev_err or (
+                    "reset timed out after %.0fs (watchdog)" % _RESET_WATCHDOG_SEC
+                )
+    except Exception as ex:
+        print(f"[network_reset_worker] timeout handler error: {ex!r}", flush=True)
+    _log.debug(
+        "network reset watchdog: %.0fs timeout, in_progress cleared",
+        _RESET_WATCHDOG_SEC,
+    )
+
 
 def _network_reset_worker(
     memory_client,
@@ -111,6 +140,9 @@ def _network_reset_worker(
     print("[network_reset_worker] thread START", flush=True)
     summary: dict | None = None
     err: str | None = None
+    reset_timer = threading.Timer(_RESET_WATCHDOG_SEC, _network_reset_timeout_handler)
+    reset_timer.daemon = True
+    reset_timer.start()
     try:
         summary = reset_mission_network_and_reseed(
             memory_client,
@@ -130,6 +162,10 @@ def _network_reset_worker(
         print(f"[network_reset_worker] reset_mission_network_and_reseed RAISED: {err!r}", flush=True)
         traceback.print_exc()
     finally:
+        try:
+            reset_timer.cancel()
+        except Exception:
+            pass
         print("[network_reset_worker] finally block ENTER", flush=True)
         now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         _log.debug(
@@ -3887,12 +3923,6 @@ def create_app() -> Flask:
 
         tyler_email = os.getenv("TYLER_EMAIL")
         gmail_pass = os.getenv("GMAIL_APP_PASSWORD")
-        print(
-            "[api_status] Env check | "
-            f"TYLER_EMAIL_is_none={tyler_email is None} | "
-            f"GMAIL_APP_PASSWORD_is_none={gmail_pass is None}",
-            flush=True,
-        )
 
         return jsonify(
             {
@@ -3910,15 +3940,8 @@ def create_app() -> Flask:
         try:
             data = request.get_json(silent=True) or {}
             text = (data.get("text") or "").strip()
-            text_len = len(text)
 
             api_key_present = bool(os.getenv("OPENAI_API_KEY"))
-
-            # Diagnostic logging so Railway shows what's going on.
-            print(
-                f"[api_tts] called | api_key_present={api_key_present} | text_len={text_len}",
-                flush=True,
-            )
 
             if not text:
                 return jsonify({"error": "Missing or empty text"}), 400
