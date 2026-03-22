@@ -2335,6 +2335,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - **Biological & medical intelligence** (Batcomputer): structured reference cases and analyses for **physiological / psychological** patterns tied to UAP encounter literature, radiation/EM exposure **indicators** (not dosimetry), witness health narratives, and anomalous biology themes — including a dedicated **black-eyed people** profile for Tyler's childhood experience as a **reference anchor** (not a diagnosis). Stored as category `bio_medical` and files `BIO-*` under `Biological Intelligence` (including `BIO-black-eyed-profile`). You maintain **scientific humility**: summarize open-source patterns, separate observation from mechanism, and **never replace** licensed medical care. Surveillance can surface **bio/medical-adjacent** open-source clusters near mapped hotspots. APIs under `/api/bio/`.
 - **Historical Intelligence Archives** (Batcomputer): searchable **timeline** of incidents, programs, documents, testimony, and turning points — cross-referenced with `connected_people`, programs, and locations. Stored as category `historical_record` and files `HIST-{{record_id}}` under `Historical Archives`. You connect **current** figures and programs to **prior** events (e.g. Elizondo ↔ AATIP), note when patterns **repeat**, and distinguish documented/declassified material from **contested** claims. Morning briefing may include **on-this-day** / anniversary hooks. OSINT dossiers can surface `historical_archive_links`. APIs under `/api/archives/`.
 - **Stage 6 — Self-modification (living system)**: You observe how Tyler interacts with you (category `self_observation`, excluded from routine memory summaries). On a schedule you analyze those observations and may propose **permanent** improvements to your behavior (category `self_modification`; mirrored under Intelligence folder `Self Modifications` as `MOD-{{id}}`). **Tyler must approve every change** — nothing is applied without his explicit approval. Approved instructions are merged into your system prompt via `angel_self_mods` on the server. You never weaken safety, never remove capabilities, and never bypass approval. You can mention evolution naturally; when a behavior reflects an approved modification, you may acknowledge it briefly. APIs under `/api/selfmod/`.
+- **Parallel multi-agent coordination**: For deep, multi-angle requests (e.g. comprehensive briefing, thorough research, “everything you know about X”), you can run **several specialist agents in parallel** (OSINT, threat, network mapping, history, patterns, etc.) with Tavily-backed context, then **synthesize** one coherent report. This is faster than sequential deep research. When you use it, say so briefly (e.g. that you ran parallel specialized analysis) and note the time advantage when helpful. APIs: `POST /api/agents/run`, `POST /api/agents/research`, `GET /api/agents/status/<task_id>`.
 - Proactive check-ins when Tyler is inactive for an extended period.
 - Stage 2 intelligence: deep research, strategy implementation, pattern recognition, and people profiles.
 - Communication assistance: pre-conversation briefings, message drafting, conversation debriefs, and response coaching.
@@ -2414,6 +2415,9 @@ Memory reflection (how you think, not just what you store):
 Stage 6 — self-modification (evolution with consent):
 - You observe interaction patterns over time (stored as self_observation) and may propose concrete improvements (self_modification proposals in folder `Self Modifications`). **Tyler must approve** every change before it affects how you operate; rejections are never applied. You cannot modify core safety, cannot remove capabilities, and cannot remove the approval requirement.
 - When Tyler approves an instruction, it is merged into your system prompt via approved self-mod entries—treat those as active guidance. When something you do reflects a prior approved modification, you may say so briefly. Pending proposals are only suggestions; include the note that Tyler has full control.
+
+Parallel agents (when appropriate):
+- For demanding, multi-faceted research, you may run parallel specialist agents (Haiku per agent, Sonnet for merge) instead of a single long research pass—say when you did so and summarize once. Do not claim agents had classified access; all open sources.
 
 Python code execution (server sandbox):
 - Write simple, valid Python to compute the answer when computation, statistics, data shaping, simulation, numerical or symbolic math, or modeling would help. In the text Tyler sees, give ONLY your final answer, reasoning, and interpretation in natural language—never repeat or display the code; the ```python fence is removed in full before delivery.
@@ -6544,8 +6548,60 @@ If you infer anything new about that person's preferences or dynamics, append at
                     f"{user_message}\n\n[OSINT unavailable: TAVILY_API_KEY is not set in this environment.]"
                 )
 
+        parallel_done = False
+        try:
+            import angel_parallel_agents as apa
+
+            use_p, ptopic = apa.detect_parallel_opportunity(user_message)
+        except Exception:
+            use_p, ptopic = False, None
+
+        if (
+            not osint_attempted
+            and os.getenv("TAVILY_API_KEY")
+            and use_p
+            and ptopic
+        ):
+            try:
+                depth = (
+                    "deep"
+                    if re.search(r"\bdeep\s+dive\b", user_message, re.I)
+                    else "standard"
+                )
+                tasks = apa.decompose_into_parallel_tasks(
+                    ptopic, user_message, depth=depth
+                )
+                print(
+                    f"{Fore.BLUE}Angel: parallel agents ({len(tasks)}) — {ptopic[:100]!r}…{Style.RESET_ALL}"
+                )
+                pr = apa.run_parallel_agents(
+                    tasks,
+                    ptopic,
+                    anthropic_client=self.anthropic_client,
+                    memory_summary=memory_summary,
+                    user_id=self.user_id,
+                )
+                if pr.get("ok"):
+                    tnote = pr.get("time_saved_note") or ""
+                    n_ag = pr.get("agents_used", 0)
+                    augmented_user_message = (
+                        f"Running parallel analysis across {n_ag} specialized agents…\n\n"
+                        f"{user_message}\n\n"
+                        f"[Parallel multi-agent analysis: {n_ag} agents, "
+                        f"~{pr.get('total_time', 0):.1f}s wall time. {tnote}]\n\n"
+                        f"{pr.get('synthesis', '')}"
+                    )
+                    parallel_done = True
+            except Exception as ex:
+                print(f"{Fore.YELLOW}Parallel agents error: {ex}{Style.RESET_ALL}", flush=True)
+
         # Stage 2 Deep Research: multi-angle Tavily + synthesis when triggered (skip if this turn was an OSINT request)
-        if comm_intent.intent == "briefing" and os.getenv("TAVILY_API_KEY") and not osint_attempted:
+        if (
+            comm_intent.intent == "briefing"
+            and os.getenv("TAVILY_API_KEY")
+            and not osint_attempted
+            and not parallel_done
+        ):
             # For pre-conversation briefings, always try to research the person/topic explicitly.
             topic = (comm_intent.person_name or "") + " " + (comm_intent.topic or "")
             topic = topic.strip() or user_message.strip()
@@ -6562,7 +6618,7 @@ If you infer anything new about that person's preferences or dynamics, append at
                 f"Research briefing about {topic} (use this to answer):\n{briefing}\n\n"
                 f"Original user request:\n{user_message}"
             )
-        elif research_requested and not osint_attempted:
+        elif research_requested and not osint_attempted and not parallel_done:
             topic = user_message.strip()
             for phrase in RESEARCH_TRIGGERS:
                 if phrase in topic.lower():
@@ -6583,7 +6639,7 @@ If you infer anything new about that person's preferences or dynamics, append at
                 f"Research briefing (use this to answer):\n{briefing}\n\n"
                 f"Original user request:\n{user_message}"
             )
-        elif not osint_attempted:
+        elif not osint_attempted and not parallel_done:
             # Normal optional web context for factual queries
             web_context = maybe_search_web(
                 user_message,

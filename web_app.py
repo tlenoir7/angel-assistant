@@ -4132,6 +4132,86 @@ def create_app() -> Flask:
             traceback.print_exc()
             return jsonify({"status": "error", "error": str(e)}), 500
 
+    @app.route("/api/agents/run", methods=["POST"])
+    def api_agents_run():
+        """Run up to 5 parallel specialist agents + coordinator synthesis."""
+        global angel
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        tasks_raw = data.get("tasks")
+        context = (data.get("context") or "").strip()
+        if not isinstance(tasks_raw, list) or not tasks_raw:
+            return jsonify({"error": "tasks (non-empty list) required"}), 400
+        try:
+            import angel_parallel_agents as apa
+            from angel import build_memory_summary_with_sections
+
+            mem = angel._fetch_combined_memories()
+            ms = build_memory_summary_with_sections(mem, None)
+            r = apa.run_parallel_agents(
+                tasks_raw[:5],
+                context or "Manual parallel run",
+                anthropic_client=angel.anthropic_client,
+                memory_summary=ms,
+                user_id=angel.user_id,
+            )
+            out = dict(r)
+            if out.get("synthesis"):
+                out["synthesis"] = _sanitize_text(str(out["synthesis"]))
+            return jsonify({"status": "ok", **out})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/agents/research", methods=["POST"])
+    def api_agents_research():
+        """Decompose topic into parallel tasks and run."""
+        global angel
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        topic = (data.get("topic") or "").strip()
+        depth = (data.get("depth") or "standard").strip().lower()
+        if depth not in ("standard", "deep"):
+            depth = "standard"
+        if not topic:
+            return jsonify({"error": "topic required"}), 400
+        try:
+            import angel_parallel_agents as apa
+            from angel import build_memory_summary_with_sections
+
+            mem = angel._fetch_combined_memories()
+            ms = build_memory_summary_with_sections(mem, None)
+            r = apa.run_research_decomposed(
+                topic,
+                depth=depth,
+                anthropic_client=angel.anthropic_client,
+                memory_summary=ms,
+                user_id=angel.user_id,
+                user_message=topic,
+            )
+            out = dict(r)
+            if out.get("synthesis"):
+                out["synthesis"] = _sanitize_text(str(out["synthesis"]))
+            return jsonify({"status": "ok", **out})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/agents/status/<path:task_id>", methods=["GET"])
+    def api_agents_status(task_id: str):
+        try:
+            import angel_parallel_agents as apa
+
+            st = apa.get_task_status(task_id)
+            if st is None:
+                return jsonify({"error": "not found"}), 404
+            return jsonify({"status": "ok", "task": st})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"error": str(e)}), 500
+
     @app.route("/api/check_in", methods=["GET"])
     def api_check_in():
         global check_in_message, check_in_generated_at
