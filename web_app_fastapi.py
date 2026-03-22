@@ -1303,6 +1303,51 @@ def create_app() -> Flask:
         @sio.on("disconnect")
         async def _ws_disconnect(sid):
             SOCKET_SESSIONS.pop(sid, None)
+            try:
+                import angel_realtime_server as _ars
+
+                await _ars.on_socket_disconnect(sid, sio)
+            except Exception:
+                traceback.print_exc()
+
+        @sio.on("realtime_start")
+        async def _evt_realtime_start(sid, data=None):
+            try:
+                import angel_realtime_server as _ars
+
+                await _ars.handle_realtime_start(sio, sid, angel, data)
+            except Exception as e:
+                traceback.print_exc()
+                await sio.emit("realtime_error", {"message": str(e)}, room=sid)
+
+        @sio.on("realtime_audio_chunk")
+        async def _evt_realtime_audio_chunk(sid, data):
+            try:
+                import angel_realtime_server as _ars
+
+                await _ars.handle_realtime_audio_chunk(sio, sid, data)
+            except Exception:
+                traceback.print_exc()
+
+        @sio.on("realtime_text")
+        async def _evt_realtime_text(sid, data):
+            try:
+                import angel_realtime_server as _ars
+
+                await _ars.handle_realtime_text(sio, sid, angel, data)
+            except Exception as e:
+                traceback.print_exc()
+                await sio.emit("realtime_error", {"message": str(e)}, room=sid)
+
+        @sio.on("realtime_stop")
+        async def _evt_realtime_stop(sid, data=None):
+            try:
+                import angel_realtime_server as _ars
+
+                await _ars.handle_realtime_stop(sio, sid)
+            except Exception as e:
+                traceback.print_exc()
+                await sio.emit("realtime_error", {"message": str(e)}, room=sid)
 
         @sio.on("user_text")
         async def _ws_user_text(sid, data):
