@@ -189,11 +189,17 @@ def _normalize_memories(memories: Any) -> list[dict]:
 
 def iter_self_modifications(memories: list) -> list[dict[str, Any]]:
     """Latest record per modification_id (Mem0 may store multiple versions)."""
+    from angel import CATEGORY_SELF_MODIFICATION as _sm_cat
+
+    n_in = len(memories) if isinstance(memories, list) else 0
     by_id: dict[str, dict[str, Any]] = {}
+    n_cat = 0
+    n_parse_fail = 0
     for m in _normalize_memories(memories):
         meta = m.get("metadata") if isinstance(m, dict) else {}
-        if not isinstance(meta, dict) or meta.get("category") != CATEGORY_SELF_MODIFICATION:
+        if not isinstance(meta, dict) or meta.get("category") != _sm_cat:
             continue
+        n_cat += 1
         raw = (m.get("memory") or m.get("data") or "").strip()
         if not raw:
             continue
@@ -210,7 +216,13 @@ def iter_self_modifications(memories: list) -> list[dict[str, Any]]:
             if not prev or u_new >= u_old:
                 by_id[mid] = rec
         except Exception:
+            n_parse_fail += 1
             continue
+    print(
+        f"[selfmod] iter_self_modifications: raw_memories={n_in} "
+        f"category_self_modification={n_cat} parse_fail={n_parse_fail} unique_ids={len(by_id)}",
+        flush=True,
+    )
     return list(by_id.values())
 
 
@@ -220,16 +232,46 @@ def _save_modification_memory(
     use_mem0_cloud: bool,
     record: dict[str, Any],
 ) -> None:
-    from angel import add_structured_memory
+    from angel import (
+        CATEGORY_SELF_MODIFICATION,
+        _load_local_memory_entries,
+        add_structured_memory,
+    )
 
-    add_structured_memory(
+    mid = (record.get("modification_id") or "").strip()
+    title = (record.get("title") or "").strip()
+    print(f"[selfmod] saving proposal: {mid!r} {title!r}", flush=True)
+
+    def _count_self_mod_rows() -> int:
+        try:
+            return sum(
+                1
+                for e in _load_local_memory_entries(user_id)
+                if isinstance(e, dict)
+                and isinstance(e.get("metadata"), dict)
+                and e["metadata"].get("category") == CATEGORY_SELF_MODIFICATION
+            )
+        except Exception:
+            return -1
+
+    before = _count_self_mod_rows()
+    text = json.dumps(record, ensure_ascii=False)
+    ok_local = add_structured_memory(
         memory_client,
         user_id,
-        json.dumps(record, ensure_ascii=False),
+        text,
         CATEGORY_SELF_MODIFICATION,
         person_name=None,
         use_mem0_cloud=use_mem0_cloud,
     )
+    after = _count_self_mod_rows()
+    result = {
+        "local_append_ok": ok_local,
+        "local_self_mod_rows_before": before,
+        "local_self_mod_rows_after": after,
+        "use_mem0_cloud": use_mem0_cloud,
+    }
+    print(f"[selfmod] save result: {result}", flush=True)
 
 
 def mirror_mod_file(files_cabinet: Any, record: dict[str, Any]) -> None:
@@ -573,6 +615,8 @@ If nothing is worth changing, return {"proposals": [], "safety_note": "..."}."""
     if not isinstance(proposals, list):
         proposals = []
 
+    print(f"[selfmod] generated {len(proposals)} proposals", flush=True)
+
     n = 0
     for p in proposals[:max_proposals]:
         if not isinstance(p, dict):
@@ -607,9 +651,12 @@ If nothing is worth changing, return {"proposals": [], "safety_note": "..."}."""
         n += 1
 
     if n:
+        print(f"[selfmod] proposals saved successfully (n={n})", flush=True)
         set_pending_proposal_notification(
             "I've been observing our interactions and I have a proposed modification to how I operate. Want to review it?"
         )
+    else:
+        print("[selfmod] no proposals saved (model empty, safety filter, or save failure)", flush=True)
     return {"ok": True, "count": n, "safety_note": data.get("safety_note")}
 
 
@@ -737,4 +784,8 @@ def api_list_proposals(memory_client, user_id: str, use_mem0_cloud: bool) -> lis
     from angel import fetch_combined_memories
 
     mem = fetch_combined_memories(memory_client, user_id, use_mem0_cloud)
-    return iter_self_modifications(mem)
+    nraw = len(mem) if isinstance(mem, list) else 0
+    print(f"[selfmod] api_list_proposals: fetch_combined_memories -> {nraw} raw rows", flush=True)
+    out = iter_self_modifications(mem)
+    print(f"[selfmod] api_list_proposals: returning {len(out)} proposal record(s)", flush=True)
+    return out

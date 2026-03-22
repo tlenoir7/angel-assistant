@@ -427,7 +427,8 @@ def _load_local_memories(user_id: str):
         return []
 
 
-def _append_local_memory(user_id: str, memory_text: str, metadata: dict):
+def _append_local_memory(user_id: str, memory_text: str, metadata: dict) -> bool:
+    """Append one memory row to tyler_memories.json. Returns True if written."""
     try:
         data = _load_local_memory_file_data()
         users = data.setdefault("users", {})
@@ -446,8 +447,32 @@ def _append_local_memory(user_id: str, memory_text: str, metadata: dict):
             }
         )
         _write_local_memory_file_silent(data)
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _memory_dedupe_key(m: dict) -> str | None:
+    """
+    Stable key so we can merge Mem0 + local JSON without duplicating the same row.
+    Prefer Mem0 id when present; else category + full body text.
+    """
+    if not isinstance(m, dict):
+        return None
+    for k in ("id", "memory_id", "memoryId"):
+        v = m.get(k)
+        if v is not None and str(v).strip():
+            return f"id:{str(v).strip()}"
+    meta = m.get("metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+    cat = (meta.get("category") or "").strip()
+    body = m.get("memory") or m.get("data") or ""
+    if not isinstance(body, str):
+        body = str(body or "")
+    if not body.strip():
+        return None
+    return f"cat:{cat}\0{body}"
 
 
 def _load_local_memory_entries(user_id: str) -> list:
@@ -906,9 +931,10 @@ def add_structured_memory(
     category: str,
     person_name: str | None = None,
     use_mem0_cloud: bool = False,
-) -> None:
+) -> bool:
     """
     Store a pattern or person profile in memory (local JSON and optionally Mem0).
+    Returns True if the row was appended to local JSON (required for durability).
     """
     metadata = {
         "category": category,
@@ -917,7 +943,13 @@ def add_structured_memory(
     }
     if person_name:
         metadata["person_name"] = person_name.strip()
-    _append_local_memory(user_id, text, metadata)
+    ok_local = _append_local_memory(user_id, text, metadata)
+    if not ok_local:
+        print(
+            f"{Fore.RED}Warning: could not append structured memory to local JSON "
+            f"(category={category!r}){Style.RESET_ALL}"
+        )
+    cloud_err: str | None = None
     if use_mem0_cloud and hasattr(memory_client, "add"):
         messages = [
             {"role": "user", "content": f"[Angel internal] Store: {text[:500]}"},
@@ -927,6 +959,7 @@ def add_structured_memory(
             memory_client.add(messages, user_id=user_id, metadata=metadata)
         except Exception as e:
             print(f"{Fore.RED}Warning: could not store structured memory in cloud: {e}{Style.RESET_ALL}")
+    return ok_local
 
 
 def extract_stage2_from_reply(reply: str) -> tuple[str, str | None, tuple[str, str] | None]:
@@ -1701,7 +1734,11 @@ def build_memory_summary_with_sections(
 
 def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -> list:
     """
-    Mem0 (or API) memories plus local JSON when not using Mem0 cloud—same merge rules as AngelCore.
+    Mem0 (or API) memories plus local JSON.
+
+    When Mem0 cloud is enabled, ``add_structured_memory`` still appends every structured row
+    to ``tyler_memories.json``. We merge those local rows here so reads match writes even if
+    Mem0 add fails, lags, or drops metadata.
     """
     try:
         raw = memory_client.get_all(user_id=user_id)
@@ -1723,6 +1760,27 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
         local = _load_local_memories(user_id)
         if isinstance(local, list):
             combined.extend(local)
+    else:
+        # Merge local JSON rows not already represented in Mem0 results.
+        seen: set[str] = set()
+        for m in combined:
+            if isinstance(m, dict):
+                k = _memory_dedupe_key(m)
+                if k:
+                    seen.add(k)
+        local = _load_local_memories(user_id)
+        if isinstance(local, list):
+            for m in local:
+                if not isinstance(m, dict):
+                    continue
+                k = _memory_dedupe_key(m)
+                if k is None:
+                    combined.append(m)
+                    continue
+                if k not in seen:
+                    combined.append(m)
+                    seen.add(k)
+
     return combined
 
 
