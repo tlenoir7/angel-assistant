@@ -35,7 +35,17 @@ AGENT_ROLES = frozenset(
 MAX_PARALLEL_AGENTS = 5
 MAX_TAVILY_PER_AGENT = 3
 AGENT_MODEL = "claude-haiku-4-5"
-COORDINATOR_MODEL = "claude-sonnet-4-5"
+
+# Coordinator: Haiku for standard (speed); Sonnet snapshot for deep runs.
+COORDINATOR_MODEL_STANDARD = "claude-haiku-4-5-20251001"
+COORDINATOR_MODEL_DEEP = "claude-sonnet-4-20250514"
+
+# Per-agent output caps (by depth); keeps synthesis input small.
+AGENT_WORD_LIMIT_STANDARD = 400
+AGENT_WORD_LIMIT_DEEP = 600
+# ~chars per word for max_tokens hint to Haiku (call_claude)
+_AGENT_MAX_TOKENS_STANDARD = 750
+_AGENT_MAX_TOKENS_DEEP = 1100
 
 # Shared memory injected into all agents + coordinator (~2000 tokens max; no per-agent Mem0).
 MAX_MEMORY_CONTEXT_TOKENS = 2000
@@ -54,6 +64,26 @@ def _cap_memory_context(text: str) -> str:
 def prepare_shared_memory_context(memory_summary: str | None) -> str:
     """Cap a pre-fetched memory blob for parallel runs (call once per turn in generate_reply)."""
     return _cap_memory_context(memory_summary or "")
+
+
+def _normalize_depth(depth: str | None) -> str:
+    d = (depth or "standard").strip().lower()
+    return "deep" if d == "deep" else "standard"
+
+
+def _agent_word_limit_for_depth(depth: str) -> int:
+    return AGENT_WORD_LIMIT_DEEP if depth == "deep" else AGENT_WORD_LIMIT_STANDARD
+
+
+def _truncate_to_word_count(text: str, max_words: int) -> str:
+    words = (text or "").split()
+    if len(words) <= max_words:
+        return (text or "").strip()
+    return " ".join(words[:max_words]).rstrip() + "…"
+
+
+def _coordinator_model_for_depth(depth: str) -> str:
+    return COORDINATOR_MODEL_DEEP if depth == "deep" else COORDINATOR_MODEL_STANDARD
 
 
 def _ts() -> str:
@@ -167,9 +197,20 @@ def _run_one_agent(
     memory_context: str,
     anthropic_client: Any,
     api_key: str | None,
+    depth: str = "standard",
 ) -> AgentTask:
     """Run one specialist agent: Tavily + Haiku only (no Mem0; memory_context is pre-fetched)."""
     from angel import call_claude
+
+    d = _normalize_depth(depth)
+    word_limit = _agent_word_limit_for_depth(d)
+    agent_max_tokens = (
+        _AGENT_MAX_TOKENS_DEEP if d == "deep" else _AGENT_MAX_TOKENS_STANDARD
+    )
+    density = (
+        f"Keep your response under {word_limit} words. Be dense and specific. "
+        "No preamble. Lead with the most important finding."
+    )
 
     _update_task(task, status="running", started_at=_ts(), error=None)
     try:
@@ -181,7 +222,11 @@ def _run_one_agent(
                 task.agent_role,
                 task.instruction,
             )
-        system = _role_system_prompt(task.agent_role)
+        system = (
+            _role_system_prompt(task.agent_role)
+            + "\n\n"
+            + density
+        )
         user = (
             f"Shared mission context (Tyler):\n{shared_context[:4000]}\n\n"
             f"Task-specific context:\n{task.context[:3000]}\n\n"
@@ -197,8 +242,9 @@ def _run_one_agent(
             user,
             model=AGENT_MODEL,
             prior_turns=None,
+            max_tokens=agent_max_tokens,
         )
-        out = (out or "").strip()
+        out = _truncate_to_word_count((out or "").strip(), word_limit)
         _update_task(
             task,
             status="complete",
@@ -225,8 +271,12 @@ def _synthesize(
     memory_context: str,
     agent_phase_sec: float,
     estimated_sequential_sec: float,
+    depth: str = "standard",
 ) -> str:
     from angel import call_claude
+
+    d = _normalize_depth(depth)
+    coord_model = _coordinator_model_for_depth(d)
 
     blocks = []
     for t in tasks:
@@ -261,7 +311,7 @@ def _synthesize(
         anthropic_client,
         system,
         user,
-        model=COORDINATOR_MODEL,
+        model=coord_model,
         prior_turns=None,
     ).strip()
 
@@ -275,9 +325,11 @@ def run_parallel_agents(
     memory_summary: str | None = None,
     memory_client: Any | None = None,
     use_mem0_cloud: bool = False,
+    depth: str = "standard",
 ) -> dict[str, Any]:
     """
-    Run up to ``MAX_PARALLEL_AGENTS`` agents in parallel; coordinator synthesizes with Sonnet.
+    Run up to ``MAX_PARALLEL_AGENTS`` agents in parallel; coordinator synthesizes (Haiku if
+    ``depth`` is standard, Sonnet snapshot if ``depth`` is ``deep``).
 
     Memory is resolved **once** before any agent thread runs:
     - If ``memory_summary`` is non-empty, it is capped and used (no Mem0 call).
@@ -288,6 +340,7 @@ def run_parallel_agents(
 
     Returns ``results``, ``synthesis``, ``agents_used``, ``total_time``, ``task_ids``.
     """
+    depth_norm = _normalize_depth(depth)
     t_total_start = time.perf_counter()
     api_key = (os.getenv("TAVILY_API_KEY") or "").strip() or None
 
@@ -368,6 +421,7 @@ def run_parallel_agents(
                 memory_context=memory_context,
                 anthropic_client=anthropic_client,
                 api_key=api_key,
+                depth=depth_norm,
             )
             future_to_index[fut] = i
         slot: list[AgentTask | None] = [None] * len(norm)
@@ -395,6 +449,7 @@ def run_parallel_agents(
         memory_context=memory_context,
         agent_phase_sec=agent_phase_sec,
         estimated_sequential_sec=seq_est,
+        depth=depth_norm,
     )
     synth_elapsed = time.perf_counter() - t_synth_start
     print(f"[parallel] synthesis complete in {synth_elapsed:.2f}s", flush=True)
@@ -408,6 +463,8 @@ def run_parallel_agents(
         "agents_used": len(ordered),
         "total_time": elapsed,
         "task_ids": [t.task_id for t in ordered],
+        "depth": depth_norm,
+        "coordinator_model": _coordinator_model_for_depth(depth_norm),
         "estimated_sequential_time_sec": seq_est,
         "time_saved_note": (
             f"Parallel run ~{elapsed:.1f}s vs ~{seq_est:.0f}s estimated sequential wall time "
@@ -550,4 +607,5 @@ def run_research_decomposed(
         memory_client=memory_client,
         use_mem0_cloud=use_mem0_cloud,
         user_id=user_id,
+        depth=depth,
     )

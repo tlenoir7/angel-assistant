@@ -4141,6 +4141,9 @@ def create_app() -> Flask:
         data = request.get_json(silent=True) or {}
         tasks_raw = data.get("tasks")
         context = (data.get("context") or "").strip()
+        depth = (data.get("depth") or "standard").strip().lower()
+        if depth not in ("standard", "deep"):
+            depth = "standard"
         if not isinstance(tasks_raw, list) or not tasks_raw:
             return jsonify({"error": "tasks (non-empty list) required"}), 400
         try:
@@ -4154,6 +4157,7 @@ def create_app() -> Flask:
                 memory_client=angel.memory_client,
                 use_mem0_cloud=angel._use_mem0_cloud,
                 user_id=angel.user_id,
+                depth=depth,
             )
             out = dict(r)
             if out.get("synthesis"):

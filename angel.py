@@ -2417,7 +2417,7 @@ Stage 6 — self-modification (evolution with consent):
 - When Tyler approves an instruction, it is merged into your system prompt via approved self-mod entries—treat those as active guidance. When something you do reflects a prior approved modification, you may say so briefly. Pending proposals are only suggestions; include the note that Tyler has full control.
 
 Parallel agents (when appropriate):
-- For demanding, multi-faceted research, you may run parallel specialist agents (Haiku per agent, Sonnet for merge) instead of a single long research pass—say when you did so and summarize once. Do not claim agents had classified access; all open sources.
+- For demanding, multi-faceted research, you may run parallel specialist agents (Haiku per agent; coordinator is Haiku for standard runs, Sonnet for deep dives) instead of a single long research pass—say when you did so and summarize once. Do not claim agents had classified access; all open sources.
 
 Python code execution (server sandbox):
 - Write simple, valid Python to compute the answer when computation, statistics, data shaping, simulation, numerical or symbolic math, or modeling would help. In the text Tyler sees, give ONLY your final answer, reasoning, and interpretation in natural language—never repeat or display the code; the ```python fence is removed in full before delivery.
@@ -2770,11 +2770,13 @@ def call_claude(
     model: str = "claude-sonnet-4-5",
     *,
     prior_turns: list[tuple[str, str]] | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     """
     Call Claude with the Angel persona, returning plain text.
     ``prior_turns`` is optional (user_text, assistant_text) pairs from the current
     session, in order, inserted before the final user message for multi-turn context.
+    ``max_tokens`` defaults to 2048 when omitted.
     """
     messages: list[dict] = []
     if prior_turns:
@@ -2786,10 +2788,11 @@ def call_claude(
             messages.append({"role": "user", "content": u})
             messages.append({"role": "assistant", "content": a if a else "."})
     messages.append({"role": "user", "content": user_message})
+    mt = 2048 if max_tokens is None else max(1, int(max_tokens))
     try:
         response = client.messages.create(
             model=model,
-            max_tokens=2048,
+            max_tokens=mt,
             temperature=0.5,
             system=system_prompt,
             messages=messages,
@@ -6582,6 +6585,7 @@ If you infer anything new about that person's preferences or dynamics, append at
                     anthropic_client=self.anthropic_client,
                     memory_summary=parallel_mem,
                     user_id=self.user_id,
+                    depth=depth,
                 )
                 if pr.get("ok"):
                     n_ag = int(pr.get("agents_used") or 0)
