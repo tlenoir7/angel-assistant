@@ -494,6 +494,26 @@ def _memory_dedupe_key(m: dict) -> str | None:
     return f"cat:{cat}\0{body}"
 
 
+def _memory_row_category(m: dict) -> str | None:
+    """Best-effort category for a Mem0 or local JSON memory row (for merge + debug)."""
+    if not isinstance(m, dict):
+        return None
+    meta = m.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    c = meta.get("category") or meta.get("Category")
+    if c is None:
+        c = m.get("category")
+    if c is not None and str(c).strip():
+        return str(c).strip()
+    return None
+
+
 def _load_local_memory_entries(user_id: str) -> list:
     """Return the raw list of memory entry dicts for user_id from tyler_memories.json."""
     try:
@@ -1767,7 +1787,13 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
     When Mem0 cloud is enabled, ``add_structured_memory`` still appends every structured row
     to ``tyler_memories.json``. We merge those local rows here so reads match writes even if
     Mem0 add fails, lags, or drops metadata.
+
+    Structured categories (Stage 2 + Stage 6) are always merged from local JSON without
+    dedupe against Mem0: local is canonical for those rows and Mem0 may omit or reshape them.
     """
+    uid_log = (user_id or "").strip() or "(empty)"
+    print(f"[fetch] fetch_combined_memories user_id={uid_log!r} use_mem0_cloud={use_mem0_cloud!r}", flush=True)
+
     try:
         raw = memory_client.get_all(user_id=user_id)
         if isinstance(raw, dict) and "results" in raw:
@@ -1785,31 +1811,92 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
         combined.extend(memories["results"])
 
     if not use_mem0_cloud:
-        local = _load_local_memories(user_id)
-        if isinstance(local, list):
-            combined.extend(local)
-    else:
-        # Merge local JSON rows not already represented in Mem0 results.
-        seen: set[str] = set()
-        for m in combined:
-            if isinstance(m, dict):
-                k = _memory_dedupe_key(m)
-                if k:
-                    seen.add(k)
-        local = _load_local_memories(user_id)
-        if isinstance(local, list):
-            for m in local:
-                if not isinstance(m, dict):
-                    continue
-                k = _memory_dedupe_key(m)
-                if k is None:
-                    combined.append(m)
-                    continue
-                if k not in seen:
-                    combined.append(m)
-                    seen.add(k)
+        local_rows = _load_local_memories(user_id)
+        n_local = len(local_rows) if isinstance(local_rows, list) else 0
+        n_local_sm = (
+            sum(
+                1
+                for r in (local_rows or [])
+                if isinstance(r, dict) and _memory_row_category(r) == CATEGORY_SELF_MODIFICATION
+            )
+            if isinstance(local_rows, list)
+            else 0
+        )
+        print(f"[fetch] local memories loaded: {n_local}", flush=True)
+        print(f"[fetch] local self_mod rows: {n_local_sm}", flush=True)
+        if isinstance(local_rows, list):
+            combined.extend(local_rows)
+        merged = combined
+        n_merged_sm = sum(
+            1
+            for r in merged
+            if isinstance(r, dict) and _memory_row_category(r) == CATEGORY_SELF_MODIFICATION
+        )
+        print(f"[fetch] after merge total: {len(merged)}", flush=True)
+        print(f"[fetch] after merge self_mod rows: {n_merged_sm}", flush=True)
+        return merged
 
-    return combined
+    # Mem0 cloud: merge local JSON; structured rows always included (no dedupe vs Mem0).
+    seen: set[str] = set()
+    for m in combined:
+        if isinstance(m, dict):
+            k = _memory_dedupe_key(m)
+            if k:
+                seen.add(k)
+
+    local_rows = _load_local_memories(user_id)
+    n_local = len(local_rows) if isinstance(local_rows, list) else 0
+    n_local_sm = (
+        sum(
+            1
+            for r in (local_rows or [])
+            if isinstance(r, dict) and _memory_row_category(r) == CATEGORY_SELF_MODIFICATION
+        )
+        if isinstance(local_rows, list)
+        else 0
+    )
+    print(f"[fetch] local memories loaded: {n_local}", flush=True)
+    print(f"[fetch] local self_mod rows: {n_local_sm}", flush=True)
+
+    added_structured = 0
+    added_dedupe = 0
+    skipped_dedupe = 0
+
+    if isinstance(local_rows, list):
+        for m in local_rows:
+            if not isinstance(m, dict):
+                continue
+            cat = _memory_row_category(m)
+            if cat in _STRUCTURED_MEMORY_CATEGORIES:
+                combined.append(m)
+                added_structured += 1
+                continue
+            k = _memory_dedupe_key(m)
+            if k is None:
+                combined.append(m)
+                added_dedupe += 1
+                continue
+            if k not in seen:
+                combined.append(m)
+                seen.add(k)
+                added_dedupe += 1
+            else:
+                skipped_dedupe += 1
+
+    merged = combined
+    n_merged_sm = sum(
+        1
+        for r in merged
+        if isinstance(r, dict) and _memory_row_category(r) == CATEGORY_SELF_MODIFICATION
+    )
+    print(f"[fetch] after merge total: {len(merged)}", flush=True)
+    print(f"[fetch] after merge self_mod rows: {n_merged_sm}", flush=True)
+    print(
+        f"[fetch] merge stats: structured_always_merged={added_structured} "
+        f"non_struct_added={added_dedupe} non_struct_skipped_dedupe={skipped_dedupe}",
+        flush=True,
+    )
+    return merged
 
 
 def _memories_excluding_reflection_reports(memories) -> list:
