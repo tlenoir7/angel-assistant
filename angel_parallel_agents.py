@@ -4,14 +4,13 @@ Multi-agent parallel coordination for Angel — specialized agents + coordinator
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,6 +36,24 @@ MAX_PARALLEL_AGENTS = 5
 MAX_TAVILY_PER_AGENT = 3
 AGENT_MODEL = "claude-haiku-4-5"
 COORDINATOR_MODEL = "claude-sonnet-4-5"
+
+# Shared memory injected into all agents + coordinator (~2000 tokens max; no per-agent Mem0).
+MAX_MEMORY_CONTEXT_TOKENS = 2000
+_CHARS_PER_TOKEN_EST = 4
+MAX_MEMORY_CONTEXT_CHARS = MAX_MEMORY_CONTEXT_TOKENS * _CHARS_PER_TOKEN_EST
+
+
+def _cap_memory_context(text: str) -> str:
+    """Truncate to a concise shared context (~MAX_MEMORY_CONTEXT_TOKENS tokens, char-estimate)."""
+    t = (text or "").strip()
+    if len(t) <= MAX_MEMORY_CONTEXT_CHARS:
+        return t
+    return t[: MAX_MEMORY_CONTEXT_CHARS - 1].rstrip() + "…"
+
+
+def prepare_shared_memory_context(memory_summary: str | None) -> str:
+    """Cap a pre-fetched memory blob for parallel runs (call once per turn in generate_reply)."""
+    return _cap_memory_context(memory_summary or "")
 
 
 def _ts() -> str:
@@ -147,10 +164,11 @@ def _run_one_agent(
     task: AgentTask,
     *,
     shared_context: str,
-    memory_excerpt: str,
+    memory_context: str,
     anthropic_client: Any,
     api_key: str | None,
 ) -> AgentTask:
+    """Run one specialist agent: Tavily + Haiku only (no Mem0; memory_context is pre-fetched)."""
     from angel import call_claude
 
     _update_task(task, status="running", started_at=_ts(), error=None)
@@ -168,7 +186,7 @@ def _run_one_agent(
             f"Shared mission context (Tyler):\n{shared_context[:4000]}\n\n"
             f"Task-specific context:\n{task.context[:3000]}\n\n"
             f"Your instruction:\n{task.instruction}\n\n"
-            f"Relevant memory excerpt:\n{memory_excerpt[:2500]}\n\n"
+            f"Relevant memory context (shared, pre-loaded for this run):\n{memory_context}\n\n"
             f"Open-web snippets (Tavily):\n{web_blob[:8000]}\n\n"
             "Respond in plain text with clear sections: Summary, Key findings, "
             "Sources/themes (no fake URLs), Notes/uncertainty."
@@ -204,7 +222,7 @@ def _synthesize(
     topic: str,
     shared_context: str,
     tasks: list[AgentTask],
-    memory_excerpt: str,
+    memory_context: str,
     agent_phase_sec: float,
     estimated_sequential_sec: float,
 ) -> str:
@@ -235,7 +253,7 @@ def _synthesize(
         f"Coordination metadata: {n} agents ({roles_csv}); parallel agent phase ~{agent_phase_sec:.1f}s; "
         f"estimated sequential wall time ~{estimated_sequential_sec:.0f}s.\n\n"
         f"Shared context:\n{shared_context[:4000]}\n\n"
-        f"Memory excerpt:\n{memory_excerpt[:2000]}\n\n"
+        f"Memory context (shared, pre-loaded; no additional memory retrieval):\n{memory_context}\n\n"
         "Agent outputs:\n"
         + "\n".join(blocks)
     )
@@ -253,15 +271,24 @@ def run_parallel_agents(
     shared_context: str,
     *,
     anthropic_client: Any,
-    memory_summary: str,
     user_id: str,
+    memory_summary: str | None = None,
+    memory_client: Any | None = None,
+    use_mem0_cloud: bool = False,
 ) -> dict[str, Any]:
     """
     Run up to ``MAX_PARALLEL_AGENTS`` agents in parallel; coordinator synthesizes with Sonnet.
 
+    Memory is resolved **once** before any agent thread runs:
+    - If ``memory_summary`` is non-empty, it is capped and used (no Mem0 call).
+    - Else if ``memory_client`` is set, ``fetch_combined_memories`` runs once and a summary is built.
+    - Otherwise agents run with empty memory context.
+
+    Agents receive only this shared string — they never call Mem0.
+
     Returns ``results``, ``synthesis``, ``agents_used``, ``total_time``, ``task_ids``.
     """
-    t0 = time.perf_counter()
+    t_total_start = time.perf_counter()
     api_key = (os.getenv("TAVILY_API_KEY") or "").strip() or None
 
     norm: list[AgentTask] = []
@@ -288,7 +315,6 @@ def run_parallel_agents(
         t.status = "pending"
         _register_task(t)
 
-    memory_excerpt = (memory_summary or "")[:12000]
     sc = (shared_context or "").strip() or f"User id: {user_id}"
 
     if not norm:
@@ -302,6 +328,35 @@ def run_parallel_agents(
             "task_ids": [],
         }
 
+    t_mem0 = time.perf_counter()
+    mem_in = (memory_summary or "").strip()
+    if mem_in:
+        memory_context = _cap_memory_context(mem_in)
+        dt_mem = time.perf_counter() - t_mem0
+        print(
+            f"[parallel] shared memory context ready in {dt_mem:.2f}s "
+            f"(pre-built, no Mem0 fetch)",
+            flush=True,
+        )
+    elif memory_client is not None:
+        from angel import build_memory_summary_with_sections, fetch_combined_memories
+
+        merged = fetch_combined_memories(memory_client, user_id, use_mem0_cloud)
+        memory_context = _cap_memory_context(
+            build_memory_summary_with_sections(merged, None)
+        )
+        dt_mem = time.perf_counter() - t_mem0
+        print(f"[parallel] memory fetch complete in {dt_mem:.2f}s", flush=True)
+    else:
+        memory_context = ""
+        dt_mem = time.perf_counter() - t_mem0
+        print(
+            f"[parallel] no memory context ({dt_mem:.2f}s); agents use Tavily + task context only",
+            flush=True,
+        )
+
+    print("[parallel] agents starting with shared context", flush=True)
+    t_pool_start = time.perf_counter()
     ordered: list[AgentTask] = []
     with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_AGENTS, len(norm))) as ex:
         future_to_index: dict[Any, int] = {}
@@ -310,7 +365,7 @@ def run_parallel_agents(
                 _run_one_agent,
                 t,
                 shared_context=sc,
-                memory_excerpt=memory_excerpt,
+                memory_context=memory_context,
                 anthropic_client=anthropic_client,
                 api_key=api_key,
             )
@@ -326,20 +381,26 @@ def run_parallel_agents(
                 slot[idx] = tt
         ordered = [s for s in slot if s is not None]
 
-    agent_phase_sec = time.perf_counter() - t0
+    agent_phase_sec = time.perf_counter() - t_pool_start
+    print(f"[parallel] all agents complete in {agent_phase_sec:.2f}s", flush=True)
+
     seq_est = float(len(ordered) * 48)
     topic = sc[:500]
+    t_synth_start = time.perf_counter()
     synthesis = _synthesize(
         anthropic_client,
         topic=topic,
         shared_context=sc,
         tasks=ordered,
-        memory_excerpt=memory_excerpt,
+        memory_context=memory_context,
         agent_phase_sec=agent_phase_sec,
         estimated_sequential_sec=seq_est,
     )
+    synth_elapsed = time.perf_counter() - t_synth_start
+    print(f"[parallel] synthesis complete in {synth_elapsed:.2f}s", flush=True)
 
-    elapsed = time.perf_counter() - t0
+    elapsed = time.perf_counter() - t_total_start
+    print(f"[parallel] total time {elapsed:.2f}s", flush=True)
     return {
         "ok": True,
         "results": [t.to_dict() for t in ordered],
@@ -474,15 +535,19 @@ def run_research_decomposed(
     *,
     depth: str,
     anthropic_client: Any,
-    memory_summary: str,
     user_id: str,
     user_message: str = "",
+    memory_summary: str | None = None,
+    memory_client: Any | None = None,
+    use_mem0_cloud: bool = False,
 ) -> dict[str, Any]:
     tasks = decompose_into_parallel_tasks(topic, user_message or topic, depth=depth)
     return run_parallel_agents(
         tasks,
-        shared_context=topic,
+        topic,
         anthropic_client=anthropic_client,
         memory_summary=memory_summary,
+        memory_client=memory_client,
+        use_mem0_cloud=use_mem0_cloud,
         user_id=user_id,
     )

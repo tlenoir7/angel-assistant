@@ -6574,11 +6574,13 @@ If you infer anything new about that person's preferences or dynamics, append at
                 print(
                     f"{Fore.BLUE}Angel: parallel agents ({len(tasks)}) — {ptopic[:100]!r}…{Style.RESET_ALL}"
                 )
+                # Single Mem0 fetch for this turn is already done above; parallel run reuses capped summary only.
+                parallel_mem = apa.prepare_shared_memory_context(memory_summary)
                 pr = apa.run_parallel_agents(
                     tasks,
                     ptopic,
                     anthropic_client=self.anthropic_client,
-                    memory_summary=memory_summary,
+                    memory_summary=parallel_mem,
                     user_id=self.user_id,
                 )
                 if pr.get("ok"):

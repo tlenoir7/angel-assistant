@@ -4145,15 +4145,14 @@ def create_app() -> Flask:
             return jsonify({"error": "tasks (non-empty list) required"}), 400
         try:
             import angel_parallel_agents as apa
-            from angel import build_memory_summary_with_sections
 
-            mem = angel._fetch_combined_memories()
-            ms = build_memory_summary_with_sections(mem, None)
             r = apa.run_parallel_agents(
                 tasks_raw[:5],
                 context or "Manual parallel run",
                 anthropic_client=angel.anthropic_client,
-                memory_summary=ms,
+                memory_summary=None,
+                memory_client=angel.memory_client,
+                use_mem0_cloud=angel._use_mem0_cloud,
                 user_id=angel.user_id,
             )
             out = dict(r)
@@ -4179,17 +4178,16 @@ def create_app() -> Flask:
             return jsonify({"error": "topic required"}), 400
         try:
             import angel_parallel_agents as apa
-            from angel import build_memory_summary_with_sections
 
-            mem = angel._fetch_combined_memories()
-            ms = build_memory_summary_with_sections(mem, None)
             r = apa.run_research_decomposed(
                 topic,
                 depth=depth,
                 anthropic_client=angel.anthropic_client,
-                memory_summary=ms,
                 user_id=angel.user_id,
                 user_message=topic,
+                memory_summary=None,
+                memory_client=angel.memory_client,
+                use_mem0_cloud=angel._use_mem0_cloud,
             )
             out = dict(r)
             if out.get("synthesis"):
