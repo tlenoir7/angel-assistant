@@ -480,6 +480,7 @@ def _network_upsert_structured_memory(
     entity_key: str,
     text: str,
     use_mem0_cloud: bool,
+    skip_mem0: bool = False,
 ) -> None:
     """Replace prior local row with same category+network_entity_key; mirror to Mem0 when enabled."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -507,6 +508,8 @@ def _network_upsert_structured_memory(
         _save_local_memory_entries(user_id, filtered)
     except Exception:
         pass
+    if skip_mem0:
+        return
     if use_mem0_cloud and hasattr(memory_client, "add"):
         try:
             messages = [
@@ -740,6 +743,8 @@ class FilesCabinet:
         name: str,
         content: str,
         tags: list[str] | None = None,
+        *,
+        skip_mem0: bool = False,
     ) -> dict:
         file_name = (name or "").strip()
         if not file_name:
@@ -757,9 +762,10 @@ class FilesCabinet:
             created_at=now,
             updated_at=now,
         )
-        mem0_id = self._push_mem0(body, dict(meta))
-        if mem0_id:
-            meta["mem0_memory_id"] = mem0_id
+        if not skip_mem0:
+            mem0_id = self._push_mem0(body, dict(meta))
+            if mem0_id:
+                meta["mem0_memory_id"] = mem0_id
         _append_local_memory(self.user_id, body, meta)
         return self.get_file(file_name) or {
             "name": file_name,
@@ -770,7 +776,7 @@ class FilesCabinet:
             "tags": tags_list,
         }
 
-    def update_file(self, name: str, new_content: str) -> dict:
+    def update_file(self, name: str, new_content: str, *, skip_mem0: bool = False) -> dict:
         file_name = (name or "").strip()
         if not file_name:
             raise ValueError("File name is required.")
@@ -786,12 +792,13 @@ class FilesCabinet:
         created_before = (meta.get("created_at") or "").strip() or now
         meta.setdefault("created_at", created_before)
         body = (new_content or "").strip()
-        self._delete_mem0_for_entry(meta)
-        mem0_id = self._push_mem0(body, meta)
-        if mem0_id:
-            meta["mem0_memory_id"] = mem0_id
-        else:
-            meta.pop("mem0_memory_id", None)
+        if not skip_mem0:
+            self._delete_mem0_for_entry(meta)
+            mem0_id = self._push_mem0(body, meta)
+            if mem0_id:
+                meta["mem0_memory_id"] = mem0_id
+            else:
+                meta.pop("mem0_memory_id", None)
         entries[idx] = {
             "memory": body,
             "metadata": meta,
@@ -4510,6 +4517,24 @@ def network_load_graph(
     return nodes, list(edges_map.values())
 
 
+def network_load_graph_local_only(
+    user_id: str,
+    files_cabinet: FilesCabinet,
+) -> tuple[dict[str, dict], list[dict]]:
+    """
+    Build mission graph from local tyler_memories.json + NET-* intel files only.
+    Avoids Mem0 get_all — use during bulk seed so each add_* is fast.
+    """
+    memories = _load_local_memory_entries(user_id)
+    if not isinstance(memories, list):
+        memories = []
+    nodes, edges_map = _network_parse_nodes_edges_from_memories(memories)
+    _network_merge_local_graph_entries(user_id, nodes, edges_map)
+    _network_merge_intel_files(files_cabinet, nodes, edges_map)
+    nodes, edges_map = _network_normalize_graph_nodes_edges(nodes, edges_map)
+    return nodes, list(edges_map.values())
+
+
 def _network_incident_edges(node_id: str, all_edges: list[dict]) -> list[dict]:
     return [
         e
@@ -4523,6 +4548,8 @@ def _network_sync_intel_file_for_node(
     node_id: str,
     node: dict,
     all_edges: list[dict],
+    *,
+    skip_mem0: bool = False,
 ) -> None:
     fn = network_intel_filename(node_id)
     incident = _network_incident_edges(node_id, all_edges)
@@ -4535,12 +4562,14 @@ def _network_sync_intel_file_for_node(
     ]
     try:
         if files_cabinet.get_file(fn):
-            files_cabinet.update_file(fn, payload)
+            files_cabinet.update_file(fn, payload, skip_mem0=skip_mem0)
         else:
-            files_cabinet.create_file(NETWORK_INTEL_FOLDER, fn, payload, tags=tags)
+            files_cabinet.create_file(
+                NETWORK_INTEL_FOLDER, fn, payload, tags=tags, skip_mem0=skip_mem0
+            )
     except ValueError:
         try:
-            files_cabinet.update_file(fn, payload)
+            files_cabinet.update_file(fn, payload, skip_mem0=skip_mem0)
         except Exception:
             pass
     except Exception:
@@ -4552,11 +4581,15 @@ def _network_sync_affected_files(
     nodes: dict[str, dict],
     edges: list[dict],
     affected_ids: set[str],
+    *,
+    skip_mem0: bool = False,
 ) -> None:
     for nid in affected_ids:
         n = nodes.get(nid)
         if n:
-            _network_sync_intel_file_for_node(files_cabinet, nid, n, edges)
+            _network_sync_intel_file_for_node(
+                files_cabinet, nid, n, edges, skip_mem0=skip_mem0
+            )
 
 
 def add_network_node(
@@ -4571,6 +4604,7 @@ def add_network_node(
     files_cabinet: FilesCabinet,
     use_mem0_cloud: bool = False,
     node_id_override: str | None = None,
+    fast_local: bool = False,
 ) -> dict:
     now = _network_now_iso()
     nt = (node_type or "person").strip().lower()
@@ -4580,7 +4614,10 @@ def add_network_node(
     if rel not in NETWORK_NODE_RELEVANCE:
         rel = "MEDIUM"
     tagl = [str(t).strip() for t in (tags or []) if str(t).strip()][:30]
-    nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+    if fast_local:
+        nodes, edges = network_load_graph_local_only(user_id, files_cabinet)
+    else:
+        nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
     ovr = (node_id_override or "").strip()
     if ovr:
         nid = network_slug_from_display_name(ovr) if (" " in ovr or "/" in ovr) else ovr.lower()
@@ -4608,21 +4645,25 @@ def add_network_node(
         entity_key=nid,
         text=json.dumps(node, ensure_ascii=False),
         use_mem0_cloud=use_mem0_cloud,
+        skip_mem0=fast_local,
     )
-    _network_sync_intel_file_for_node(files_cabinet, nid, node, edges)
-    try:
-        import angel_proactive as _apro
+    _network_sync_intel_file_for_node(
+        files_cabinet, nid, node, edges, skip_mem0=fast_local
+    )
+    if not fast_local:
+        try:
+            import angel_proactive as _apro
 
-        _apro.maybe_auto_watch_from_network(
-            memory_client,
-            user_id,
-            files_cabinet,
-            use_mem0_cloud,
-            ((name or nid).strip() or nid),
-            rel,
-        )
-    except Exception:
-        pass
+            _apro.maybe_auto_watch_from_network(
+                memory_client,
+                user_id,
+                files_cabinet,
+                use_mem0_cloud,
+                ((name or nid).strip() or nid),
+                rel,
+            )
+        except Exception:
+            pass
     return node
 
 
@@ -4638,6 +4679,7 @@ def add_network_edge(
     user_id: str,
     files_cabinet: FilesCabinet,
     use_mem0_cloud: bool = False,
+    fast_local: bool = False,
 ) -> dict:
     sid = _network_normalize_node_id(source_id)
     tid = _network_normalize_node_id(target_id)
@@ -4651,7 +4693,10 @@ def add_network_edge(
     ev = (evidence or "").strip()
     now = _network_now_iso()
     eid = hashlib.sha256(f"{sid}|{tid}|{rt}|{desc[:160]}".encode("utf-8")).hexdigest()[:16]
-    nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+    if fast_local:
+        nodes, edges = network_load_graph_local_only(user_id, files_cabinet)
+    else:
+        nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
 
     def _ensure_stub(nid: str, display: str) -> None:
         if nid in nodes:
@@ -4667,11 +4712,15 @@ def add_network_edge(
             files_cabinet=files_cabinet,
             use_mem0_cloud=use_mem0_cloud,
             node_id_override=nid,
+            fast_local=fast_local,
         )
 
     _ensure_stub(sid, source_id.strip())
     _ensure_stub(tid, target_id.strip())
-    nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+    if fast_local:
+        nodes, edges = network_load_graph_local_only(user_id, files_cabinet)
+    else:
+        nodes, edges = network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
 
     edge = {
         "source_id": sid,
@@ -4692,8 +4741,11 @@ def add_network_edge(
         entity_key=eid,
         text=json.dumps(edge, ensure_ascii=False),
         use_mem0_cloud=use_mem0_cloud,
+        skip_mem0=fast_local,
     )
-    _network_sync_affected_files(files_cabinet, nodes, edges, {sid, tid})
+    _network_sync_affected_files(
+        files_cabinet, nodes, edges, {sid, tid}, skip_mem0=fast_local
+    )
     return edge
 
 
@@ -5142,6 +5194,7 @@ def reset_mission_network_and_reseed(
             files_cabinet,
             use_mem0_cloud,
             force=True,
+            timeout_seconds=90.0,
         )
         nodes, edges = network_load_graph(
             memory_client, user_id, use_mem0_cloud, files_cabinet
@@ -5161,6 +5214,207 @@ def reset_mission_network_and_reseed(
     return out
 
 
+def _network_background_mem0_full_sync(
+    memory_client,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: FilesCabinet,
+) -> None:
+    """Push local network_node / network_edge rows and NET-* files to Mem0 (runs in a daemon thread)."""
+    if not use_mem0_cloud:
+        return
+    try:
+        for entry in _load_local_memory_entries(user_id):
+            if not isinstance(entry, dict):
+                continue
+            meta = entry.get("metadata") or {}
+            if not isinstance(meta, dict):
+                continue
+            cat = meta.get("category")
+            if cat not in (CATEGORY_NETWORK_NODE, CATEGORY_NETWORK_EDGE):
+                continue
+            ek = (meta.get("network_entity_key") or "").strip()
+            raw = (entry.get("memory") or entry.get("data") or "").strip()
+            if not ek or not raw:
+                continue
+            _network_upsert_structured_memory(
+                memory_client,
+                user_id,
+                category=cat,
+                entity_key=ek,
+                text=raw,
+                use_mem0_cloud=use_mem0_cloud,
+                skip_mem0=False,
+            )
+        try:
+            recs = files_cabinet.list_files(folder=NETWORK_INTEL_FOLDER)
+        except Exception:
+            recs = []
+        for rec in recs:
+            fn = (rec.get("name") or "").strip()
+            if not fn:
+                continue
+            try:
+                full = files_cabinet.get_file(fn)
+                if not full:
+                    continue
+                body = (full.get("content") or "").strip()
+                if not body:
+                    continue
+                files_cabinet.update_file(fn, body, skip_mem0=False)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    print("[seed] Mem0 background sync: finished", flush=True)
+
+
+def _seed_mission_network_if_empty_core(
+    memory_client,
+    user_id: str,
+    files_cabinet: FilesCabinet,
+    use_mem0_cloud: bool,
+    *,
+    force: bool,
+) -> bool:
+    """
+    Local-first graph seed: tyler_memories.json + NET-* files without per-row Mem0 calls.
+    Caller spawns _network_background_mem0_full_sync after this returns.
+    """
+    if not force:
+        _, edges = network_load_graph_local_only(user_id, files_cabinet)
+        if len(edges) > 0:
+            return False
+
+    # Relevance: Grusch & Elizondo CRITICAL; all other seed entities HIGH (see network summary / mission graph).
+    seed_nodes: list[tuple[str, str, str, str, list[str]]] = [
+        ("David Grusch", "person", "UAP whistleblower; former intelligence community.", "CRITICAL", ["UAP", "disclosure", "whistleblower"]),
+        ("Luis Elizondo", "person", "Former AATIP / UAP program visibility.", "CRITICAL", ["UAP", "AATIP", "disclosure"]),
+        ("Christopher Mellon", "person", "Former Deputy Assistant Secretary of Defense for Intelligence; disclosure advocate.", "HIGH", ["UAP", "disclosure", "Pentagon"]),
+        ("Ross Coulthart", "person", "Investigative journalist covering UAP.", "HIGH", ["UAP", "media", "disclosure"]),
+        ("Marco Rubio", "person", "Senior US official; public UAP-related statements.", "HIGH", ["UAP", "government"]),
+        ("AARO", "organization", "DoD All-domain Anomaly Resolution Office (UAP).", "HIGH", ["UAP", "DoD", "government"]),
+        ("House Oversight Committee", "organization", "US House committee; UAP hearings context.", "HIGH", ["UAP", "Congress", "government"]),
+        ("Pentagon", "organization", "US Department of Defense headquarters.", "HIGH", ["DoD", "government", "military"]),
+        ("NRO", "organization", "National Reconnaissance Office.", "HIGH", ["intelligence", "government"]),
+        ("NGA", "organization", "National Geospatial-Intelligence Agency.", "HIGH", ["intelligence", "government", "military"]),
+        ("AATIP", "program", "Advanced Aerospace Threat Identification Program (historical DoD UAP effort).", "HIGH", ["UAP", "DoD", "program"]),
+    ]
+    _SEED_EDGE_COUNT = 15  # 12 main graph + 3 Marco Rubio cluster edges
+
+    print(f"[seed] writing {len(seed_nodes)} nodes to local JSON", flush=True)
+    seen_seed_slugs: set[str] = set()
+    for name, nt, desc, rel, tags in seed_nodes:
+        sid = network_slug_from_display_name(name)
+        if sid in seen_seed_slugs:
+            continue
+        seen_seed_slugs.add(sid)
+        add_network_node(
+            name,
+            nt,
+            desc,
+            rel,
+            tags,
+            memory_client=memory_client,
+            user_id=user_id,
+            files_cabinet=files_cabinet,
+            use_mem0_cloud=use_mem0_cloud,
+            fast_local=True,
+        )
+
+    print(f"[seed] writing {_SEED_EDGE_COUNT} edges to local JSON", flush=True)
+
+    def e(a, b, rt, desc, st="STRONG", ev="Mission seed graph"):
+        return add_network_edge(
+            a,
+            b,
+            rt,
+            desc,
+            st,
+            ev,
+            memory_client=memory_client,
+            user_id=user_id,
+            files_cabinet=files_cabinet,
+            use_mem0_cloud=use_mem0_cloud,
+            fast_local=True,
+        )
+
+    e("David Grusch", "NRO", "connected_to", "Open-source mission context link.", ev="Seed data")
+    e("David Grusch", "NGA", "connected_to", "Open-source mission context link.", ev="Seed data")
+    e("David Grusch", "AARO", "connected_to", "UAP oversight / reporting context.", ev="Seed data")
+    e("David Grusch", "House Oversight Committee", "testified_with", "Congressional UAP hearing context.", "CONFIRMED", "Seed data")
+    e("Luis Elizondo", "Pentagon", "employed_by", "Former DoD context.", "STRONG", "Seed data")
+    e("Luis Elizondo", "AATIP", "member_of", "Program association (open sources).", "STRONG", "Seed data")
+    e("Luis Elizondo", "David Grusch", "corroborates", "Disclosure-adjacent narrative alignment (OSINT).", "MODERATE", "Seed data")
+    e("Christopher Mellon", "Pentagon", "employed_by", "Former DASD(I) role (historical).", "STRONG", "Seed data")
+    e("Christopher Mellon", "Luis Elizondo", "works_with", "Advocacy / public UAP work.", "MODERATE", "Seed data")
+    e("Christopher Mellon", "David Grusch", "corroborates", "Disclosure ecosystem.", "MODERATE", "Seed data")
+    e("Ross Coulthart", "Luis Elizondo", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
+    e("Ross Coulthart", "David Grusch", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
+    e("Ross Coulthart", "Christopher Mellon", "connected_to", "Media / public commentary.", "MODERATE", "Seed data")
+    # Marco Rubio cluster — pass canonical slugs (marco-rubio, aaro, house-oversight-committee, david-grusch)
+    _mr_edges = [
+        (
+            "marco-rubio",
+            "aaro",
+            "connected_to",
+            "Public statements on UAP governance and oversight context.",
+            "MODERATE",
+            "Seed data",
+        ),
+        (
+            "marco-rubio",
+            "house-oversight-committee",
+            "connected_to",
+            "Congressional UAP hearings / oversight context (role varies by cycle).",
+            "MODERATE",
+            "Seed data",
+        ),
+        (
+            "marco-rubio",
+            "david-grusch",
+            "corroborates",
+            "Public UAP statements aligned with disclosure themes (open sources).",
+            "WEAK",
+            "Seed data",
+        ),
+    ]
+    _mr_stored: list[dict[str, str | None]] = []
+    for src_raw, tgt_raw, rt, desc, st, ev in _mr_edges:
+        edge_out = e(src_raw, tgt_raw, rt, desc, st, ev)
+        _mr_stored.append(
+            {
+                "edge_id": edge_out.get("edge_id"),
+                "source_id": edge_out.get("source_id"),
+                "target_id": edge_out.get("target_id"),
+                "rel": rt,
+            }
+        )
+    _mission_graph_log.debug(
+        "seed_mission_network_if_empty: Marco Rubio cluster %d edges edge_ids=%s detail=%s",
+        len(_mr_stored),
+        [x.get("edge_id") for x in _mr_stored],
+        _mr_stored,
+    )
+
+    print("[seed] local write complete, starting Mem0 background sync", flush=True)
+    if use_mem0_cloud:
+        try:
+            threading.Thread(
+                target=_network_background_mem0_full_sync,
+                args=(memory_client, user_id, use_mem0_cloud, files_cabinet),
+                daemon=True,
+                name="network-graph-mem0-sync",
+            ).start()
+        except Exception:
+            pass
+    else:
+        print("[seed] skip Mem0 background sync (cloud off)", flush=True)
+
+    _mission_graph_log.info("seed_mission_network_if_empty: mission graph seed finished successfully")
+    return True
+
+
 def seed_mission_network_if_empty(
     memory_client,
     user_id: str,
@@ -5168,125 +5422,41 @@ def seed_mission_network_if_empty(
     use_mem0_cloud: bool,
     *,
     force: bool = False,
+    timeout_seconds: float = 90.0,
 ) -> bool:
     """
     Seed Tyler mission graph when there are no edges yet (orphan nodes still trigger seed).
     If force=True, always run the full seed (upserts overwrite existing nodes/edges by id).
+    Writes local JSON first; Mem0 cloud sync runs in a background thread when enabled.
     """
-    try:
-        if not force:
-            _, edges = network_load_graph(
-                memory_client, user_id, use_mem0_cloud, files_cabinet
-            )
-            if len(edges) > 0:
-                return False
+    outcome = {"ok": None, "err": None}  # ok: bool|None, err: BaseException|None
 
-        # Relevance: Grusch & Elizondo CRITICAL; all other seed entities HIGH (see network summary / mission graph).
-        seed_nodes: list[tuple[str, str, str, str, list[str]]] = [
-            ("David Grusch", "person", "UAP whistleblower; former intelligence community.", "CRITICAL", ["UAP", "disclosure", "whistleblower"]),
-            ("Luis Elizondo", "person", "Former AATIP / UAP program visibility.", "CRITICAL", ["UAP", "AATIP", "disclosure"]),
-            ("Christopher Mellon", "person", "Former Deputy Assistant Secretary of Defense for Intelligence; disclosure advocate.", "HIGH", ["UAP", "disclosure", "Pentagon"]),
-            ("Ross Coulthart", "person", "Investigative journalist covering UAP.", "HIGH", ["UAP", "media", "disclosure"]),
-            ("Marco Rubio", "person", "Senior US official; public UAP-related statements.", "HIGH", ["UAP", "government"]),
-            ("AARO", "organization", "DoD All-domain Anomaly Resolution Office (UAP).", "HIGH", ["UAP", "DoD", "government"]),
-            ("House Oversight Committee", "organization", "US House committee; UAP hearings context.", "HIGH", ["UAP", "Congress", "government"]),
-            ("Pentagon", "organization", "US Department of Defense headquarters.", "HIGH", ["DoD", "government", "military"]),
-            ("NRO", "organization", "National Reconnaissance Office.", "HIGH", ["intelligence", "government"]),
-            ("NGA", "organization", "National Geospatial-Intelligence Agency.", "HIGH", ["intelligence", "government", "military"]),
-            ("AATIP", "program", "Advanced Aerospace Threat Identification Program (historical DoD UAP effort).", "HIGH", ["UAP", "DoD", "program"]),
-        ]
-        seen_seed_slugs: set[str] = set()
-        for name, nt, desc, rel, tags in seed_nodes:
-            sid = network_slug_from_display_name(name)
-            if sid in seen_seed_slugs:
-                continue
-            seen_seed_slugs.add(sid)
-            add_network_node(
-                name,
-                nt,
-                desc,
-                rel,
-                tags,
-                memory_client=memory_client,
-                user_id=user_id,
-                files_cabinet=files_cabinet,
-                use_mem0_cloud=use_mem0_cloud,
+    def _runner() -> None:
+        try:
+            outcome["ok"] = _seed_mission_network_if_empty_core(
+                memory_client,
+                user_id,
+                files_cabinet,
+                use_mem0_cloud,
+                force=force,
             )
+        except BaseException as ex:
+            outcome["err"] = ex
 
-        def e(a, b, rt, desc, st="STRONG", ev="Mission seed graph"):
-            return add_network_edge(
-                a, b, rt, desc, st, ev,
-                memory_client=memory_client,
-                user_id=user_id,
-                files_cabinet=files_cabinet,
-                use_mem0_cloud=use_mem0_cloud,
-            )
-
-        e("David Grusch", "NRO", "connected_to", "Open-source mission context link.", ev="Seed data")
-        e("David Grusch", "NGA", "connected_to", "Open-source mission context link.", ev="Seed data")
-        e("David Grusch", "AARO", "connected_to", "UAP oversight / reporting context.", ev="Seed data")
-        e("David Grusch", "House Oversight Committee", "testified_with", "Congressional UAP hearing context.", "CONFIRMED", "Seed data")
-        e("Luis Elizondo", "Pentagon", "employed_by", "Former DoD context.", "STRONG", "Seed data")
-        e("Luis Elizondo", "AATIP", "member_of", "Program association (open sources).", "STRONG", "Seed data")
-        e("Luis Elizondo", "David Grusch", "corroborates", "Disclosure-adjacent narrative alignment (OSINT).", "MODERATE", "Seed data")
-        e("Christopher Mellon", "Pentagon", "employed_by", "Former DASD(I) role (historical).", "STRONG", "Seed data")
-        e("Christopher Mellon", "Luis Elizondo", "works_with", "Advocacy / public UAP work.", "MODERATE", "Seed data")
-        e("Christopher Mellon", "David Grusch", "corroborates", "Disclosure ecosystem.", "MODERATE", "Seed data")
-        e("Ross Coulthart", "Luis Elizondo", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
-        e("Ross Coulthart", "David Grusch", "connected_to", "Media interviews / reporting.", "MODERATE", "Seed data")
-        e("Ross Coulthart", "Christopher Mellon", "connected_to", "Media / public commentary.", "MODERATE", "Seed data")
-        # Marco Rubio cluster — pass canonical slugs (marco-rubio, aaro, house-oversight-committee, david-grusch)
-        # so edge endpoints match mission node ids after _network_normalize_node_id.
-        _mr_edges = [
-            (
-                "marco-rubio",
-                "aaro",
-                "connected_to",
-                "Public statements on UAP governance and oversight context.",
-                "MODERATE",
-                "Seed data",
-            ),
-            (
-                "marco-rubio",
-                "house-oversight-committee",
-                "connected_to",
-                "Congressional UAP hearings / oversight context (role varies by cycle).",
-                "MODERATE",
-                "Seed data",
-            ),
-            (
-                "marco-rubio",
-                "david-grusch",
-                "corroborates",
-                "Public UAP statements aligned with disclosure themes (open sources).",
-                "WEAK",
-                "Seed data",
-            ),
-        ]
-        _mr_stored: list[dict[str, str | None]] = []
-        for src_raw, tgt_raw, rt, desc, st, ev in _mr_edges:
-            sid = _network_normalize_node_id(src_raw)
-            tid = _network_normalize_node_id(tgt_raw)
-            edge_out = e(src_raw, tgt_raw, rt, desc, st, ev)
-            _mr_stored.append(
-                {
-                    "edge_id": edge_out.get("edge_id"),
-                    "source_id": edge_out.get("source_id"),
-                    "target_id": edge_out.get("target_id"),
-                    "rel": rt,
-                }
-            )
-        _mission_graph_log.debug(
-            "seed_mission_network_if_empty: Marco Rubio cluster %d edges edge_ids=%s detail=%s",
-            len(_mr_stored),
-            [x.get("edge_id") for x in _mr_stored],
-            _mr_stored,
+    th = threading.Thread(target=_runner, daemon=True, name="mission-network-seed")
+    th.start()
+    th.join(timeout=timeout_seconds)
+    if th.is_alive():
+        print(
+            f"[seed] TIMEOUT after {timeout_seconds}s — seed thread still running; "
+            "local graph may be partial",
+            flush=True,
         )
-        _mission_graph_log.info("seed_mission_network_if_empty: mission graph seed finished successfully")
-        return True
-    except Exception:
+        return False
+    if outcome["err"] is not None:
         _mission_graph_log.exception("seed_mission_network_if_empty failed")
         return False
+    return bool(outcome["ok"])
 
 
 _mission_network_seed_thread_started = False
@@ -5324,7 +5494,11 @@ def schedule_mission_network_seed_background(
         try:
             try:
                 seed_mission_network_if_empty(
-                    memory_client, user_id, files_cabinet, use_mem0_cloud
+                    memory_client,
+                    user_id,
+                    files_cabinet,
+                    use_mem0_cloud,
+                    timeout_seconds=90.0,
                 )
             except Exception:
                 pass
