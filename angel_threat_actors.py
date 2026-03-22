@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -15,6 +16,8 @@ import anthropic
 
 THREAT_ACTORS_FOLDER = "Threat Actors"
 TA_FILE_PREFIX = "TA-"
+
+_log = logging.getLogger(__name__)
 
 ACTOR_TYPES = frozenset({"person", "organization", "program", "faction"})
 THREAT_TYPES = frozenset(
@@ -101,6 +104,7 @@ def _threat_actor_upsert_memory(
         "source": "angel-threat-actors",
         "threat_actor_id": actor_id,
     }
+    # 1) Local JSON first — durable; survives Mem0 timeouts/outages.
     try:
         entries = ang._load_local_memory_entries(user_id)
         if not isinstance(entries, list):
@@ -117,14 +121,28 @@ def _threat_actor_upsert_memory(
         ]
         filtered.append({"memory": text, "metadata": dict(meta), "created_at": ts})
         ang._save_local_memory_entries(user_id, filtered)
-    except Exception:
-        pass
-    if use_mem0_cloud and hasattr(memory_client, "add"):
-        try:
-            messages = [
-                {"role": "user", "content": f"[Angel threat actor {actor_id}] {text[:1200]}"},
-                {"role": "assistant", "content": "Stored."},
-            ]
+    except Exception as e:
+        _log.exception("threat actor local JSON save failed actor_id=%s: %s", actor_id, e)
+        return
+
+    # 2) Mem0 cloud — best effort; 10s timeout on HTTP client when available.
+    if not use_mem0_cloud or not hasattr(memory_client, "add"):
+        return
+    messages = [
+        {"role": "user", "content": f"[Angel threat actor {actor_id}] {text[:1200]}"},
+        {"role": "assistant", "content": "Stored."},
+    ]
+    try:
+        if isinstance(memory_client, ang.Mem0CloudClient):
+            memory_client.add(
+                messages,
+                user_id=user_id,
+                metadata=dict(meta),
+                infer=False,
+                async_mode=True,
+                timeout=10.0,
+            )
+        else:
             try:
                 memory_client.add(
                     messages,
@@ -135,8 +153,12 @@ def _threat_actor_upsert_memory(
                 )
             except TypeError:
                 memory_client.add(messages, user_id=user_id, metadata=dict(meta))
-        except Exception:
-            pass
+    except Exception as e:
+        _log.warning(
+            "threat actor Mem0 add failed (local JSON already saved) actor_id=%s: %s",
+            actor_id,
+            e,
+        )
 
 
 def _sync_ta_intel_file(files_cabinet: Any, actor: dict[str, Any]) -> None:

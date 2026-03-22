@@ -16,6 +16,7 @@ from io import BytesIO
 import wave
 
 _mission_graph_log = logging.getLogger(__name__)
+_mem0_log = logging.getLogger(__name__)
 import tempfile
 
 import requests
@@ -229,6 +230,7 @@ class Mem0CloudClient:
         *,
         infer: bool = True,
         async_mode: bool = True,
+        timeout: float = 30.0,
     ):
         # v1 add memories endpoint supports version="v2"
         url = f"{MEM0_API_BASE_URL}/v1/memories/"
@@ -241,19 +243,31 @@ class Mem0CloudClient:
             "async_mode": async_mode,
             "infer": infer,
         }
-        resp = requests.post(url, headers=self._headers(), json=payload, timeout=30)
+        resp = requests.post(url, headers=self._headers(), json=payload, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
 
-    def delete_memory(self, memory_id: str) -> None:
-        """Delete a single memory in Mem0 Cloud by id (v1 API)."""
+    def delete_memory(self, memory_id: str, *, timeout: float = 5.0) -> None:
+        """Delete a single memory in Mem0 Cloud by id (v1 API). Never raises."""
         mid = (memory_id or "").strip()
         if not mid:
             return
         url = f"{MEM0_API_BASE_URL}/v1/memories/{mid}/"
-        resp = requests.delete(url, headers=self._headers(), timeout=30)
-        if resp.status_code not in (200, 204):
-            resp.raise_for_status()
+        try:
+            resp = requests.delete(url, headers=self._headers(), timeout=timeout)
+            if resp.status_code == 404:
+                return
+            if resp.status_code not in (200, 204):
+                resp.raise_for_status()
+        except requests.exceptions.Timeout:
+            _mem0_log.warning("Mem0 delete timeout memory_id=%s…", mid[:24])
+        except requests.exceptions.HTTPError as e:
+            code = getattr(e.response, "status_code", None) if e.response is not None else None
+            if code == 404:
+                return
+            _mem0_log.warning("Mem0 delete HTTP %s memory_id=%s…: %s", code, mid[:24], e)
+        except requests.exceptions.RequestException as e:
+            _mem0_log.warning("Mem0 delete failed memory_id=%s…: %s", mid[:24], e)
 
 
 # Monkey-patch Mem0's Anthropic LLM so it does not send top_p (Anthropic forbids
@@ -676,23 +690,28 @@ class FilesCabinet:
             return None
 
     def _delete_mem0_for_entry(self, meta: dict) -> None:
+        """Best-effort Mem0 row removal; never raises. Deletes use short timeouts."""
         if not self._use_mem0_cloud:
             return
-        mid = (meta.get("mem0_memory_id") or "").strip() if isinstance(meta, dict) else ""
-        if mid and isinstance(self.memory_client, Mem0CloudClient):
-            try:
-                self.memory_client.delete_memory(mid)
-            except Exception as e:
-                print(f"{Fore.YELLOW}FilesCabinet Mem0 delete id={mid}: {e}{Style.RESET_ALL}")
-            return
-        # Fallback: search cloud memories by file_name
-        if not isinstance(self.memory_client, Mem0CloudClient):
-            return
-        fname = (meta.get("file_name") or "").strip() if isinstance(meta, dict) else ""
-        if not fname:
-            return
         try:
-            raw = self.memory_client.get_all(user_id=self.user_id)
+            mid = (meta.get("mem0_memory_id") or "").strip() if isinstance(meta, dict) else ""
+            if mid and isinstance(self.memory_client, Mem0CloudClient):
+                try:
+                    self.memory_client.delete_memory(mid)
+                except Exception as e:
+                    _mem0_log.warning("FilesCabinet Mem0 delete id=%s…: %s", mid[:24], e)
+                return
+            # Fallback: search cloud memories by file_name
+            if not isinstance(self.memory_client, Mem0CloudClient):
+                return
+            fname = (meta.get("file_name") or "").strip() if isinstance(meta, dict) else ""
+            if not fname:
+                return
+            try:
+                raw = self.memory_client.get_all(user_id=self.user_id)
+            except Exception as e:
+                _mem0_log.warning("FilesCabinet Mem0 delete scan get_all: %s", e)
+                return
             results = raw.get("results") if isinstance(raw, dict) else raw
             if not isinstance(results, list):
                 return
@@ -711,9 +730,9 @@ class FilesCabinet:
                     try:
                         self.memory_client.delete_memory(rid)
                     except Exception as e:
-                        print(f"{Fore.YELLOW}FilesCabinet Mem0 delete fallback: {e}{Style.RESET_ALL}")
+                        _mem0_log.warning("FilesCabinet Mem0 delete fallback id=%s…: %s", rid[:24], e)
         except Exception as e:
-            print(f"{Fore.YELLOW}FilesCabinet Mem0 delete scan: {e}{Style.RESET_ALL}")
+            _mem0_log.warning("FilesCabinet _delete_mem0_for_entry: %s", e)
 
     def create_file(
         self,
@@ -5065,8 +5084,12 @@ def _purge_mem0_network_graph_memories(
                     memory_client.delete_memory(rid)
                     deleted += 1
                     found_any = True
-                except Exception:
-                    pass
+                except Exception as e:
+                    _mem0_log.warning(
+                        "purge network graph Mem0 delete skipped id=%s…: %s",
+                        str(rid)[:24],
+                        e,
+                    )
             if len(results) < page_sz:
                 break
             page += 1
