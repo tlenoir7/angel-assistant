@@ -33,6 +33,7 @@ import angel_environmental_map
 import angel_communication_patterns
 import angel_biological_intelligence
 import angel_historical_archives
+import angel_chemistry
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -3816,6 +3817,103 @@ def create_app() -> Flask:
             )
             p = angel_biological_intelligence.get_black_eyed_profile()
             return jsonify({"ok": True, "profile": p})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Chemistry & materials intelligence (PubChem, NIST, Materials Project) ---
+    @app.route("/api/chemistry/status", methods=["GET"])
+    def api_chemistry_status():
+        try:
+            return jsonify({"ok": True, **angel_chemistry.chemistry_status()})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/chemistry/compound", methods=["POST"])
+    def api_chemistry_compound():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        q = (data.get("query") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        if not q:
+            return jsonify({"ok": False, "error": "query required"}), 400
+        try:
+            r = angel_chemistry.compound_api_payload(
+                q,
+                ctx,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/chemistry/material", methods=["POST"])
+    def api_chemistry_material():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        q = (data.get("query") or "").strip()
+        use_case = (data.get("use_case") or "").strip()
+        if not q:
+            return jsonify({"ok": False, "error": "query required"}), 400
+        try:
+            r = angel_chemistry.material_api_payload(
+                q,
+                use_case,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/chemistry/synthesis", methods=["POST"])
+    def api_chemistry_synthesis():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        target = (data.get("target") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        if not target:
+            return jsonify({"ok": False, "error": "target required"}), 400
+        try:
+            r = angel_chemistry.analyze_synthesis_route(
+                target,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/chemistry/design", methods=["POST"])
+    def api_chemistry_design():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        req = data.get("requirements")
+        if not isinstance(req, dict):
+            return jsonify({"ok": False, "error": "requirements object required"}), 400
+        try:
+            r = angel_chemistry.design_material_for_requirements(
+                req,
+                anthropic_client=angel.anthropic_client,
+            )
+            return jsonify(r)
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500

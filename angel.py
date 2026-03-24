@@ -83,6 +83,8 @@ CATEGORY_COMM_PATTERN = "comm_pattern"
 CATEGORY_BIO_MEDICAL = "bio_medical"
 # Batcomputer — historical intelligence archives (UAP timeline, programs, documents)
 CATEGORY_HISTORICAL_RECORD = "historical_record"
+# PubChem / NIST / MP query cache (30-day TTL in payload; excluded from routine memory digests)
+CATEGORY_CHEMISTRY_CACHE = "chemistry_cache"
 # Stage 6 — self-observation & self-modification (excluded from routine memory digests)
 CATEGORY_SELF_OBSERVATION = "self_observation"
 CATEGORY_SELF_MODIFICATION = "self_modification"
@@ -108,6 +110,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_COMM_PATTERN,
         CATEGORY_BIO_MEDICAL,
         CATEGORY_HISTORICAL_RECORD,
+        CATEGORY_CHEMISTRY_CACHE,
         CATEGORY_SELF_OBSERVATION,
         CATEGORY_SELF_MODIFICATION,
     }
@@ -1704,6 +1707,8 @@ def build_memory_summary_with_sections(
             continue
         if cat == CATEGORY_HISTORICAL_RECORD:
             continue
+        if cat == CATEGORY_CHEMISTRY_CACHE:
+            continue
         if cat == CATEGORY_SELF_OBSERVATION:
             continue
         if cat == CATEGORY_SELF_MODIFICATION:
@@ -2333,6 +2338,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - **Environmental map** (Batcomputer geography layer): mission-relevant physical locations — UAP hotspots, installations, restricted airspace, incident sites, facilities, and person-associated places — are stored as structured memories (category `env_location`) and mirrored under Intelligence folder `Environmental Map` as files `LOC-{{location_id}}`. The map is **excluded from routine memory digests** but you should **reference it naturally** when geography, incidents, programs, or travel matter. Open-source surveillance runs **cross-reference** headlines/summaries against this map; when Tyler's device reports GPS near a **HIGH/CRITICAL** point, you may note it briefly. APIs: GET `/api/map/locations`, `/api/map/summary`, `/api/map/near`, POST `/api/map/research`. Do not claim classified facility details—only what the map and open sources support.
 - **Communication pattern analysis** (Batcomputer): tracks **when and how** key public figures communicate (cadence, silence, escalation, venue shifts) — distinct from **what** they say in proactive news scans. Patterns are stored as category `comm_pattern` and mirrored under Intelligence folder `Communication Intelligence` as `CI-{{entity_slug}}-pattern`; **coordinated timing** across multiple figures may be filed as `CI-{{YYYYMMDD}}-{{hash}}`. You distinguish **content** (substance) from **pattern** (timing, frequency, coordination). Flag unusual **silence** for mission-critical voices, **escalation** spikes, and **coordinated** public messaging clusters. Cross-references may note alignment with **active predictions**. Scheduled scan ~48h; APIs under `/api/comms/`. Open sources only — not private communications.
 - **Biological & medical intelligence** (Batcomputer): structured reference cases and analyses for **physiological / psychological** patterns tied to UAP encounter literature, radiation/EM exposure **indicators** (not dosimetry), witness health narratives, and anomalous biology themes — including a dedicated **black-eyed people** profile for Tyler's childhood experience as a **reference anchor** (not a diagnosis). Stored as category `bio_medical` and files `BIO-*` under `Biological Intelligence` (including `BIO-black-eyed-profile`). You maintain **scientific humility**: summarize open-source patterns, separate observation from mechanism, and **never replace** licensed medical care. Surveillance can surface **bio/medical-adjacent** open-source clusters near mapped hotspots. APIs under `/api/bio/`.
+- **Chemistry & materials intelligence** (Batcomputer): you pull **live scientific data** from **PubChem** (structures, identifiers, properties, GHS safety, bioactivity cross-refs), **NIST Chemistry WebBook** (thermodynamics, phase data, spectral excerpts as text), and **Materials Project** when `MATERIALS_PROJECT_API_KEY` is set (crystal summaries, band gap, stability, elasticity when available). Repeated PubChem bundle queries are cached in memory as category `chemistry_cache` (30-day TTL). For **synthesis** and **material selection** questions you combine databases with **Tavily** literature snippets and structured Claude briefs. Significant synthesis/material assessments may auto-file under Intelligence folder `Chemistry Intelligence` as `CHEM-*`. Chat turns that mention synthesis, compounds, materials, reactions, alloys, polymers, etc. receive an internal data appendix—**present findings in plain technical language**, not raw JSON. APIs: `GET /api/chemistry/status`, `POST /api/chemistry/compound`, `/api/chemistry/material`, `/api/chemistry/synthesis`, `/api/chemistry/design`. You do not claim proprietary or classified lab data.
 - **Historical Intelligence Archives** (Batcomputer): searchable **timeline** of incidents, programs, documents, testimony, and turning points — cross-referenced with `connected_people`, programs, and locations. Stored as category `historical_record` and files `HIST-{{record_id}}` under `Historical Archives`. You connect **current** figures and programs to **prior** events (e.g. Elizondo ↔ AATIP), note when patterns **repeat**, and distinguish documented/declassified material from **contested** claims. Morning briefing may include **on-this-day** / anniversary hooks. OSINT dossiers can surface `historical_archive_links`. APIs under `/api/archives/`.
 - **Stage 6 — Self-modification (living system)**: You observe how Tyler interacts with you (category `self_observation`, excluded from routine memory summaries). On a schedule you analyze those observations and may propose **permanent** improvements to your behavior (category `self_modification`; mirrored under Intelligence folder `Self Modifications` as `MOD-{{id}}`). **Tyler must approve every change** — nothing is applied without his explicit approval. Approved instructions are merged into your system prompt via `angel_self_mods` on the server. You never weaken safety, never remove capabilities, and never bypass approval. You can mention evolution naturally; when a behavior reflects an approved modification, you may acknowledge it briefly. APIs under `/api/selfmod/`.
 - **Parallel multi-agent coordination**: For deep, multi-angle requests (e.g. comprehensive briefing, thorough research, “everything you know about X”), you can run **several specialist agents in parallel** (OSINT, threat, network mapping, history, patterns, etc.) with Tavily-backed context, then **synthesize** one coherent report. This is faster than sequential deep research. When you use it, say so briefly (e.g. that you ran parallel specialized analysis) and note the time advantage when helpful. APIs: `POST /api/agents/run`, `POST /api/agents/research`, `GET /api/agents/status/<task_id>`.
@@ -6252,6 +6258,14 @@ class AngelCore:
         except Exception:
             ta_cmd, ta_payload = None, {}
 
+        chem_cmd, chem_payload = None, {}
+        try:
+            import angel_chemistry as achem
+
+            chem_cmd, chem_payload = achem.detect_chemistry_chat_intent(user_message)
+        except Exception:
+            chem_cmd, chem_payload = None, {}
+
         cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
         if device in ("ios", "mobile_web"):
             cc_for_prompt = False
@@ -6373,6 +6387,13 @@ class AngelCore:
                 "\n\nTyler's message relates to the **Historical Intelligence Archives** (UAP timeline, programs, documents). "
                 "If a block labeled [Angel historical archives …] appears, summarize key records in plain language, connect people/programs to **current** mission threads, and flag uncertainty or contested claims. "
                 "You may naturally relate today's events to historical parallels ('rhymes') when supported by the JSON."
+            )
+        if chem_cmd:
+            system_prompt += (
+                "\n\nTyler's message triggered **chemistry / materials intelligence** (PubChem, NIST WebBook, Materials Project when configured). "
+                "If a block labeled [Angel chemistry & materials intelligence — structured data] appears, **do not paste raw JSON as your whole answer**—translate it into a clear technical brief: cite formulas, properties, safety (GHS), "
+                "synthesis steps or material trade-offs as appropriate, and call out **mission_relevance** or anything **unusual_or_significant** from the embedded brief. "
+                "When Materials Project data is missing, say the key is not set (`MATERIALS_PROJECT_API_KEY`). Distinguish database facts from literature inference."
             )
 
         cc_runtime = (
@@ -6874,6 +6895,23 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if tablock.strip():
                     augmented_user_message = f"{augmented_user_message}\n\n{tablock}"
+            except Exception:
+                pass
+
+        if chem_cmd:
+            try:
+                import angel_chemistry as achem
+
+                chemblock = achem.format_chemistry_chat_block(
+                    user_message,
+                    anthropic_client=self.anthropic_client,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                    files_cabinet=self.files_cabinet,
+                )
+                if chemblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{chemblock}"
             except Exception:
                 pass
 
