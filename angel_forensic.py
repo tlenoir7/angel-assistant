@@ -621,8 +621,8 @@ def format_forensic_chat_block(
             + json.dumps(
                 {
                     "notice": "No image bytes in this chat message. "
-                    "Use POST /api/forensic/analyze (or /api/forensic/uap, /api/forensic/document) with image_b64, "
-                    "or enable forensic capture on the client. iPhone: use forensic endpoint instead of /api/vision when Tyler wants authenticity analysis.",
+                    "Use POST /api/vision/forensic (routed classify + pipelines + VI-* filing) or /api/forensic/analyze (or /uap /document) with image_b64, "
+                    "or enable forensic capture on the client. iPhone: Forensic mode → /api/vision/forensic; classic multi-layer → /api/forensic/*.",
                     "intent": intent,
                 },
                 indent=2,

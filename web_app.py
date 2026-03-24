@@ -20,6 +20,7 @@ import angel_translation
 import angel_file_reading
 import angel_threat_actors
 import angel_forensic
+import angel_vision_forensic
 import angel_surveillance
 import angel_environmental_map
 import angel_communication_patterns
@@ -1998,7 +1999,8 @@ def create_app() -> Flask:
         """
         Camera vision: JPEG (base64) + question, using Claude vision with Angel's full system prompt and memory.
         JSON body: image (base64 JPEG), question (str), device (ios | desktop | mobile_web).
-        For authenticity / manipulation / UAP forensics, use POST /api/forensic/analyze (or /uap /document) instead.
+        For routed forensic JSON (classify + pipelines + auto-file Visual Intelligence), use POST /api/vision/forensic.
+        For multi-layer FA-* forensics or UAP/document modes, use POST /api/forensic/analyze (or /uap /document).
         """
         global last_activity_at, check_in_message, check_in_generated_at
         last_activity_at = time.time()
@@ -2083,6 +2085,83 @@ def create_app() -> Flask:
             print(f"[api_vision] Claude vision error: {e}", flush=True)
             traceback.print_exc()
             return jsonify({"error": "Vision analysis failed.", "details": str(e)}), 500
+
+    @app.route("/api/vision/forensic", methods=["POST"])
+    def api_vision_forensic():
+        """
+        Computer vision on demand: one Claude call — classify + routed forensic JSON.
+        Body: { image_base64, context?, tyler_location?, file_name?, skip_autofile?, skip_network_apply? }
+        Also accepts image (alias) for image_base64.
+        """
+        if angel is None:
+            return jsonify({"ok": False, "error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        image_b64 = str(
+            data.get("image_base64") or data.get("image_b64") or data.get("image") or ""
+        ).strip()
+        ctx = (data.get("context") or data.get("question") or "").strip()
+        tyler_loc = (data.get("tyler_location") or "").strip()
+        fn = (data.get("file_name") or data.get("name") or "photo.jpg").strip()
+        skip_af = bool(data.get("skip_autofile", False))
+        skip_net = bool(data.get("skip_network_apply", False))
+        if not image_b64:
+            return jsonify({"ok": False, "error": "Missing image_base64 (or image)."}), 400
+        try:
+            memories = angel._fetch_combined_memories()
+            mem_excerpt = build_memory_summary_with_sections(memories, ctx or "visual forensic")
+            if len(mem_excerpt) > 12000:
+                mem_excerpt = mem_excerpt[:11997] + "..."
+            r = angel_vision_forensic.analyze_image_forensic(
+                image_b64,
+                ctx,
+                tyler_loc or None,
+                angel.anthropic_client,
+                angel.files_cabinet,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                file_name=fn or "photo.jpg",
+                intelligence_files_summary=angel.files_cabinet.get_summary(),
+                memory_summary=mem_excerpt,
+                skip_autofile=skip_af,
+                skip_network_apply=skip_net,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/vision/forensic/file", methods=["POST"])
+    def api_vision_forensic_file():
+        """
+        Save a forensic result to Visual Intelligence when not auto-filed.
+        Body: { image_base64, forensic_json, file_name? } — forensic_json is the prior /api/vision/forensic object (or inner fields).
+        """
+        if angel is None:
+            return jsonify({"ok": False, "error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        image_b64 = str(
+            data.get("image_base64") or data.get("image_b64") or data.get("image") or ""
+        ).strip()
+        fj = data.get("forensic_json") or data.get("forensic")
+        if isinstance(fj, str):
+            try:
+                fj = json.loads(fj)
+            except Exception:
+                fj = None
+        fn = (data.get("file_name") or "photo.jpg").strip()
+        if not image_b64 or not isinstance(fj, dict):
+            return jsonify(
+                {"ok": False, "error": "Missing image_base64 or forensic_json object."}
+            ), 400
+        try:
+            r = angel_vision_forensic.file_visual_intel_manual(
+                fj, image_b64, angel.files_cabinet, file_name=fn or "photo.jpg"
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     # --- Forensic visual analysis (Batcomputer): authenticity, UAP imagery, document photos ---
     # iPhone / iOS: keep using /api/vision for default chat+camera; call /api/forensic/* when Tyler
