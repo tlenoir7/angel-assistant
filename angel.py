@@ -85,6 +85,8 @@ CATEGORY_BIO_MEDICAL = "bio_medical"
 CATEGORY_HISTORICAL_RECORD = "historical_record"
 # PubChem / NIST / MP query cache (30-day TTL in payload; excluded from routine memory digests)
 CATEGORY_CHEMISTRY_CACHE = "chemistry_cache"
+# ArXiv (and similar) query cache for theoretical research agent (7-day TTL in payload)
+CATEGORY_RESEARCH_CACHE = "research_cache"
 # Stage 6 — self-observation & self-modification (excluded from routine memory digests)
 CATEGORY_SELF_OBSERVATION = "self_observation"
 CATEGORY_SELF_MODIFICATION = "self_modification"
@@ -111,6 +113,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_BIO_MEDICAL,
         CATEGORY_HISTORICAL_RECORD,
         CATEGORY_CHEMISTRY_CACHE,
+        CATEGORY_RESEARCH_CACHE,
         CATEGORY_SELF_OBSERVATION,
         CATEGORY_SELF_MODIFICATION,
     }
@@ -1709,6 +1712,8 @@ def build_memory_summary_with_sections(
             continue
         if cat == CATEGORY_CHEMISTRY_CACHE:
             continue
+        if cat == CATEGORY_RESEARCH_CACHE:
+            continue
         if cat == CATEGORY_SELF_OBSERVATION:
             continue
         if cat == CATEGORY_SELF_MODIFICATION:
@@ -2339,6 +2344,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - **Communication pattern analysis** (Batcomputer): tracks **when and how** key public figures communicate (cadence, silence, escalation, venue shifts) — distinct from **what** they say in proactive news scans. Patterns are stored as category `comm_pattern` and mirrored under Intelligence folder `Communication Intelligence` as `CI-{{entity_slug}}-pattern`; **coordinated timing** across multiple figures may be filed as `CI-{{YYYYMMDD}}-{{hash}}`. You distinguish **content** (substance) from **pattern** (timing, frequency, coordination). Flag unusual **silence** for mission-critical voices, **escalation** spikes, and **coordinated** public messaging clusters. Cross-references may note alignment with **active predictions**. Scheduled scan ~48h; APIs under `/api/comms/`. Open sources only — not private communications.
 - **Biological & medical intelligence** (Batcomputer): structured reference cases and analyses for **physiological / psychological** patterns tied to UAP encounter literature, radiation/EM exposure **indicators** (not dosimetry), witness health narratives, and anomalous biology themes — including a dedicated **black-eyed people** profile for Tyler's childhood experience as a **reference anchor** (not a diagnosis). Stored as category `bio_medical` and files `BIO-*` under `Biological Intelligence` (including `BIO-black-eyed-profile`). You maintain **scientific humility**: summarize open-source patterns, separate observation from mechanism, and **never replace** licensed medical care. Surveillance can surface **bio/medical-adjacent** open-source clusters near mapped hotspots. APIs under `/api/bio/`.
 - **Chemistry & materials intelligence** (Batcomputer): you pull **live scientific data** from **PubChem** (structures, identifiers, properties, GHS safety, bioactivity cross-refs), **NIST Chemistry WebBook** (thermodynamics, phase data, spectral excerpts as text), and **Materials Project** when `MATERIALS_PROJECT_API_KEY` is set (crystal summaries, band gap, stability, elasticity when available). Repeated PubChem bundle queries are cached in memory as category `chemistry_cache` (30-day TTL). For **synthesis** and **material selection** questions you combine databases with **Tavily** literature snippets and structured Claude briefs. Significant synthesis/material assessments may auto-file under Intelligence folder `Chemistry Intelligence` as `CHEM-*`. Chat turns that mention synthesis, compounds, materials, reactions, alloys, polymers, etc. receive an internal data appendix—**present findings in plain technical language**, not raw JSON. APIs: `GET /api/chemistry/status`, `POST /api/chemistry/compound`, `/api/chemistry/material`, `/api/chemistry/synthesis`, `/api/chemistry/design`. You do not claim proprietary or classified lab data.
+- **Theoretical research agent** (Engineering track — Build 1): you query **real** technical corpora on demand—**ArXiv** (preprints), **NASA NTRS** (technical reports), **DARPA / DTIC** (program and defense technical literature via **Tavily** `site:` search—there is no public DARPA API), and **US patents** via **PatentsView PatentSearch** when `PATENTSVIEW_API_KEY` is set, otherwise **Tavily** on **patents.google.com**. ArXiv search results are cached in Mem0 as category `research_cache` (7-day TTL). You synthesize findings into TRL estimates, gaps, mission relevance, and recommended follow-ups; when relevance is **HIGH** or **CRITICAL** you auto-file under Intelligence folder `Research Intelligence` as `RES-YYYYMMDD-*`, with cross-references to **Chemistry Intelligence** and **OSINT Dossiers** when filenames or tags overlap. Chat triggers include papers, studies, NASA/DARPA/patent wording, state of the art, and engineering questions with literature intent. APIs: `POST /api/research/query`, `/api/research/paper`, `/api/research/patent`, `GET /api/research/status`.
 - **Historical Intelligence Archives** (Batcomputer): searchable **timeline** of incidents, programs, documents, testimony, and turning points — cross-referenced with `connected_people`, programs, and locations. Stored as category `historical_record` and files `HIST-{{record_id}}` under `Historical Archives`. You connect **current** figures and programs to **prior** events (e.g. Elizondo ↔ AATIP), note when patterns **repeat**, and distinguish documented/declassified material from **contested** claims. Morning briefing may include **on-this-day** / anniversary hooks. OSINT dossiers can surface `historical_archive_links`. APIs under `/api/archives/`.
 - **Stage 6 — Self-modification (living system)**: You observe how Tyler interacts with you (category `self_observation`, excluded from routine memory summaries). On a schedule you analyze those observations and may propose **permanent** improvements to your behavior (category `self_modification`; mirrored under Intelligence folder `Self Modifications` as `MOD-{{id}}`). **Tyler must approve every change** — nothing is applied without his explicit approval. Approved instructions are merged into your system prompt via `angel_self_mods` on the server. You never weaken safety, never remove capabilities, and never bypass approval. You can mention evolution naturally; when a behavior reflects an approved modification, you may acknowledge it briefly. APIs under `/api/selfmod/`.
 - **Parallel multi-agent coordination**: For deep, multi-angle requests (e.g. comprehensive briefing, thorough research, “everything you know about X”), you can run **several specialist agents in parallel** (OSINT, threat, network mapping, history, patterns, etc.) with Tavily-backed context, then **synthesize** one coherent report. This is faster than sequential deep research. When you use it, say so briefly (e.g. that you ran parallel specialized analysis) and note the time advantage when helpful. APIs: `POST /api/agents/run`, `POST /api/agents/research`, `GET /api/agents/status/<task_id>`.
@@ -6266,6 +6272,16 @@ class AngelCore:
         except Exception:
             chem_cmd, chem_payload = None, {}
 
+        theo_cmd = False
+        try:
+            import angel_research as ares
+
+            theo_cmd, _ = ares.detect_theoretical_research_intent(
+                user_message, skip_if_pure_chemistry=bool(chem_cmd)
+            )
+        except Exception:
+            theo_cmd = False
+
         cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
         if device in ("ios", "mobile_web"):
             cc_for_prompt = False
@@ -6394,6 +6410,11 @@ class AngelCore:
                 "If a block labeled [Angel chemistry & materials intelligence — structured data] appears, **do not paste raw JSON as your whole answer**—translate it into a clear technical brief: cite formulas, properties, safety (GHS), "
                 "synthesis steps or material trade-offs as appropriate, and call out **mission_relevance** or anything **unusual_or_significant** from the embedded brief. "
                 "When Materials Project data is missing, say the key is not set (`MATERIALS_PROJECT_API_KEY`). Distinguish database facts from literature inference."
+            )
+        if theo_cmd:
+            system_prompt += (
+                "\n\nTyler's message triggered **theoretical / engineering research** (ArXiv, NASA NTRS, DARPA/DTIC via Tavily, patents via PatentsView or patents.google.com). "
+                "If a block labeled [Angel theoretical research — structured data] appears, **do not paste the entire JSON**—give a concise synthesis, **3–5 top sources** with one-line descriptions, note TRL and mission relevance, gaps, and offer to go deeper on any paper, NASA report, program, or patent."
             )
 
         cc_runtime = (
@@ -6634,6 +6655,34 @@ If you infer anything new about that person's preferences or dynamics, append at
             except Exception as ex:
                 print(f"{Fore.YELLOW}Parallel agents error: {ex}{Style.RESET_ALL}", flush=True)
 
+        theoretical_done = False
+        if not osint_attempted and not parallel_done and theo_cmd:
+            try:
+                import angel_research as ares
+
+                _tq = (user_message or "").strip()
+                print(
+                    f"{Fore.BLUE}Angel: theoretical research agent (ArXiv / NASA / DARPA / patents)…{Style.RESET_ALL}"
+                )
+                _tres = ares.run_research_agent(
+                    _tq,
+                    (user_message or "")[:4000],
+                    None,
+                    anthropic_client=self.anthropic_client,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                    files_cabinet=self.files_cabinet,
+                )
+                _tblock = ares.format_research_agent_block_for_prompt(_tres)
+                augmented_user_message = f"{augmented_user_message}\n\n{_tblock}"
+                theoretical_done = True
+            except Exception as ex:
+                print(
+                    f"{Fore.YELLOW}Theoretical research agent error: {ex}{Style.RESET_ALL}",
+                    flush=True,
+                )
+
         # Stage 2 Deep Research: multi-angle Tavily + synthesis when triggered (skip if this turn was an OSINT request)
         if (
             comm_intent.intent == "briefing"
@@ -6657,7 +6706,7 @@ If you infer anything new about that person's preferences or dynamics, append at
                 f"Research briefing about {topic} (use this to answer):\n{briefing}\n\n"
                 f"Original user request:\n{user_message}"
             )
-        elif research_requested and not osint_attempted and not parallel_done:
+        elif research_requested and not osint_attempted and not parallel_done and not theoretical_done:
             topic = user_message.strip()
             for phrase in RESEARCH_TRIGGERS:
                 if phrase in topic.lower():

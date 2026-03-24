@@ -34,6 +34,7 @@ import angel_communication_patterns
 import angel_biological_intelligence
 import angel_historical_archives
 import angel_chemistry
+import angel_research
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -3914,6 +3915,82 @@ def create_app() -> Flask:
                 anthropic_client=angel.anthropic_client,
             )
             return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Theoretical research agent (ArXiv, NASA NTRS, DARPA/DTIC, patents) ---
+    @app.route("/api/research/query", methods=["POST"])
+    def api_research_query():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        query = (data.get("query") or "").strip()
+        context = (data.get("context") or "").strip()
+        rtypes = data.get("research_types")
+        if not query:
+            return jsonify({"ok": False, "error": "query required"}), 400
+        if rtypes is not None and not isinstance(rtypes, list):
+            rtypes = None
+        try:
+            out = angel_research.run_research_agent(
+                query,
+                context or query,
+                rtypes,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify({"ok": True, **out})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/research/paper", methods=["POST"])
+    def api_research_paper():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        aid = (data.get("arxiv_id") or "").strip()
+        if not aid:
+            return jsonify({"ok": False, "error": "arxiv_id required"}), 400
+        try:
+            r = angel_research.get_arxiv_paper(
+                aid,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": bool(r.get("ok")), **r})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/research/patent", methods=["POST"])
+    def api_research_patent():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        pnum = (data.get("patent_number") or "").strip()
+        pq = (data.get("query") or "").strip()
+        try:
+            if pnum:
+                r = angel_research.get_patent_detail(pnum)
+                return jsonify({"ok": bool(r.get("ok")), **r})
+            if pq:
+                r = angel_research.search_patents(pq, max_results=10)
+                return jsonify({"ok": bool(r.get("ok")), **r})
+            return jsonify({"ok": False, "error": "patent_number or query required"}), 400
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/research/status", methods=["GET"])
+    def api_research_status():
+        try:
+            return jsonify({"ok": True, **angel_research.research_status()})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
