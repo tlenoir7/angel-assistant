@@ -28,6 +28,7 @@ import angel_biological_intelligence
 import angel_historical_archives
 import angel_chemistry
 import angel_research
+import angel_physics
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -3935,6 +3936,75 @@ def create_app() -> Flask:
     def api_research_status():
         try:
             return jsonify({"ok": True, **angel_research.research_status()})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Physics simulation engine ---
+    @app.route("/api/physics/simulate", methods=["POST"])
+    def api_physics_simulate():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        st = (data.get("simulation_type") or "").strip()
+        params = data.get("params") if isinstance(data.get("params"), dict) else {}
+        ctx = (data.get("context") or "").strip()
+        if not st:
+            return jsonify({"ok": False, "error": "simulation_type required"}), 400
+        try:
+            out = angel_physics.run_physics_simulation(
+                st,
+                params,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify({"ok": True, **out})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/physics/extract-params", methods=["POST"])
+    def api_physics_extract_params():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        msg = (data.get("message") or "").strip()
+        if not msg:
+            return jsonify({"ok": False, "error": "message required"}), 400
+        try:
+            out = angel_physics.extract_simulation_params(msg, angel.anthropic_client)
+            return jsonify({"ok": True, **out})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/physics/natural", methods=["POST"])
+    def api_physics_natural():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        msg = (data.get("message") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        if not msg:
+            return jsonify({"ok": False, "error": "message required"}), 400
+        try:
+            out = angel_physics.run_physics_natural(
+                msg,
+                ctx or msg,
+                anthropic_client=angel.anthropic_client,
+                files_cabinet=angel.files_cabinet,
+            )
+            code = 200 if out.get("ok") else 400
+            return jsonify(out), code
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/physics/status", methods=["GET"])
+    def api_physics_status():
+        try:
+            return jsonify({"ok": True, **angel_physics.physics_library_status()})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500

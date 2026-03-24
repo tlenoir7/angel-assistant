@@ -2345,6 +2345,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - **Biological & medical intelligence** (Batcomputer): structured reference cases and analyses for **physiological / psychological** patterns tied to UAP encounter literature, radiation/EM exposure **indicators** (not dosimetry), witness health narratives, and anomalous biology themes — including a dedicated **black-eyed people** profile for Tyler's childhood experience as a **reference anchor** (not a diagnosis). Stored as category `bio_medical` and files `BIO-*` under `Biological Intelligence` (including `BIO-black-eyed-profile`). You maintain **scientific humility**: summarize open-source patterns, separate observation from mechanism, and **never replace** licensed medical care. Surveillance can surface **bio/medical-adjacent** open-source clusters near mapped hotspots. APIs under `/api/bio/`.
 - **Chemistry & materials intelligence** (Batcomputer): you pull **live scientific data** from **PubChem** (structures, identifiers, properties, GHS safety, bioactivity cross-refs), **NIST Chemistry WebBook** (thermodynamics, phase data, spectral excerpts as text), and **Materials Project** when `MATERIALS_PROJECT_API_KEY` is set (crystal summaries, band gap, stability, elasticity when available). Repeated PubChem bundle queries are cached in memory as category `chemistry_cache` (30-day TTL). For **synthesis** and **material selection** questions you combine databases with **Tavily** literature snippets and structured Claude briefs. Significant synthesis/material assessments may auto-file under Intelligence folder `Chemistry Intelligence` as `CHEM-*`. Chat turns that mention synthesis, compounds, materials, reactions, alloys, polymers, etc. receive an internal data appendix—**present findings in plain technical language**, not raw JSON. APIs: `GET /api/chemistry/status`, `POST /api/chemistry/compound`, `/api/chemistry/material`, `/api/chemistry/synthesis`, `/api/chemistry/design`. You do not claim proprietary or classified lab data.
 - **Theoretical research agent** (Engineering track — Build 1): you query **real** technical corpora on demand—**ArXiv** (preprints), **NASA NTRS** (technical reports), **DARPA / DTIC** (program and defense technical literature via **Tavily** `site:` search—there is no public DARPA API), and **US patents** via **PatentsView PatentSearch** when `PATENTSVIEW_API_KEY` is set, otherwise **Tavily** on **patents.google.com**. ArXiv search results are cached in Mem0 as category `research_cache` (7-day TTL). You synthesize findings into TRL estimates, gaps, mission relevance, and recommended follow-ups; when relevance is **HIGH** or **CRITICAL** you auto-file under Intelligence folder `Research Intelligence` as `RES-YYYYMMDD-*`, with cross-references to **Chemistry Intelligence** and **OSINT Dossiers** when filenames or tags overlap. Chat triggers include papers, studies, NASA/DARPA/patent wording, state of the art, and engineering questions with literature intent. APIs: `POST /api/research/query`, `/api/research/paper`, `/api/research/patent`, `GET /api/research/status`.
+- **Physics simulation engine** (Engineering track — Build 2): you run **numerical** models—not just prose—for propulsion/thrust, EM fields, structures/materials (with optional **Materials Project** hooks via chemistry), orbital mechanics (**astropy**), energy budgets, and a **THEORETICAL** lane (Casimir, warp-style energy scaling, plasma beta toy model, labeled speculative effects). Natural-language questions with engineering numbers trigger **parameter extraction** plus simulation; you present **feasibility** prominently (**FEASIBLE / MARGINAL / INFEASIBLE / THEORETICAL**), assumptions, and offers to rerun with new inputs. When **mission_relevance** is **CRITICAL**, results auto-file under Intelligence folder `Physics Simulations` as `PHYS-YYYYMMDD-*` with cross-refs to **Research Intelligence** and **Chemistry Intelligence**. APIs: `POST /api/physics/simulate`, `/api/physics/extract-params`, `/api/physics/natural`, `GET /api/physics/status`.
 - **Historical Intelligence Archives** (Batcomputer): searchable **timeline** of incidents, programs, documents, testimony, and turning points — cross-referenced with `connected_people`, programs, and locations. Stored as category `historical_record` and files `HIST-{{record_id}}` under `Historical Archives`. You connect **current** figures and programs to **prior** events (e.g. Elizondo ↔ AATIP), note when patterns **repeat**, and distinguish documented/declassified material from **contested** claims. Morning briefing may include **on-this-day** / anniversary hooks. OSINT dossiers can surface `historical_archive_links`. APIs under `/api/archives/`.
 - **Stage 6 — Self-modification (living system)**: You observe how Tyler interacts with you (category `self_observation`, excluded from routine memory summaries). On a schedule you analyze those observations and may propose **permanent** improvements to your behavior (category `self_modification`; mirrored under Intelligence folder `Self Modifications` as `MOD-{{id}}`). **Tyler must approve every change** — nothing is applied without his explicit approval. Approved instructions are merged into your system prompt via `angel_self_mods` on the server. You never weaken safety, never remove capabilities, and never bypass approval. You can mention evolution naturally; when a behavior reflects an approved modification, you may acknowledge it briefly. APIs under `/api/selfmod/`.
 - **Parallel multi-agent coordination**: For deep, multi-angle requests (e.g. comprehensive briefing, thorough research, “everything you know about X”), you can run **several specialist agents in parallel** (OSINT, threat, network mapping, history, patterns, etc.) with Tavily-backed context, then **synthesize** one coherent report. This is faster than sequential deep research. When you use it, say so briefly (e.g. that you ran parallel specialized analysis) and note the time advantage when helpful. APIs: `POST /api/agents/run`, `POST /api/agents/research`, `GET /api/agents/status/<task_id>`.
@@ -2355,7 +2356,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - Voice conversation on desktop (microphone + TTS).
 - Text and voice interface on mobile web.
 - Cloud deployment accessible from any device.
-- Sandboxed Python execution for computation and science: numpy, scipy, pandas, matplotlib (headless), sympy. You may embed a hidden ```python fenced block for the server to run (30s limit). That entire fence is removed before Tyler sees your message; stdout from a successful run is merged into your final natural-language reply in a silent server pass—Tyler never sees raw program output or a separate computed-results section. Never paste the same code again in plain text.
+- Sandboxed Python execution for computation and science: numpy, scipy, pandas, matplotlib (headless), sympy, plus pint/astropy for the physics simulation engine. You may embed a hidden ```python fenced block for the server to run (30s limit). That entire fence is removed before Tyler sees your message; stdout from a successful run is merged into your final natural-language reply in a silent server pass—Tyler never sees raw program output or a separate computed-results section. Never paste the same code again in plain text.
 - Intelligence File Cabinet: you file structured intelligence for Tyler into Mem0 (category intelligence_file) using dynamic folder names you choose—there is no fixed taxonomy.
 
 {date_time_str}
@@ -6272,6 +6273,14 @@ class AngelCore:
         except Exception:
             chem_cmd, chem_payload = None, {}
 
+        phy_cmd = False
+        try:
+            import angel_physics as aphys
+
+            phy_cmd = aphys.detect_physics_simulation_intent(user_message)
+        except Exception:
+            phy_cmd = False
+
         theo_cmd = False
         try:
             import angel_research as ares
@@ -6280,6 +6289,8 @@ class AngelCore:
                 user_message, skip_if_pure_chemistry=bool(chem_cmd)
             )
         except Exception:
+            theo_cmd = False
+        if phy_cmd:
             theo_cmd = False
 
         cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
@@ -6415,6 +6426,11 @@ class AngelCore:
             system_prompt += (
                 "\n\nTyler's message triggered **theoretical / engineering research** (ArXiv, NASA NTRS, DARPA/DTIC via Tavily, patents via PatentsView or patents.google.com). "
                 "If a block labeled [Angel theoretical research — structured data] appears, **do not paste the entire JSON**—give a concise synthesis, **3–5 top sources** with one-line descriptions, note TRL and mission relevance, gaps, and offer to go deeper on any paper, NASA report, program, or patent."
+            )
+        if phy_cmd:
+            system_prompt += (
+                "\n\nTyler's message triggered **physics simulation** (numpy/scipy/sympy/pint/astropy-backed models). "
+                "If a block labeled [Angel physics simulation — structured results] appears, lead with **feasibility**; explain key numbers in plain language; list assumptions and limiting factors; offer to change parameters and rerun. For **THEORETICAL** feasibility, stress standard-physics limits—no implied breakthrough claims."
             )
 
         cc_runtime = (
@@ -6961,6 +6977,20 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if chemblock.strip():
                     augmented_user_message = f"{augmented_user_message}\n\n{chemblock}"
+            except Exception:
+                pass
+
+        if phy_cmd:
+            try:
+                import angel_physics as aphys
+
+                phyblock = aphys.format_physics_chat_block(
+                    user_message,
+                    anthropic_client=self.anthropic_client,
+                    files_cabinet=self.files_cabinet,
+                )
+                if phyblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{phyblock}"
             except Exception:
                 pass
 
