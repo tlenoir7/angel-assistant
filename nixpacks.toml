@@ -1,5 +1,0 @@
-[phases.setup]
-nixPkgs = ["opencascade-occt"]
-
-[phases.install]
-cmds = ["/opt/venv/bin/pip install -r requirements.txt"]
