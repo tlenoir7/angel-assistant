@@ -70,6 +70,7 @@ from angel import (
     schedule_mission_network_seed_background,
     reset_mission_network_and_reseed,
     network_load_graph,
+    is_trusted_operator,
 )
 
 try:
@@ -4590,6 +4591,7 @@ def create_app() -> Flask:
                 use_mem0_cloud=angel._use_mem0_cloud,
                 user_id=angel.user_id,
                 depth=depth,
+                trusted_operator=is_trusted_operator(angel.user_id),
             )
             out = dict(r)
             if out.get("synthesis"):
@@ -4624,6 +4626,7 @@ def create_app() -> Flask:
                 memory_summary=None,
                 memory_client=angel.memory_client,
                 use_mem0_cloud=angel._use_mem0_cloud,
+                trusted_operator=is_trusted_operator(angel.user_id),
             )
             out = dict(r)
             if out.get("synthesis"):
