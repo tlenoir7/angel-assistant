@@ -35,6 +35,7 @@ import angel_communication_patterns
 import angel_biological_intelligence
 import angel_historical_archives
 import angel_chemistry
+import angel_medical
 import angel_research
 import angel_physics
 import angel_cad
@@ -3923,6 +3924,155 @@ def create_app() -> Flask:
             r = angel_chemistry.design_material_for_requirements(
                 req,
                 anthropic_client=angel.anthropic_client,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Medical Intelligence Core (PubMed, openFDA, MedlinePlus, ClinicalTrials.gov) ---
+    @app.route("/api/medical/status", methods=["GET"])
+    def api_medical_status():
+        try:
+            return jsonify({"ok": True, **angel_medical.medical_databases_status()})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/medical/condition", methods=["POST"])
+    def api_medical_condition():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        cond = (data.get("condition") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        if not cond:
+            return jsonify({"ok": False, "error": "condition required"}), 400
+        try:
+            r = angel_medical.analyze_condition(
+                cond,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/medical/drug", methods=["POST"])
+    def api_medical_drug():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        drug = (data.get("drug") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        if not drug:
+            return jsonify({"ok": False, "error": "drug required"}), 400
+        try:
+            r = angel_medical.analyze_drug(
+                drug,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/medical/literature", methods=["POST"])
+    def api_medical_literature():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        q = (data.get("query") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        if not q:
+            return jsonify({"ok": False, "error": "query required"}), 400
+        try:
+            r = angel_medical.search_medical_literature(
+                q,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/medical/trials", methods=["POST"])
+    def api_medical_trials():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        cond = (data.get("condition") or "").strip()
+        intr = (data.get("intervention") or "").strip() or None
+        if not cond:
+            return jsonify({"ok": False, "error": "condition required"}), 400
+        try:
+            r = angel_medical.search_trials(
+                cond,
+                intervention=intr,
+                status="RECRUITING",
+                max_results=15,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify({"ok": True, **r})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/medical/biological-threat", methods=["POST"])
+    def api_medical_biological_threat():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        agent = (data.get("agent") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        if not agent:
+            return jsonify({"ok": False, "error": "agent required"}), 400
+        try:
+            r = angel_medical.analyze_biological_agent(
+                agent,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/medical/health-profile", methods=["POST"])
+    def api_medical_health_profile():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        hd = data.get("health_data")
+        if not isinstance(hd, dict):
+            return jsonify({"ok": False, "error": "health_data object required"}), 400
+        try:
+            r = angel_medical.update_health_profile(
+                hd,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
             )
             return jsonify(r)
         except Exception as e:

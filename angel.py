@@ -92,6 +92,10 @@ CATEGORY_HISTORICAL_RECORD = "historical_record"
 CATEGORY_CHEMISTRY_CACHE = "chemistry_cache"
 # ArXiv (and similar) query cache for theoretical research agent (7-day TTL in payload)
 CATEGORY_RESEARCH_CACHE = "research_cache"
+# Medical / biomedical API query cache (7-day TTL in payload; excluded from memory digests)
+CATEGORY_MEDICAL_CACHE = "medical_cache"
+# Tyler health profile (Build 8 preview; excluded from routine memory summaries)
+CATEGORY_PERSONAL_HEALTH = "personal_health"
 # Stage 6 — self-observation & self-modification (excluded from routine memory digests)
 CATEGORY_SELF_OBSERVATION = "self_observation"
 CATEGORY_SELF_MODIFICATION = "self_modification"
@@ -119,6 +123,8 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_HISTORICAL_RECORD,
         CATEGORY_CHEMISTRY_CACHE,
         CATEGORY_RESEARCH_CACHE,
+        CATEGORY_MEDICAL_CACHE,
+        CATEGORY_PERSONAL_HEALTH,
         CATEGORY_SELF_OBSERVATION,
         CATEGORY_SELF_MODIFICATION,
     }
@@ -1623,6 +1629,10 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_COMM_PATTERN,
             CATEGORY_BIO_MEDICAL,
             CATEGORY_HISTORICAL_RECORD,
+            CATEGORY_CHEMISTRY_CACHE,
+            CATEGORY_RESEARCH_CACHE,
+            CATEGORY_MEDICAL_CACHE,
+            CATEGORY_PERSONAL_HEALTH,
             CATEGORY_SELF_OBSERVATION,
             CATEGORY_SELF_MODIFICATION,
         ):
@@ -1768,6 +1778,10 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_CHEMISTRY_CACHE:
             continue
         if cat == CATEGORY_RESEARCH_CACHE:
+            continue
+        if cat == CATEGORY_MEDICAL_CACHE:
+            continue
+        if cat == CATEGORY_PERSONAL_HEALTH:
             continue
         if cat == CATEGORY_SELF_OBSERVATION:
             continue
@@ -1974,6 +1988,7 @@ def _memories_excluding_reflection_reports(memories) -> list:
             CATEGORY_REFLECTION,
             CATEGORY_SELF_OBSERVATION,
             CATEGORY_SELF_MODIFICATION,
+            CATEGORY_PERSONAL_HEALTH,
         ):
             continue
         out.append(m)
@@ -2396,6 +2411,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - **Environmental map** (Batcomputer geography layer): mission-relevant physical locations — UAP hotspots, installations, restricted airspace, incident sites, facilities, and person-associated places — are stored as structured memories (category `env_location`) and mirrored under Intelligence folder `Environmental Map` as files `LOC-{{location_id}}`. The map is **excluded from routine memory digests** but you should **reference it naturally** when geography, incidents, programs, or travel matter. Open-source surveillance runs **cross-reference** headlines/summaries against this map; when Tyler's device reports GPS near a **HIGH/CRITICAL** point, you may note it briefly. APIs: GET `/api/map/locations`, `/api/map/summary`, `/api/map/near`, POST `/api/map/research`. Do not claim classified facility details—only what the map and open sources support.
 - **Communication pattern analysis** (Batcomputer): tracks **when and how** key public figures communicate (cadence, silence, escalation, venue shifts) — distinct from **what** they say in proactive news scans. Patterns are stored as category `comm_pattern` and mirrored under Intelligence folder `Communication Intelligence` as `CI-{{entity_slug}}-pattern`; **coordinated timing** across multiple figures may be filed as `CI-{{YYYYMMDD}}-{{hash}}`. You distinguish **content** (substance) from **pattern** (timing, frequency, coordination). Flag unusual **silence** for mission-critical voices, **escalation** spikes, and **coordinated** public messaging clusters. Cross-references may note alignment with **active predictions**. Scheduled scan ~48h; APIs under `/api/comms/`. Open sources only — not private communications.
 - **Biological & medical intelligence** (Batcomputer): structured reference cases and analyses for **physiological / psychological** patterns tied to UAP encounter literature, radiation/EM exposure **indicators** (not dosimetry), witness health narratives, and anomalous biology themes — including a dedicated **black-eyed people** profile for Tyler's childhood experience as a **reference anchor** (not a diagnosis). Stored as category `bio_medical` and files `BIO-*` under `Biological Intelligence` (including `BIO-black-eyed-profile`). You maintain **scientific humility**: summarize open-source patterns, separate observation from mechanism, and **never replace** licensed medical care. Surveillance can surface **bio/medical-adjacent** open-source clusters near mapped hotspots. APIs under `/api/bio/`.
+- **Medical Intelligence Core** (Build 5 — biomedical databases): on medical turns you receive a structured appendix from **PubMed** (NCBI E-utilities), **openFDA** drug labels and adverse events, **NIH MedlinePlus** health topics, and **ClinicalTrials.gov** API v2 — all **open, no API keys**. You synthesize **evidence quality** (ESTABLISHED / EMERGING / EXPERIMENTAL / THEORETICAL), flag **black box** warnings when present, and **never** present outputs as diagnosis or treatment orders—Tyler must consult licensed professionals. HIGH/CRITICAL mission relevance auto-files under Intelligence folder `Medical Intelligence` as `MED-YYYYMMDD-*` (biothreat-style assessments may file under `Biological Intelligence`). Tyler may store a private **health profile** (category `personal_health`, excluded from routine memory digests) via `POST /api/medical/health-profile`. APIs: `GET /api/medical/status`, `POST /api/medical/condition`, `/drug`, `/literature`, `/trials`, `/biological-threat`, `/health-profile`.
 - **Chemistry & materials intelligence** (Batcomputer): you pull **live scientific data** from **PubChem** (structures, identifiers, properties, GHS safety, bioactivity cross-refs), **NIST Chemistry WebBook** (thermodynamics, phase data, spectral excerpts as text), and **Materials Project** when `MATERIALS_PROJECT_API_KEY` is set (crystal summaries, band gap, stability, elasticity when available). Repeated PubChem bundle queries are cached in memory as category `chemistry_cache` (30-day TTL). For **synthesis** and **material selection** questions you combine databases with **Tavily** literature snippets and structured Claude briefs. Significant synthesis/material assessments may auto-file under Intelligence folder `Chemistry Intelligence` as `CHEM-*`. Chat turns that mention synthesis, compounds, materials, reactions, alloys, polymers, etc. receive an internal data appendix—**present findings in plain technical language**, not raw JSON. APIs: `GET /api/chemistry/status`, `POST /api/chemistry/compound`, `/api/chemistry/material`, `/api/chemistry/synthesis`, `/api/chemistry/design`. You do not claim proprietary or classified lab data.
 - **Theoretical research agent** (Engineering track — Build 1): you query **real** technical corpora on demand—**ArXiv** (preprints), **NASA NTRS** (technical reports), **DARPA / DTIC** (program and defense technical literature via **Tavily** `site:` search—there is no public DARPA API), and **US patents** via **PatentsView PatentSearch** when `PATENTSVIEW_API_KEY` is set, otherwise **Tavily** on **patents.google.com**. ArXiv search results are cached in Mem0 as category `research_cache` (7-day TTL). You synthesize findings into TRL estimates, gaps, mission relevance, and recommended follow-ups; when relevance is **HIGH** or **CRITICAL** you auto-file under Intelligence folder `Research Intelligence` as `RES-YYYYMMDD-*`, with cross-references to **Chemistry Intelligence** and **OSINT Dossiers** when filenames or tags overlap. Chat triggers include papers, studies, NASA/DARPA/patent wording, state of the art, and engineering questions with literature intent. APIs: `POST /api/research/query`, `/api/research/paper`, `/api/research/patent`, `GET /api/research/status`.
 - **Physics simulation engine** (Engineering track — Build 2): you run **numerical** models—not just prose—for propulsion/thrust, EM fields, structures/materials (with optional **Materials Project** hooks via chemistry), orbital mechanics (**astropy**), energy budgets, and a **THEORETICAL** lane (Casimir, warp-style energy scaling, plasma beta toy model, labeled speculative effects). Natural-language questions with engineering numbers trigger **parameter extraction** plus simulation; you present **feasibility** prominently (**FEASIBLE / MARGINAL / INFEASIBLE / THEORETICAL**), assumptions, and offers to rerun with new inputs. When **mission_relevance** is **CRITICAL**, results auto-file under Intelligence folder `Physics Simulations` as `PHYS-YYYYMMDD-*` with cross-refs to **Research Intelligence** and **Chemistry Intelligence**. APIs: `POST /api/physics/simulate`, `/api/physics/extract-params`, `/api/physics/natural`, `GET /api/physics/status`.
@@ -6295,6 +6311,14 @@ class AngelCore:
         except Exception:
             bio_cmd, bio_payload = None, {}
 
+        med_cmd, med_payload = None, {}
+        try:
+            import angel_medical as amed
+
+            med_cmd, med_payload = amed.detect_medical_chat_intent(user_message)
+        except Exception:
+            med_cmd, med_payload = None, {}
+
         hist_cmd, hist_payload = None, {}
         try:
             import angel_historical_archives as ahist
@@ -6347,6 +6371,8 @@ class AngelCore:
         if phy_cmd:
             theo_cmd = False
         if cad_cmd:
+            theo_cmd = False
+        if med_cmd:
             theo_cmd = False
 
         cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
@@ -6465,6 +6491,12 @@ class AngelCore:
                 "\n\nTyler's message relates to **biological / medical intelligence** (UAP-adjacent health patterns, exposure indicators, witness narratives — including the black-eyed people profile when relevant). "
                 "If a block labeled [Angel biological intelligence …] appears, integrate it with care: this is **not** a clinical diagnosis; cite uncertainty, mission relevance, and Tyler's personal connection to BEK research when on-topic. "
                 "Encourage professional medical evaluation when appropriate."
+            )
+        if med_cmd:
+            system_prompt += (
+                "\n\nTyler's message triggered the **Medical Intelligence Core** (PubMed, openFDA, MedlinePlus, ClinicalTrials.gov — open sources only). "
+                "If a block labeled [Medical intelligence appendix …] appears, answer conversationally: lead with **evidence quality**, summarize mechanism/options/trials at a high level, note **limitations** and that this is **not medical advice**. "
+                "Offer to go deeper on any subsection. If a black-box warning was flagged, say so clearly."
             )
         if hist_cmd:
             system_prompt += (
@@ -6670,6 +6702,7 @@ If you infer anything new about that person's preferences or dynamics, append at
         _operator_trusted = is_trusted_operator(self.user_id)
         _skip_parallel_agents = bool(
             cad_cmd
+            or bool(med_cmd)
             or (
                 _operator_trusted
                 and _message_has_cad_design_generation_keywords(user_message)
@@ -6991,6 +7024,25 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if bblock.strip():
                     augmented_user_message = f"{augmented_user_message}\n\n{bblock}"
+            except Exception:
+                pass
+
+        if med_cmd:
+            try:
+                import angel_medical as amed
+
+                mres = amed.run_medical_intent_for_chat(
+                    med_cmd,
+                    med_payload,
+                    anthropic_client=self.anthropic_client,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                    files_cabinet=self.files_cabinet,
+                )
+                mbuf = amed.format_medical_block_for_prompt(mres)
+                if mbuf.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{mbuf}"
             except Exception:
                 pass
 
