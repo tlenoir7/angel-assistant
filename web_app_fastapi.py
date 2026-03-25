@@ -1155,7 +1155,18 @@ def create_app() -> Flask:
     sched_tz = os.getenv("TIMEZONE", "America/Los_Angeles").strip()
     scheduler = BackgroundScheduler()
     angel_scheduler = scheduler
-    scheduler.add_job(_run_morning_briefing_job, "cron", hour=hour, minute=minute)
+    if os.environ.get("DISABLE_BRIEFING", "").lower() == "true":
+        pass  # briefing disabled
+    else:
+        if hour > 23 or minute > 59:
+            _log.warning(
+                "Invalid BRIEFING_TIME=%r (hour=%s minute=%s); skipping morning briefing cron job",
+                briefing_time,
+                hour,
+                minute,
+            )
+        else:
+            scheduler.add_job(_run_morning_briefing_job, "cron", hour=hour, minute=minute)
     scheduler.add_job(_run_proactive_intelligence_job, "interval", hours=4)
     scheduler.add_job(
         _run_weekly_reflection_job,
