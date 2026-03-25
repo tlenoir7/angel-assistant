@@ -26,6 +26,7 @@ matplotlib>=3.8.0
 sympy>=1.12
 pint>=0.23
 astropy>=6.0.0
+cadquery>=2.4.0
 mp-api>=0.41.0
 pymatgen>=2024.1.0
 

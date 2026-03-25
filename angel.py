@@ -2346,6 +2346,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - **Chemistry & materials intelligence** (Batcomputer): you pull **live scientific data** from **PubChem** (structures, identifiers, properties, GHS safety, bioactivity cross-refs), **NIST Chemistry WebBook** (thermodynamics, phase data, spectral excerpts as text), and **Materials Project** when `MATERIALS_PROJECT_API_KEY` is set (crystal summaries, band gap, stability, elasticity when available). Repeated PubChem bundle queries are cached in memory as category `chemistry_cache` (30-day TTL). For **synthesis** and **material selection** questions you combine databases with **Tavily** literature snippets and structured Claude briefs. Significant synthesis/material assessments may auto-file under Intelligence folder `Chemistry Intelligence` as `CHEM-*`. Chat turns that mention synthesis, compounds, materials, reactions, alloys, polymers, etc. receive an internal data appendix—**present findings in plain technical language**, not raw JSON. APIs: `GET /api/chemistry/status`, `POST /api/chemistry/compound`, `/api/chemistry/material`, `/api/chemistry/synthesis`, `/api/chemistry/design`. You do not claim proprietary or classified lab data.
 - **Theoretical research agent** (Engineering track — Build 1): you query **real** technical corpora on demand—**ArXiv** (preprints), **NASA NTRS** (technical reports), **DARPA / DTIC** (program and defense technical literature via **Tavily** `site:` search—there is no public DARPA API), and **US patents** via **PatentsView PatentSearch** when `PATENTSVIEW_API_KEY` is set, otherwise **Tavily** on **patents.google.com**. ArXiv search results are cached in Mem0 as category `research_cache` (7-day TTL). You synthesize findings into TRL estimates, gaps, mission relevance, and recommended follow-ups; when relevance is **HIGH** or **CRITICAL** you auto-file under Intelligence folder `Research Intelligence` as `RES-YYYYMMDD-*`, with cross-references to **Chemistry Intelligence** and **OSINT Dossiers** when filenames or tags overlap. Chat triggers include papers, studies, NASA/DARPA/patent wording, state of the art, and engineering questions with literature intent. APIs: `POST /api/research/query`, `/api/research/paper`, `/api/research/patent`, `GET /api/research/status`.
 - **Physics simulation engine** (Engineering track — Build 2): you run **numerical** models—not just prose—for propulsion/thrust, EM fields, structures/materials (with optional **Materials Project** hooks via chemistry), orbital mechanics (**astropy**), energy budgets, and a **THEORETICAL** lane (Casimir, warp-style energy scaling, plasma beta toy model, labeled speculative effects). Natural-language questions with engineering numbers trigger **parameter extraction** plus simulation; you present **feasibility** prominently (**FEASIBLE / MARGINAL / INFEASIBLE / THEORETICAL**), assumptions, and offers to rerun with new inputs. When **mission_relevance** is **CRITICAL**, results auto-file under Intelligence folder `Physics Simulations` as `PHYS-YYYYMMDD-*` with cross-refs to **Research Intelligence** and **Chemistry Intelligence**. APIs: `POST /api/physics/simulate`, `/api/physics/extract-params`, `/api/physics/natural`, `GET /api/physics/status`.
+- **CAD generation** (Engineering track — Build 3): you produce **downloadable** geometry (**STEP**, **STL**, **IGES** when the stack allows) using **cadquery** (preferred headless path on Linux/Railway) or **FreeCAD** Python for basic primitives when installed. Generators include boxes, cylinders, spheres, cones, toruses, **NACA 4-digit** airfoils, fuselage/nozzle/pressure-vessel/disc/lenticular shapes, and **assemblies**. Claude can turn a **design brief** into a build plan; when Tyler also ran a **physics simulation** in the same turn, sizing may use those constraints. Outputs live under the server temp `angel_cad` tree; **HIGH/CRITICAL** mission relevance can auto-file a summary under Intelligence folder `Engineering Designs`. APIs: `POST /api/cad/generate`, `/api/cad/from-brief`, `GET /api/cad/download/...`, `/api/cad/list`, `/api/cad/status`.
 - **Historical Intelligence Archives** (Batcomputer): searchable **timeline** of incidents, programs, documents, testimony, and turning points — cross-referenced with `connected_people`, programs, and locations. Stored as category `historical_record` and files `HIST-{{record_id}}` under `Historical Archives`. You connect **current** figures and programs to **prior** events (e.g. Elizondo ↔ AATIP), note when patterns **repeat**, and distinguish documented/declassified material from **contested** claims. Morning briefing may include **on-this-day** / anniversary hooks. OSINT dossiers can surface `historical_archive_links`. APIs under `/api/archives/`.
 - **Stage 6 — Self-modification (living system)**: You observe how Tyler interacts with you (category `self_observation`, excluded from routine memory summaries). On a schedule you analyze those observations and may propose **permanent** improvements to your behavior (category `self_modification`; mirrored under Intelligence folder `Self Modifications` as `MOD-{{id}}`). **Tyler must approve every change** — nothing is applied without his explicit approval. Approved instructions are merged into your system prompt via `angel_self_mods` on the server. You never weaken safety, never remove capabilities, and never bypass approval. You can mention evolution naturally; when a behavior reflects an approved modification, you may acknowledge it briefly. APIs under `/api/selfmod/`.
 - **Parallel multi-agent coordination**: For deep, multi-angle requests (e.g. comprehensive briefing, thorough research, “everything you know about X”), you can run **several specialist agents in parallel** (OSINT, threat, network mapping, history, patterns, etc.) with Tavily-backed context, then **synthesize** one coherent report. This is faster than sequential deep research. When you use it, say so briefly (e.g. that you ran parallel specialized analysis) and note the time advantage when helpful. APIs: `POST /api/agents/run`, `POST /api/agents/research`, `GET /api/agents/status/<task_id>`.
@@ -6281,6 +6282,14 @@ class AngelCore:
         except Exception:
             phy_cmd = False
 
+        cad_cmd = False
+        try:
+            import angel_cad as acad
+
+            cad_cmd = acad.detect_cad_generation_intent(user_message)
+        except Exception:
+            cad_cmd = False
+
         theo_cmd = False
         try:
             import angel_research as ares
@@ -6291,6 +6300,8 @@ class AngelCore:
         except Exception:
             theo_cmd = False
         if phy_cmd:
+            theo_cmd = False
+        if cad_cmd:
             theo_cmd = False
 
         cc_for_prompt = self.computer_control_enabled and COMPUTER_CONTROL_AVAILABLE
@@ -6431,6 +6442,11 @@ class AngelCore:
             system_prompt += (
                 "\n\nTyler's message triggered **physics simulation** (numpy/scipy/sympy/pint/astropy-backed models). "
                 "If a block labeled [Angel physics simulation — structured results] appears, lead with **feasibility**; explain key numbers in plain language; list assumptions and limiting factors; offer to change parameters and rerun. For **THEORETICAL** feasibility, stress standard-physics limits—no implied breakthrough claims."
+            )
+        if cad_cmd:
+            system_prompt += (
+                "\n\nTyler's message triggered **CAD generation** (cadquery/FreeCAD-backed). "
+                "If a block labeled [Angel CAD generation — structured results] appears, summarize the solid model, list **download** paths or `/api/cad/download/...` links, state assumptions, and offer to revise dimensions. When a physics simulation block appears in the same turn, treat it as sizing context for the CAD output."
             )
 
         cc_runtime = (
@@ -6980,7 +6996,32 @@ If you infer anything new about that person's preferences or dynamics, append at
             except Exception:
                 pass
 
-        if phy_cmd:
+        physics_natural_bundle: dict | None = None
+        if phy_cmd and cad_cmd:
+            try:
+                import angel_physics as aphys
+
+                physics_natural_bundle = aphys.run_physics_natural(
+                    user_message,
+                    user_message[:4000],
+                    anthropic_client=self.anthropic_client,
+                    files_cabinet=self.files_cabinet,
+                )
+                if physics_natural_bundle.get("ok"):
+                    augmented_user_message = (
+                        f"{augmented_user_message}\n\n"
+                        + aphys.format_physics_block_for_prompt(physics_natural_bundle["simulation"])
+                    )
+                else:
+                    augmented_user_message = (
+                        f"{augmented_user_message}\n\n[Angel physics — error]\n"
+                        + json.dumps(physics_natural_bundle, default=str)[:2500]
+                    )
+            except Exception as ex:
+                augmented_user_message = (
+                    f"{augmented_user_message}\n\n[Angel physics — error] {ex}"
+                )
+        elif phy_cmd:
             try:
                 import angel_physics as aphys
 
@@ -6993,6 +7034,32 @@ If you infer anything new about that person's preferences or dynamics, append at
                     augmented_user_message = f"{augmented_user_message}\n\n{phyblock}"
             except Exception:
                 pass
+
+        if cad_cmd:
+            try:
+                import angel_cad as acad
+
+                hints = acad._physics_hints(physics_natural_bundle)
+                cad_out = acad.generate_from_brief(
+                    user_message,
+                    user_message[:4000],
+                    session_id=self.user_id,
+                    anthropic_client=self.anthropic_client,
+                    physics_constraints=hints,
+                    files_cabinet=self.files_cabinet,
+                )
+                if cad_out.get("ok"):
+                    augmented_user_message = (
+                        f"{augmented_user_message}\n\n"
+                        + acad.format_cad_block_for_prompt(cad_out)
+                    )
+                else:
+                    augmented_user_message = (
+                        f"{augmented_user_message}\n\n[Angel CAD — error]\n"
+                        + json.dumps(cad_out, default=str)[:3000]
+                    )
+            except Exception as ex:
+                augmented_user_message = f"{augmented_user_message}\n\n[Angel CAD — error] {ex}"
 
         try:
             import angel_environmental_map as aemap

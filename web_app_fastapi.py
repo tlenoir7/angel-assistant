@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import re
 import os
 import threading
 import time
@@ -13,7 +14,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import functools
 import requests
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
 from apscheduler.schedulers.background import BackgroundScheduler
 import socketio
 from fastapi import FastAPI
@@ -36,6 +37,7 @@ import angel_historical_archives
 import angel_chemistry
 import angel_research
 import angel_physics
+import angel_cad
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -4061,6 +4063,112 @@ def create_app() -> Flask:
     def api_physics_status():
         try:
             return jsonify({"ok": True, **angel_physics.physics_library_status()})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- CAD generation (cadquery primary; FreeCAD optional for primitives) ---
+    @app.route("/api/cad/generate", methods=["POST"])
+    def api_cad_generate():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        shape = (data.get("shape") or "").strip().lower()
+        params = data.get("params") if isinstance(data.get("params"), dict) else {}
+        ctx = (data.get("context") or "").strip()
+        dn = (data.get("design_name") or "").strip() or f"cad_{datetime.now(timezone.utc).strftime('%H%M%S')}"
+        if not shape:
+            return jsonify({"ok": False, "error": "shape required"}), 400
+        try:
+            safe_dn = re.sub(r"[^a-zA-Z0-9._-]+", "_", dn)[:80] or "cad_design"
+            gen = angel_cad.generate_shape(
+                shape,
+                params,
+                session_id=angel.user_id,
+                design_name=safe_dn,
+                context=ctx,
+            )
+            if not gen.get("ok"):
+                return jsonify({"ok": False, **gen}), 400
+            rationale = {"note": "direct API generate", "context": ctx}
+            brief_path = Path(gen["design_dir"]) / f"{safe_dn}_design_brief.json"
+            try:
+                brief_path.write_text(
+                    json.dumps({"shape": shape, "params": params, "rationale": rationale}, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            out = {
+                "ok": True,
+                "design_name": safe_dn,
+                "shape": shape,
+                "files_generated": {k: v for k, v in (gen.get("paths") or {}).items() if v},
+                "design_rationale": json.dumps(rationale),
+                "backend": gen.get("backend"),
+                "design_dir": gen.get("design_dir"),
+            }
+            base = str(request.host_url).rstrip("/")
+            return jsonify(angel_cad.enrich_with_download_urls(out, base))
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/cad/from-brief", methods=["POST"])
+    def api_cad_from_brief():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        brief = data.get("brief")
+        if brief is None and isinstance(data.get("design_brief"), str):
+            brief = data.get("design_brief")
+        ctx = (data.get("context") or "").strip()
+        phys = data.get("physics_constraints") if isinstance(data.get("physics_constraints"), dict) else {}
+        if isinstance(brief, dict):
+            pass
+        elif not (isinstance(brief, str) and brief.strip()):
+            return jsonify({"ok": False, "error": "brief (string or object) required"}), 400
+        try:
+            out = angel_cad.generate_from_brief(
+                brief if isinstance(brief, (str, dict)) else str(brief),
+                ctx,
+                session_id=angel.user_id,
+                anthropic_client=angel.anthropic_client,
+                physics_constraints=phys,
+                design_name=(data.get("design_name") or "").strip() or None,
+                files_cabinet=angel.files_cabinet,
+            )
+            base = str(request.host_url).rstrip("/")
+            code = 200 if out.get("ok") else 400
+            return jsonify(angel_cad.enrich_with_download_urls(out, base)), code
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/cad/download/<design_name>/<filename>", methods=["GET"])
+    def api_cad_download(design_name, filename):
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        p = angel_cad.resolve_download_path(angel.user_id, design_name, filename)
+        if p is None:
+            return jsonify({"ok": False, "error": "file not found"}), 404
+        return send_file(str(p), as_attachment=True, download_name=filename)
+
+    @app.route("/api/cad/list", methods=["GET"])
+    def api_cad_list():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            rows = angel_cad.list_designs(angel.user_id)
+            return jsonify({"ok": True, "designs": rows})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/cad/status", methods=["GET"])
+    def api_cad_status():
+        try:
+            return jsonify({"ok": True, **angel_cad.get_cad_status()})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
