@@ -412,14 +412,10 @@ def run_parallel_agents(
 
     t_mem0 = time.perf_counter()
     mem_in = (memory_summary or "").strip()
+    mem_mode = "none"
     if mem_in:
         memory_context = _cap_memory_context(mem_in)
-        dt_mem = time.perf_counter() - t_mem0
-        print(
-            f"[parallel] shared memory context ready in {dt_mem:.2f}s "
-            f"(pre-built, no Mem0 fetch)",
-            flush=True,
-        )
+        mem_mode = "prebuilt"
     elif memory_client is not None:
         from angel import build_memory_summary_with_sections, fetch_combined_memories
 
@@ -427,17 +423,10 @@ def run_parallel_agents(
         memory_context = _cap_memory_context(
             build_memory_summary_with_sections(merged, None)
         )
-        dt_mem = time.perf_counter() - t_mem0
-        print(f"[parallel] memory fetch complete in {dt_mem:.2f}s", flush=True)
+        mem_mode = "fetch"
     else:
         memory_context = ""
-        dt_mem = time.perf_counter() - t_mem0
-        print(
-            f"[parallel] no memory context ({dt_mem:.2f}s); agents use Tavily + task context only",
-            flush=True,
-        )
-
-    print("[parallel] agents starting with shared context", flush=True)
+    dt_mem = time.perf_counter() - t_mem0
     t_pool_start = time.perf_counter()
     ordered: list[AgentTask] = []
     with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_AGENTS, len(norm))) as ex:
@@ -466,7 +455,6 @@ def run_parallel_agents(
         ordered = [s for s in slot if s is not None]
 
     agent_phase_sec = time.perf_counter() - t_pool_start
-    print(f"[parallel] all agents complete in {agent_phase_sec:.2f}s", flush=True)
 
     seq_est = float(len(ordered) * 48)
     topic = sc[:500]
@@ -483,10 +471,13 @@ def run_parallel_agents(
         trusted_operator=trusted_operator,
     )
     synth_elapsed = time.perf_counter() - t_synth_start
-    print(f"[parallel] synthesis complete in {synth_elapsed:.2f}s", flush=True)
 
     elapsed = time.perf_counter() - t_total_start
-    print(f"[parallel] total time {elapsed:.2f}s", flush=True)
+    print(
+        f"[parallel] agents={len(ordered)} mem={mem_mode} mem_setup={dt_mem:.2f}s "
+        f"phase={agent_phase_sec:.2f}s synth={synth_elapsed:.2f}s total={elapsed:.2f}s",
+        flush=True,
+    )
     return {
         "ok": True,
         "results": [t.to_dict() for t in ordered],

@@ -24,6 +24,10 @@ except ImportError:
 OPENAI_BETA_HEADER = "realtime=v1"
 
 
+def _realtime_verbose() -> bool:
+    return (os.getenv("ANGEL_VERBOSE_STDIO") or "").strip().lower() in ("1", "true", "yes")
+
+
 def _realtime_ws_url() -> str:
     model = (os.environ.get("OPENAI_REALTIME_MODEL") or "gpt-realtime").strip()
     return f"wss://api.openai.com/v1/realtime?model={model}"
@@ -208,17 +212,20 @@ class AngelRealtimeSession:
             raise RuntimeError("Realtime session not connected")
 
         # Drain any pending server messages so we start with a clear buffer
+        drain_types: list[str] = []
         while True:
             try:
                 raw = self._ws.recv(timeout=0.01)
                 msg = json.loads(raw)
-                print(f"[Realtime] drain: unexpected message type = {msg.get('type')!r}", msg)
+                drain_types.append(str(msg.get("type")))
             except TimeoutError:
                 break
+        if drain_types:
+            tail = drain_types[:10]
+            more = f" (+{len(drain_types) - 10} more)" if len(drain_types) > 10 else ""
+            print(f"[Realtime] drain: n={len(drain_types)} types={tail}{more}", flush=True)
 
-        print(f"[Realtime] send_audio: wav_bytes length = {len(wav_bytes)}")
         pcm_bytes = _wav_to_pcm16_24k(wav_bytes)
-        print(f"[Realtime] send_audio: pcm_bytes length after conversion = {len(pcm_bytes)}")
 
         MIN_PCM_BYTES = 2400  # 100ms at 24kHz 16-bit mono (24000 * 0.1 * 2)
         if not pcm_bytes or len(pcm_bytes) < MIN_PCM_BYTES:
@@ -230,15 +237,22 @@ class AngelRealtimeSession:
 
         chunk_size = 4096
         total_sent = 0
+        n_chunks = 0
         for i in range(0, len(pcm_bytes), chunk_size):
             chunk = pcm_bytes[i : i + chunk_size]
             n = len(chunk)
-            print(f"[Realtime] send_audio: sending chunk size = {n}")
+            if _realtime_verbose():
+                print(f"[Realtime] send_audio chunk n={n}")
             chunk_b64 = base64.standard_b64encode(chunk).decode("ascii")
             self._send_json({"type": "input_audio_buffer.append", "audio": chunk_b64})
             total_sent += n
+            n_chunks += 1
             time.sleep(0.1)
-        print(f"[Realtime] send_audio: total bytes sent before commit = {total_sent}")
+        print(
+            f"[Realtime] send_audio: wav_in={len(wav_bytes)} pcm={len(pcm_bytes)} "
+            f"chunks={n_chunks} bytes_sent={total_sent}",
+            flush=True,
+        )
 
         time.sleep(0.5)
         self._send_json({"type": "input_audio_buffer.commit"})
@@ -252,11 +266,13 @@ class AngelRealtimeSession:
 
         transcript_parts: list[str] = []
         audio_chunks: list[bytes] = []
+        evt_counts: dict[str, int] = {}
         while True:
             raw = self._ws.recv()
             msg = json.loads(raw)
             t = msg.get("type")
-            print(f"[Realtime] response event: type={t!r}")
+            if isinstance(t, str):
+                evt_counts[t] = evt_counts.get(t, 0) + 1
 
             # Audio: response.audio.delta (current API event name)
             if t == "response.audio.delta":
@@ -268,7 +284,9 @@ class AngelRealtimeSession:
             elif t == "response.audio_transcript.done":
                 transcript_parts.append(msg.get("transcript", ""))
             elif t == "response.error":
-                print("[Realtime] response.error event:", json.dumps(msg, indent=2))
+                err_blob = json.dumps(msg, ensure_ascii=False)
+                tail = err_blob if _realtime_verbose() else (err_blob[:400] + ("…" if len(err_blob) > 400 else ""))
+                print(f"[Realtime] response.error: {tail}", flush=True)
             elif t == "response.done":
                 status = (msg.get("response") or {}).get("status", "")
                 if status not in ("completed", "incomplete"):
@@ -279,6 +297,14 @@ class AngelRealtimeSession:
 
         transcript = "".join(transcript_parts).strip()
         audio_bytes = b"".join(audio_chunks)
+        keys = sorted(evt_counts.keys())
+        summary = ",".join(f"{k}:{evt_counts[k]}" for k in keys[:12])
+        if len(keys) > 12:
+            summary += f",…(+{len(keys) - 12} types)"
+        print(
+            f"[Realtime] response stream: events={sum(evt_counts.values())} types=[{summary}]",
+            flush=True,
+        )
         return transcript, audio_bytes
 
     def disconnect(self) -> None:

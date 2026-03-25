@@ -146,11 +146,6 @@ def record_turn_observation(
     """Heuristic observation for this turn; stored as category self_observation (compact)."""
     from angel import add_structured_memory
 
-    print(
-        "[selfmod] add_structured_memory (observation) category_passed="
-        f"{CATEGORY_SELF_OBSERVATION!r} — must equal angel.CATEGORY_SELF_OBSERVATION",
-        flush=True,
-    )
     u = (user_message or "").strip()
     if not u:
         return
@@ -217,31 +212,15 @@ def _normalize_memories(memories: Any) -> list[dict]:
 
 def iter_self_modifications(memories: list) -> list[dict[str, Any]]:
     """Latest record per modification_id (Mem0 may store multiple versions)."""
-    n_in = len(memories) if isinstance(memories, list) else 0
     norm = _normalize_memories(memories)
-    sample_cats: list[str | None] = []
-    for m in norm[:24]:
-        if isinstance(m, dict):
-            sample_cats.append(_memory_category_from_item(m))
-        else:
-            sample_cats.append(None)
-    print(
-        "[selfmod] iter_self_modifications: filter_category="
-        f"{CATEGORY_SELF_MODIFICATION!r} (angel.CATEGORY_SELF_MODIFICATION) "
-        f"sample_categories_first_rows={sample_cats!r}",
-        flush=True,
-    )
 
     by_id: dict[str, dict[str, Any]] = {}
-    n_cat = 0
-    n_parse_fail = 0
     for m in norm:
         if not isinstance(m, dict):
             continue
         cat = _memory_category_from_item(m)
         if cat != CATEGORY_SELF_MODIFICATION:
             continue
-        n_cat += 1
         raw = (m.get("memory") or m.get("data") or "").strip()
         if not raw:
             continue
@@ -258,13 +237,7 @@ def iter_self_modifications(memories: list) -> list[dict[str, Any]]:
             if not prev or u_new >= u_old:
                 by_id[mid] = rec
         except Exception:
-            n_parse_fail += 1
             continue
-    print(
-        f"[selfmod] iter_self_modifications: raw_memories={n_in} "
-        f"rows_matching_self_modification_category={n_cat} parse_fail={n_parse_fail} unique_ids={len(by_id)}",
-        flush=True,
-    )
     return list(by_id.values())
 
 
@@ -274,34 +247,10 @@ def _save_modification_memory(
     use_mem0_cloud: bool,
     record: dict[str, Any],
 ) -> None:
-    from angel import (
-        CATEGORY_SELF_MODIFICATION,
-        _load_local_memory_entries,
-        add_structured_memory,
-    )
+    from angel import CATEGORY_SELF_MODIFICATION, add_structured_memory
 
-    mid = (record.get("modification_id") or "").strip()
-    title = (record.get("title") or "").strip()
-    print(f"[selfmod] saving proposal: {mid!r} {title!r}", flush=True)
-    print(
-        "[selfmod] add_structured_memory (proposal) category_passed="
-        f"{CATEGORY_SELF_MODIFICATION!r} — must equal angel.CATEGORY_SELF_MODIFICATION",
-        flush=True,
-    )
-
-    def _count_self_mod_rows() -> int:
-        try:
-            return sum(
-                1
-                for e in _load_local_memory_entries(user_id)
-                if isinstance(e, dict) and _memory_category_from_item(e) == CATEGORY_SELF_MODIFICATION
-            )
-        except Exception:
-            return -1
-
-    before = _count_self_mod_rows()
     text = json.dumps(record, ensure_ascii=False)
-    ok_local = add_structured_memory(
+    add_structured_memory(
         memory_client,
         user_id,
         text,
@@ -309,14 +258,6 @@ def _save_modification_memory(
         person_name=None,
         use_mem0_cloud=use_mem0_cloud,
     )
-    after = _count_self_mod_rows()
-    result = {
-        "local_append_ok": ok_local,
-        "local_self_mod_rows_before": before,
-        "local_self_mod_rows_after": after,
-        "use_mem0_cloud": use_mem0_cloud,
-    }
-    print(f"[selfmod] save result: {result}", flush=True)
 
 
 def mirror_mod_file(files_cabinet: Any, record: dict[str, Any]) -> None:
@@ -661,8 +602,6 @@ If nothing is worth changing, return {"proposals": [], "safety_note": "..."}."""
     if not isinstance(proposals, list):
         proposals = []
 
-    print(f"[selfmod] generated {len(proposals)} proposals", flush=True)
-
     n = 0
     for p in proposals[:max_proposals]:
         if not isinstance(p, dict):
@@ -697,12 +636,10 @@ If nothing is worth changing, return {"proposals": [], "safety_note": "..."}."""
         n += 1
 
     if n:
-        print(f"[selfmod] proposals saved successfully (n={n})", flush=True)
         set_pending_proposal_notification(
             "I've been observing our interactions and I have a proposed modification to how I operate. Want to review it?"
         )
-    else:
-        print("[selfmod] no proposals saved (model empty, safety filter, or save failure)", flush=True)
+    print(f"[selfmod] weekly analysis: generated={len(proposals)} saved={n}", flush=True)
     return {"ok": True, "count": n, "safety_note": data.get("safety_note")}
 
 
@@ -831,8 +768,5 @@ def api_list_proposals(memory_client, user_id: str, use_mem0_cloud: bool) -> lis
     from angel import fetch_combined_memories
 
     mem = fetch_combined_memories(memory_client, user_id, use_mem0_cloud)
-    nraw = len(mem) if isinstance(mem, list) else 0
-    print(f"[selfmod] api_list_proposals: fetch_combined_memories -> {nraw} raw rows", flush=True)
     out = iter_self_modifications(mem)
-    print(f"[selfmod] api_list_proposals: returning {len(out)} proposal record(s)", flush=True)
     return out

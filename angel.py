@@ -17,6 +17,11 @@ import wave
 
 _mission_graph_log = logging.getLogger(__name__)
 _mem0_log = logging.getLogger(__name__)
+
+
+def _verbose_stdio() -> bool:
+    """Extra stdout (per-chunk realtime, full JSON previews). Default off for hosted log limits."""
+    return (os.getenv("ANGEL_VERBOSE_STDIO") or "").strip().lower() in ("1", "true", "yes")
 import tempfile
 
 import requests
@@ -1138,6 +1143,7 @@ def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet
         return reply
     text = reply
     filed_success: list[tuple[str, str]] = []  # (file_name, folder) for confirmation if reply is empty
+    filing_notes: list[str] = []
 
     # 1) [FILE:folder=...|name=...] blocks
     pos = 0
@@ -1158,9 +1164,7 @@ def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet
             continue
 
         if not body:
-            print(
-                f"{Fore.YELLOW}Intelligence file tag {name!r} had empty body; stripping tag only.{Style.RESET_ALL}"
-            )
+            filing_notes.append(f"empty_body:{name!r}")
             left = text[:start].rstrip()
             right = text[end_tag:].lstrip()
             text = f"{left}\n\n{right}".strip() if left and right else (left + right).strip()
@@ -1171,17 +1175,12 @@ def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet
             tags = _infer_threat_intel_tags(folder, body)
             files_cabinet.create_file(folder, name, body, tags=tags)
             filed_success.append((name, folder))
-            print(
-                f"{Fore.MAGENTA}Intelligence file saved: {folder!r} / {name!r}{Style.RESET_ALL}"
-            )
         except ValueError as e:
-            print(
-                f"{Fore.YELLOW}Intelligence file not saved ({e}); markup left in reply.{Style.RESET_ALL}"
-            )
+            filing_notes.append(f"not_saved:{name!r}:{e}")
             pos = end_tag
             continue
         except Exception as e:
-            print(f"{Fore.YELLOW}Intelligence file save error: {e}{Style.RESET_ALL}")
+            filing_notes.append(f"error:{name!r}:{e}")
             pos = end_tag
             continue
 
@@ -1210,21 +1209,27 @@ def process_filed_intelligence_in_reply(reply: str, files_cabinet: "FilesCabinet
             tags = _infer_threat_intel_tags(folder, body)
             files_cabinet.create_file(folder, name, body, tags=tags)
             filed_success.append((name, folder))
-            print(
-                f"{Fore.MAGENTA}Intelligence file saved (legacy block): {folder!r} / {name!r}{Style.RESET_ALL}"
-            )
         except ValueError as e:
-            print(
-                f"{Fore.YELLOW}Intelligence file not saved ({e}); legacy block left in reply.{Style.RESET_ALL}"
-            )
+            filing_notes.append(f"legacy_not_saved:{name!r}:{e}")
             break
         except Exception as e:
-            print(f"{Fore.YELLOW}Intelligence file save error: {e}{Style.RESET_ALL}")
+            filing_notes.append(f"legacy_error:{name!r}:{e}")
             break
 
         left = text[:start].rstrip()
         right = text[end:].lstrip()
         text = f"{left}\n\n{right}".strip() if left and right else (left + right).strip()
+
+    if filed_success or filing_notes:
+        names = [f"{n}@{f}" for n, f in filed_success[:12]]
+        more = "" if len(filed_success) <= 12 else f" (+{len(filed_success) - 12} more)"
+        print(
+            f"{Fore.MAGENTA}Intelligence filing: saved={len(filed_success)} "
+            f"files=[{', '.join(names)}]{more} notes={len(filing_notes)}{Style.RESET_ALL}",
+            flush=True,
+        )
+        if filing_notes and _verbose_stdio():
+            print(f"{Fore.YELLOW}Intelligence filing notes: {filing_notes[:8]}{Style.RESET_ALL}", flush=True)
 
     if not (text or "").strip() and filed_success:
         text = "Filed. " + " ".join(
@@ -1852,7 +1857,6 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
     dedupe against Mem0: local is canonical for those rows and Mem0 may omit or reshape them.
     """
     uid_log = (user_id or "").strip() or "(empty)"
-    print(f"[fetch] fetch_combined_memories user_id={uid_log!r} use_mem0_cloud={use_mem0_cloud!r}", flush=True)
 
     try:
         raw = memory_client.get_all(user_id=user_id)
@@ -1870,6 +1874,8 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
     elif isinstance(memories, dict) and isinstance(memories.get("results"), list):
         combined.extend(memories["results"])
 
+    n_from_api = len(combined)
+
     if not use_mem0_cloud:
         local_rows = _load_local_memories(user_id)
         n_local = len(local_rows) if isinstance(local_rows, list) else 0
@@ -1882,8 +1888,6 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
             if isinstance(local_rows, list)
             else 0
         )
-        print(f"[fetch] local memories loaded: {n_local}", flush=True)
-        print(f"[fetch] local self_mod rows: {n_local_sm}", flush=True)
         if isinstance(local_rows, list):
             combined.extend(local_rows)
         merged = combined
@@ -1892,8 +1896,11 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
             for r in merged
             if isinstance(r, dict) and _memory_row_category(r) == CATEGORY_SELF_MODIFICATION
         )
-        print(f"[fetch] after merge total: {len(merged)}", flush=True)
-        print(f"[fetch] after merge self_mod rows: {n_merged_sm}", flush=True)
+        print(
+            f"[fetch] user={uid_log!r} cloud=0 api_n={n_from_api} local_n={n_local} "
+            f"merged={len(merged)} self_mod={n_merged_sm}",
+            flush=True,
+        )
         return merged
 
     # Mem0 cloud: merge local JSON; structured rows always included (no dedupe vs Mem0).
@@ -1915,8 +1922,6 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
         if isinstance(local_rows, list)
         else 0
     )
-    print(f"[fetch] local memories loaded: {n_local}", flush=True)
-    print(f"[fetch] local self_mod rows: {n_local_sm}", flush=True)
 
     added_structured = 0
     added_dedupe = 0
@@ -1949,11 +1954,9 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
         for r in merged
         if isinstance(r, dict) and _memory_row_category(r) == CATEGORY_SELF_MODIFICATION
     )
-    print(f"[fetch] after merge total: {len(merged)}", flush=True)
-    print(f"[fetch] after merge self_mod rows: {n_merged_sm}", flush=True)
     print(
-        f"[fetch] merge stats: structured_always_merged={added_structured} "
-        f"non_struct_added={added_dedupe} non_struct_skipped_dedupe={skipped_dedupe}",
+        f"[fetch] user={uid_log!r} cloud=1 api_n={n_from_api} local_n={n_local} merged={len(merged)} "
+        f"self_mod={n_merged_sm} struct+={added_structured} dedupe+={added_dedupe} dedupe_skip={skipped_dedupe}",
         flush=True,
     )
     return merged
@@ -2676,16 +2679,16 @@ def call_gpt4o_audio(
         )
         if not resp.ok:
             body = resp.text
-            if resp.status_code == 400:
-                print(f"{Fore.RED}OpenAI 400 Bad Request - full response body:{Style.RESET_ALL}\n{body}")
-            else:
-                print(f"{Fore.RED}OpenAI voice API error {resp.status_code}:{Style.RESET_ALL}\n{body}")
+            tail = body if _verbose_stdio() else (body[:500] + ("…" if len(body) > 500 else ""))
+            print(f"{Fore.RED}OpenAI voice API error {resp.status_code}:{Style.RESET_ALL}\n{tail}")
             return f"(Angel voice error {resp.status_code}: {body[:500]})", None, ""
         data = resp.json()
     except requests.RequestException as e:
         err_resp = getattr(e, "response", None)
         if err_resp is not None:
-            print(f"{Fore.RED}OpenAI voice request failed - response body:{Style.RESET_ALL}\n{err_resp.text}")
+            et = err_resp.text or ""
+            tail = et if _verbose_stdio() else (et[:500] + ("…" if len(et) > 500 else ""))
+            print(f"{Fore.RED}OpenAI voice request failed:{Style.RESET_ALL}\n{tail}")
         return f"(Angel encountered an error with voice: {e})", None, ""
     except Exception as e:
         return f"(Angel encountered an error with voice: {e})", None, ""
@@ -2696,8 +2699,7 @@ def call_gpt4o_audio(
             return "(No response from voice model.)", None, ""
         msg = choices[0].get("message") or {}
 
-        # Print full response structure once so we can verify parsing
-        if not getattr(call_gpt4o_audio, "_logged_response_structure", False):
+        if _verbose_stdio() and not getattr(call_gpt4o_audio, "_logged_response_structure", False):
             print(f"{Fore.CYAN}GPT-4o audio preview response structure (first time):{Style.RESET_ALL}")
             try:
                 import json
@@ -2712,7 +2714,7 @@ def call_gpt4o_audio(
                     return obj
                 print(json.dumps(_redact(data), indent=2, default=str)[:2000])
             except Exception:
-                print(data)
+                print(str(data)[:2000])
             call_gpt4o_audio._logged_response_structure = True
 
         audio_obj = msg.get("audio") or {}
@@ -2736,10 +2738,10 @@ def call_gpt4o_audio(
         if isinstance(audio_obj, dict) and audio_obj.get("input_transcript"):
             user_transcript = (audio_obj.get("input_transcript") or "").strip()
 
-        # Print both on first response to verify parsing
-        if not getattr(call_gpt4o_audio, "_logged_parsed_values", False):
-            print(f"{Fore.CYAN}[GPT-4o audio] reply_text (Angel): {repr(reply_text[:200])}{Style.RESET_ALL}")
-            print(f"{Fore.CYAN}[GPT-4o audio] user_transcript (You): {repr(user_transcript[:200])}{Style.RESET_ALL}")
+        if _verbose_stdio() and not getattr(call_gpt4o_audio, "_logged_parsed_values", False):
+            print(
+                f"{Fore.CYAN}[GPT-4o audio] reply_len={len(reply_text)} user_transcript_len={len(user_transcript)}{Style.RESET_ALL}"
+            )
             call_gpt4o_audio._logged_parsed_values = True
 
         # Parse audio from message.audio.data (base64)
@@ -2930,9 +2932,7 @@ def maybe_search_web(
 
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
-        print(
-            f"{Fore.YELLOW}TAVILY_API_KEY is not set; skipping web search.{Style.RESET_ALL}"
-        )
+        _mem0_log.debug("TAVILY_API_KEY not set; skipping web search")
         return None
 
     try:
@@ -5438,7 +5438,6 @@ def reset_mission_network_and_reseed(
     Recovery: delete Network Intelligence mirror files only, then force a full mission seed.
     Skips slow Mem0 cloud deletes — nodes/edges are upserted in place (canonical JSON also on disk).
     """
-    print("[reset] step 1: deleting Network Intelligence files", flush=True)
     out: dict = {
         "ok": True,
         "intel_files_deleted": 0,
@@ -5464,8 +5463,6 @@ def reset_mission_network_and_reseed(
             except Exception:
                 pass
 
-        print(f"[reset] step 2: files deleted, count={out['intel_files_deleted']}", flush=True)
-        print("[reset] step 3: calling seed_mission_network_if_empty force=True", flush=True)
         out["seed_ran"] = seed_mission_network_if_empty(
             memory_client,
             user_id,
@@ -5480,12 +5477,12 @@ def reset_mission_network_and_reseed(
         out["nodes_after"] = len(nodes)
         out["edges_after"] = len(edges)
         print(
-            f"[reset] step 4: seed complete, nodes={out['nodes_after']} edges={out['edges_after']} (local)",
+            f"[reset] mission_network ok={out['ok']} intel_files_deleted={out['intel_files_deleted']} "
+            f"seed_ran={out['seed_ran']} nodes={out['nodes_after']} edges={out['edges_after']}",
             flush=True,
         )
-        print("[reset] step 5: returning result", flush=True)
     except Exception as e:
-        print(f"[reset] EXCEPTION before step 5: {e!r}", flush=True)
+        print(f"[reset] mission_network FAILED: {e!r}", flush=True)
         traceback.print_exc()
         out["ok"] = False
         out["error"] = str(e)
@@ -5544,7 +5541,7 @@ def _network_background_mem0_full_sync(
                 pass
     except Exception:
         pass
-    print("[seed] Mem0 background sync: finished", flush=True)
+    _mission_graph_log.debug("network Mem0 background sync finished")
 
 
 def _seed_mission_network_if_empty_core(
@@ -5580,7 +5577,6 @@ def _seed_mission_network_if_empty_core(
     ]
     _SEED_EDGE_COUNT = 15  # 12 main graph + 3 Marco Rubio cluster edges
 
-    print(f"[seed] writing {len(seed_nodes)} nodes to local JSON", flush=True)
     seen_seed_slugs: set[str] = set()
     for name, nt, desc, rel, tags in seed_nodes:
         sid = network_slug_from_display_name(name)
@@ -5599,8 +5595,6 @@ def _seed_mission_network_if_empty_core(
             use_mem0_cloud=use_mem0_cloud,
             fast_local=True,
         )
-
-    print(f"[seed] writing {_SEED_EDGE_COUNT} edges to local JSON", flush=True)
 
     def e(a, b, rt, desc, st="STRONG", ev="Mission seed graph"):
         return add_network_edge(
@@ -5669,13 +5663,11 @@ def _seed_mission_network_if_empty_core(
             }
         )
     _mission_graph_log.debug(
-        "seed_mission_network_if_empty: Marco Rubio cluster %d edges edge_ids=%s detail=%s",
+        "seed Marco Rubio cluster edges=%d edge_ids=%s",
         len(_mr_stored),
         [x.get("edge_id") for x in _mr_stored],
-        _mr_stored,
     )
 
-    print("[seed] local write complete, starting Mem0 background sync", flush=True)
     if use_mem0_cloud:
         try:
             threading.Thread(
@@ -5687,8 +5679,13 @@ def _seed_mission_network_if_empty_core(
         except Exception:
             pass
     else:
-        print("[seed] skip Mem0 background sync (cloud off)", flush=True)
+        _mission_graph_log.debug("seed: skip Mem0 background sync (cloud off)")
 
+    print(
+        f"[seed] mission_graph nodes={len(seen_seed_slugs)} edges={_SEED_EDGE_COUNT} "
+        f"mem0_sync={'async' if use_mem0_cloud else 'off'}",
+        flush=True,
+    )
     _mission_graph_log.debug("seed_mission_network_if_empty: mission graph seed finished successfully")
     return True
 
@@ -6177,13 +6174,6 @@ class AngelCore:
 
     def load_initial_memory_summary(self) -> str:
         memories = self._fetch_combined_memories()
-        try:
-            print(f"{Fore.MAGENTA}MEMORIES LOADED (AngelCore):{Style.RESET_ALL} {len(memories)}")
-            for i, m in enumerate(memories, start=1):
-                print(f"{Fore.MAGENTA}  {i}. {_memory_text_for_debug(m)}{Style.RESET_ALL}")
-        except Exception as e:
-            print(f"{Fore.RED}Warning: could not print loaded memories: {e}{Style.RESET_ALL}")
-            print(traceback.format_exc())
         return summarize_memories_for_prompt(memories)
 
     def generate_reply(
@@ -6614,17 +6604,12 @@ If you infer anything new about that person's preferences or dynamics, append at
 [ANGEL_PROFILE]: <Person Name>|<concise updated profile text>.
 """
 
-        print(f"{Fore.BLUE}Angel is thinking...{Style.RESET_ALL}")
-
         augmented_user_message = user_message
         osint_ran = False
         osint_attempted = bool(osint_triggered and osint_target)
 
         if osint_triggered and osint_target:
             if os.getenv("TAVILY_API_KEY"):
-                print(
-                    f"{Fore.BLUE}Angel: OSINT deep background on {osint_target!r} ({osint_type})...{Style.RESET_ALL}"
-                )
                 os_res = run_osint_background(
                     osint_target,
                     osint_type,
@@ -6720,9 +6705,6 @@ If you infer anything new about that person's preferences or dynamics, append at
                     depth=depth,
                     trusted_operator=_operator_trusted,
                 )
-                print(
-                    f"{Fore.BLUE}Angel: parallel agents ({len(tasks)}) — {ptopic[:100]!r}…{Style.RESET_ALL}"
-                )
                 # Single Mem0 fetch for this turn is already done above; parallel run reuses capped summary only.
                 parallel_mem = apa.prepare_shared_memory_context(memory_summary)
                 pr = apa.run_parallel_agents(
@@ -6766,9 +6748,6 @@ If you infer anything new about that person's preferences or dynamics, append at
                 import angel_research as ares
 
                 _tq = (user_message or "").strip()
-                print(
-                    f"{Fore.BLUE}Angel: theoretical research agent (ArXiv / NASA / DARPA / patents)…{Style.RESET_ALL}"
-                )
                 _tres = ares.run_research_agent(
                     _tq,
                     (user_message or "")[:4000],
@@ -6798,7 +6777,6 @@ If you infer anything new about that person's preferences or dynamics, append at
             # For pre-conversation briefings, always try to research the person/topic explicitly.
             topic = (comm_intent.person_name or "") + " " + (comm_intent.topic or "")
             topic = topic.strip() or user_message.strip()
-            print(f"{Fore.BLUE}Angel: researching {topic!r} for your briefing...{Style.RESET_ALL}")
             briefing = do_deep_research(
                 topic,
                 memory_summary,
@@ -6819,7 +6797,6 @@ If you infer anything new about that person's preferences or dynamics, append at
                     break
             if not topic or len(topic) < 2:
                 topic = "current events and recent developments"
-            print(f"{Fore.BLUE}Angel: researching that for you...{Style.RESET_ALL}")
             briefing = do_deep_research(
                 topic,
                 memory_summary,
@@ -6842,7 +6819,6 @@ If you infer anything new about that person's preferences or dynamics, append at
                 use_mem0_cloud=self._use_mem0_cloud,
             )
             if web_context:
-                print(f"{Fore.BLUE}Angel: let me look that up for you...{Style.RESET_ALL}")
                 augmented_user_message = (
                     f"{web_context}\n\nOriginal user question:\n{user_message}"
                 )
