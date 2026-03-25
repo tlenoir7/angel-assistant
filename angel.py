@@ -134,6 +134,43 @@ def is_trusted_operator(user_id: str | None) -> bool:
     """True when ``user_id`` is Tyler's canonical id or a known single-operator deploy alias."""
     uid = (user_id or "").strip().lower()
     return bool(uid) and uid in _TRUSTED_OPERATOR_ALIASES
+
+
+def _message_has_cad_design_generation_keywords(user_message: str) -> bool:
+    """
+    True when the message looks CAD / mechanical-design / geometry-generation related.
+    Used with :func:`is_trusted_operator` to skip parallel agents (they are not needed and
+    can misread design asks as adversarial).
+    """
+    raw = (user_message or "").strip().lower()
+    if len(raw) < 4:
+        return False
+    patterns = (
+        r"\bcadquery\b",
+        r"\bcad\b",
+        r"\bstep\b",
+        r"\bstl\b",
+        r"\biges\b",
+        r"\bextrude\b",
+        r"\bsolid model\b",
+        r"\b3d print\b",
+        r"\b3d model\b",
+        r"\bgeometry\b",
+        r"\bmeshes?\b",
+        r"\bfuselage\b",
+        r"\bairfoil\b",
+        r"\bnaca\b",
+        r"\blenticular\b",
+        r"\bengineering design\b",
+        r"\bmechanical design\b",
+        r"generate\s+(?:a\s+)?(?:solid|geometry|model|cad|mesh)",
+        r"design\s+(?:a|an|the)?\s*(?:solid|part|model|assembly|wing)",
+        r"export\s+(?:a\s+)?(?:step|stl|iges)",
+        r"build\s+(?:a\s+)?(?:model|part|solid)",
+    )
+    return any(re.search(p, raw) for p in patterns)
+
+
 # Open-source dossiers (Item 13 — Batcomputer-style OSINT)
 OSINT_DOSSIERS_FOLDER = "OSINT Dossiers"
 OSINT_DOSSIER_MAX_AGE_DAYS = 30
@@ -6645,17 +6682,28 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
 
         parallel_done = False
-        try:
-            import angel_parallel_agents as apa
-
-            use_p, ptopic = apa.detect_parallel_opportunity(user_message)
-        except Exception:
-            use_p, ptopic = False, None
-
         _operator_trusted = is_trusted_operator(self.user_id)
+        _skip_parallel_agents = bool(
+            cad_cmd
+            or (
+                _operator_trusted
+                and _message_has_cad_design_generation_keywords(user_message)
+            )
+        )
+        use_p, ptopic = False, None
+        apa = None
+        if not _skip_parallel_agents:
+            try:
+                import angel_parallel_agents as apa
+
+                use_p, ptopic = apa.detect_parallel_opportunity(user_message)
+            except Exception:
+                use_p, ptopic = False, None
 
         if (
-            not osint_attempted
+            not _skip_parallel_agents
+            and apa is not None
+            and not osint_attempted
             and os.getenv("TAVILY_API_KEY")
             and use_p
             and ptopic
