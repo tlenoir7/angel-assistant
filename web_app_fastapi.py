@@ -4155,6 +4155,51 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": "file not found"}), 404
         return send_file(str(p), as_attachment=True, download_name=filename)
 
+    @app.route("/api/cad/mesh/<design_name>/<filename>", methods=["POST"])
+    def api_cad_mesh_convert(design_name, filename):
+        """Convert an existing STL for a design into mesh JSON (one-off or cache refresh)."""
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            out = angel_cad.convert_stl_filename_to_mesh_json(angel.user_id, design_name, filename)
+            code = 200 if out.get("ok") else 400
+            return jsonify(out), code
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e), "design_name": design_name}), 500
+
+    @app.route("/api/cad/mesh-json/<design_name>", methods=["GET"])
+    def api_cad_mesh_json(design_name):
+        """Return cached mesh JSON for a design (generate once on demand)."""
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            out = angel_cad.get_or_create_mesh_json(angel.user_id, design_name)
+            code = 200 if out.get("ok") else 400
+            return jsonify(out), code
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e), "design_name": design_name}), 500
+
+    @app.route("/api/cad/thumbnail/<design_name>", methods=["GET"])
+    def api_cad_thumbnail(design_name):
+        """Generate (and cache) a simple 3-view STL thumbnail PNG for a design."""
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            png, err = angel_cad.get_or_create_thumbnail_png_bytes(angel.user_id, design_name)
+            if not png:
+                return jsonify({"ok": False, "error": err or "thumbnail failed", "design_name": design_name}), 400
+            return send_file(
+                BytesIO(png),
+                mimetype="image/png",
+                as_attachment=False,
+                download_name=f"{design_name}.png",
+            )
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e), "design_name": design_name}), 500
+
     @app.route("/api/cad/list", methods=["GET"])
     def api_cad_list():
         if angel is None:

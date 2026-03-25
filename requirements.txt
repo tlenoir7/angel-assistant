@@ -23,6 +23,7 @@ PyPDF2>=3.0.0
 python-docx>=1.1.0
 openpyxl>=3.1.0
 matplotlib>=3.8.0
+numpy-stl>=3.0.0
 sympy>=1.12
 pint>=0.23
 astropy>=6.0.0

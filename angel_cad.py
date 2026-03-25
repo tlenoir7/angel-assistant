@@ -1006,6 +1006,233 @@ def resolve_download_path(session_id: str, design_name: str, filename: str) -> P
     return p if p.is_file() else None
 
 
+def resolve_design_dir(session_id: str, design_name: str) -> Path | None:
+    """Resolve design directory safely (no creation)."""
+    if ".." in design_name:
+        return None
+    safe_d = re.sub(r"[^a-zA-Z0-9._-]+", "_", design_name).strip("._")
+    if not safe_d:
+        return None
+    root = CAD_ROOT / re.sub(r"[^a-zA-Z0-9._-]+", "_", session_id or "default")
+    p = root / safe_d
+    try:
+        p = p.resolve()
+        root = root.resolve()
+        if not str(p).startswith(str(root)):
+            return None
+    except Exception:
+        return None
+    return p if p.is_dir() else None
+
+
+def _pick_primary_stl(design_dir: Path, design_name: str) -> Path | None:
+    """Choose a best-guess STL for a design (prefers <design_name>.stl)."""
+    preferred = design_dir / f"{design_name}.stl"
+    if preferred.is_file():
+        return preferred
+    stls = sorted([p for p in design_dir.iterdir() if p.is_file() and p.suffix.lower() == ".stl"])
+    return stls[0] if stls else None
+
+
+def _mesh_cache_path(design_dir: Path, design_name: str) -> Path:
+    return design_dir / f"{design_name}.mesh.json"
+
+
+def _thumbnail_cache_path(design_dir: Path, design_name: str) -> Path:
+    return design_dir / f"{design_name}.thumbnail.png"
+
+
+def stl_to_mesh_json(stl_path: Path, *, design_name: str) -> dict[str, Any]:
+    """
+    Convert an STL file into a web-friendly mesh JSON:
+    - vertices: [[x,y,z], ...]
+    - faces: [i0,i1,i2, i0,i1,i2, ...]
+    - normals: [[nx,ny,nz], ...] per face
+    - bounds: {min:[x,y,z], max:[x,y,z]}
+    """
+    from stl import mesh as stlmesh  # type: ignore
+
+    p = Path(stl_path)
+    if not p.is_file():
+        return {"ok": False, "error": "stl file not found"}
+
+    m = stlmesh.Mesh.from_file(str(p))
+    vectors = m.vectors  # (n, 3, 3)
+    normals = getattr(m, "normals", None)
+
+    # Build indexed vertex buffer with simple rounding-based dedupe.
+    v_index: dict[tuple[float, float, float], int] = {}
+    vertices: list[list[float]] = []
+    faces: list[int] = []
+    for tri in vectors:
+        idxs: list[int] = []
+        for v in tri:
+            key = (round(float(v[0]), 6), round(float(v[1]), 6), round(float(v[2]), 6))
+            i = v_index.get(key)
+            if i is None:
+                i = len(vertices)
+                v_index[key] = i
+                vertices.append([float(v[0]), float(v[1]), float(v[2])])
+            idxs.append(i)
+        faces.extend(idxs[:3])
+
+    # Normals per face
+    normals_out: list[list[float]] = []
+    if normals is not None:
+        try:
+            for n in normals:
+                normals_out.append([float(n[0]), float(n[1]), float(n[2])])
+        except Exception:
+            normals_out = []
+
+    # Bounds
+    try:
+        import numpy as np
+
+        arr = np.array(vertices, dtype=float) if vertices else np.zeros((0, 3), dtype=float)
+        if arr.size:
+            mn = arr.min(axis=0).tolist()
+            mx = arr.max(axis=0).tolist()
+        else:
+            mn = [0.0, 0.0, 0.0]
+            mx = [0.0, 0.0, 0.0]
+    except Exception:
+        mn = [0.0, 0.0, 0.0]
+        mx = [0.0, 0.0, 0.0]
+
+    sz_kb = int(round(p.stat().st_size / 1024.0))
+    return {
+        "ok": True,
+        "design_name": design_name,
+        "file_size_kb": sz_kb,
+        "vertices": vertices,
+        "faces": faces,
+        "normals": normals_out,
+        "bounds": {"min": mn, "max": mx},
+    }
+
+
+def get_or_create_mesh_json(session_id: str, design_name: str) -> dict[str, Any]:
+    ddir = resolve_design_dir(session_id, design_name)
+    if ddir is None:
+        return {"ok": False, "error": "design not found", "design_name": design_name}
+    cache = _mesh_cache_path(ddir, design_name)
+    if cache.is_file():
+        try:
+            return json.loads(cache.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    stl_p = _pick_primary_stl(ddir, design_name)
+    if stl_p is None:
+        return {"ok": False, "error": "no STL found for design", "design_name": design_name}
+    out = stl_to_mesh_json(stl_p, design_name=design_name)
+    if out.get("ok"):
+        try:
+            cache.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+    return out
+
+
+def convert_stl_filename_to_mesh_json(session_id: str, design_name: str, filename: str) -> dict[str, Any]:
+    p = resolve_download_path(session_id, design_name, filename)
+    if p is None:
+        return {"ok": False, "error": "file not found", "design_name": design_name}
+    if p.suffix.lower() != ".stl":
+        return {"ok": False, "error": "only .stl supported", "design_name": design_name}
+    ddir = resolve_design_dir(session_id, design_name)
+    if ddir is None:
+        return {"ok": False, "error": "design not found", "design_name": design_name}
+    out = stl_to_mesh_json(p, design_name=design_name)
+    if out.get("ok"):
+        try:
+            # Cache per design (best-effort) and also per-file.
+            _mesh_cache_path(ddir, design_name).write_text(
+                json.dumps(out, ensure_ascii=False), encoding="utf-8"
+            )
+            (ddir / f"{p.stem}.mesh.json").write_text(
+                json.dumps(out, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
+    return out
+
+
+def get_or_create_thumbnail_png_bytes(session_id: str, design_name: str) -> tuple[bytes | None, str | None]:
+    """
+    Render top/front/side thumbnail PNG for design STL.
+    Returns (png_bytes, error_str).
+    """
+    ddir = resolve_design_dir(session_id, design_name)
+    if ddir is None:
+        return None, "design not found"
+    cache = _thumbnail_cache_path(ddir, design_name)
+    if cache.is_file():
+        try:
+            return cache.read_bytes(), None
+        except Exception:
+            pass
+    stl_p = _pick_primary_stl(ddir, design_name)
+    if stl_p is None:
+        return None, "no STL found for design"
+
+    try:
+        import numpy as np
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+        from stl import mesh as stlmesh  # type: ignore
+
+        m = stlmesh.Mesh.from_file(str(stl_p))
+        tris = m.vectors  # (n, 3, 3)
+        all_pts = tris.reshape(-1, 3)
+        mn = all_pts.min(axis=0)
+        mx = all_pts.max(axis=0)
+        center = (mn + mx) / 2.0
+        size = float(np.max(mx - mn)) or 1.0
+
+        fig = plt.figure(figsize=(9, 3), dpi=180, facecolor="#0b0b10")
+        views = [
+            ("Top", 90, -90),
+            ("Front", 0, -90),
+            ("Side", 0, 0),
+        ]
+        for i, (title, elev, azim) in enumerate(views, start=1):
+            ax = fig.add_subplot(1, 3, i, projection="3d")
+            ax.set_facecolor("#0b0b10")
+            coll = Poly3DCollection(tris, linewidths=0.0, alpha=1.0)
+            coll.set_facecolor("#8b8f97")
+            coll.set_edgecolor((0, 0, 0, 0))
+            ax.add_collection3d(coll)
+            ax.view_init(elev=elev, azim=azim)
+            ax.set_title(title, color="#e5e7eb", fontsize=10, pad=6)
+            ax.set_xlim(center[0] - size / 2, center[0] + size / 2)
+            ax.set_ylim(center[1] - size / 2, center[1] + size / 2)
+            ax.set_zlim(center[2] - size / 2, center[2] + size / 2)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_zticks([])
+            ax.grid(False)
+            ax.set_axis_off()
+
+        import io
+
+        buf = io.BytesIO()
+        plt.tight_layout(pad=0.1)
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.0)
+        plt.close(fig)
+        png = buf.getvalue()
+        try:
+            cache.write_bytes(png)
+        except Exception:
+            pass
+        return png, None
+    except Exception as e:
+        return None, str(e)
+
+
 def enrich_with_download_urls(result: dict[str, Any], base_url: str) -> dict[str, Any]:
     if not result.get("ok"):
         return result
