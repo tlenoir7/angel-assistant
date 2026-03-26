@@ -1,8 +1,9 @@
 """
-Medical Intelligence Core (Build 5–6) — clinical DBs + biomedical research agent
+Medical Intelligence Core (Build 5–7) — clinical DBs, biomedical research, theoretical treatment design
 (PubMed, FDA, MedlinePlus, CT.gov, UniProt, NCBI Gene, KEGG, PDB, ClinVar, Tavily).
 Open-source APIs only; not a substitute for licensed clinical care.
 KEGG: permitted for academic/non-commercial use per KEGG license terms.
+Build 7 outputs are theoretical research syntheses only — never clinical advice.
 """
 
 from __future__ import annotations
@@ -26,8 +27,17 @@ MEDICAL_INTEL_FOLDER = "Medical Intelligence"
 BIO_INTEL_FOLDER = "Biological Intelligence"
 GENOMICS_INTEL_FOLDER = "Genomics Intelligence"
 PHARMA_INTEL_FOLDER = "Pharmacological Intelligence"
+THEORETICAL_MEDICINE_FOLDER = "Theoretical Medicine"
+UAP_MEDICAL_INTEL_FOLDER = "UAP Medical Intelligence"
 MED_PREFIX = "MED-"
 BIO_RESEARCH_PREFIX = "BIO-"
+RX_PREFIX = "RX-"
+
+THEORETICAL_TREATMENT_DISCLAIMER = (
+    "This is a theoretical research synthesis for educational and investigative purposes only. "
+    "It does not constitute medical advice. Any treatment decisions must be made with qualified "
+    "medical professionals."
+)
 
 PUBMED_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 UNIPROT_REST = "https://rest.uniprot.org/"
@@ -1239,6 +1249,68 @@ def _maybe_file_biomedical_intel(
         return None
 
 
+def _rx_file_slug(condition_key: str) -> str:
+    h = hashlib.sha256(condition_key.strip().lower().encode()).hexdigest()[:10]
+    d = _now_utc().strftime("%Y%m%d")
+    return f"{RX_PREFIX}{d}-{h}"
+
+
+def _maybe_file_rx_intel(
+    files_cabinet: Any,
+    *,
+    folder: str,
+    condition_key: str,
+    body: dict[str, Any],
+    tags: list[str],
+) -> str | None:
+    try:
+        fn = _rx_file_slug(condition_key)
+        text = json.dumps(body, ensure_ascii=False, indent=2)
+        if files_cabinet.get_file(fn):
+            files_cabinet.update_file(fn, text, skip_mem0=True)
+        else:
+            files_cabinet.create_file(folder, fn, text, tags=tags, skip_mem0=True)
+        return fn
+    except Exception as e:
+        _log.debug("rx intel auto-file skipped: %s", e)
+        return None
+
+
+def _normalize_treatment_constraints(raw: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "avoid": [],
+        "prioritize": [],
+        "target_mechanism": "",
+        "patient_context": "",
+        "timeline": "",
+        "suggested_compounds": [],
+    }
+    if not isinstance(raw, dict):
+        return base
+    for k in ("avoid", "prioritize"):
+        v = raw.get(k)
+        if isinstance(v, list):
+            base[k] = [str(x).strip() for x in v if str(x).strip()]
+        elif isinstance(v, str) and v.strip():
+            base[k] = [v.strip()]
+    for k in ("target_mechanism", "patient_context", "timeline"):
+        if raw.get(k) is not None:
+            base[k] = str(raw.get(k) or "").strip()
+    sc = raw.get("suggested_compounds")
+    if isinstance(sc, list):
+        base["suggested_compounds"] = [str(x).strip() for x in sc if str(x).strip()]
+    return base
+
+
+def _attach_treatment_disclaimer(out: dict[str, Any]) -> dict[str, Any]:
+    out["disclaimer"] = THEORETICAL_TREATMENT_DISCLAIMER
+    an = out.get("analysis")
+    if isinstance(an, dict) and not an.get("disclaimer"):
+        an = {**an, "disclaimer": THEORETICAL_TREATMENT_DISCLAIMER}
+        out["analysis"] = an
+    return out
+
+
 def _kegg_pathway_bundle(query: str, memory_client: Any, user_id: str, use_mem0_cloud: bool) -> dict[str, Any]:
     s = search_pathway(query)
     out: dict[str, Any] = {"search": s}
@@ -1645,6 +1717,501 @@ JSON only."""
             target_key=f"drug_target:{d}",
             body=out,
             tags=["pharmacological_intelligence", "drug_target", f"mission:{mr}"],
+        )
+    return out
+
+
+# --- Build 7: theoretical treatment design ---
+
+
+def design_theoretical_treatment(
+    condition: str,
+    constraints: dict[str, Any] | None,
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: Any | None = None,
+) -> dict[str, Any]:
+    cond = (condition or "").strip()
+    ctx = (context or "").strip()
+    cst = _normalize_treatment_constraints(constraints)
+    if not cond:
+        return _attach_treatment_disclaimer({"ok": False, "error": "empty_condition", "mode": "design_treatment"})
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+    tm = cst.get("target_mechanism") or cond
+    gathered: dict[str, Any] = {}
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        f1 = ex.submit(get_condition_summary, cond)
+        f2 = ex.submit(
+            search_pubmed,
+            f"{cond} pathophysiology molecular mechanism therapeutic target druggable",
+            12,
+            **mem_kw,
+        )
+        f3 = ex.submit(
+            search_pubmed,
+            f"{cond} standard of care limitation unmet need resistance therapy failure",
+            10,
+            **mem_kw,
+        )
+        f4 = ex.submit(
+            search_pubmed,
+            f"{cond} investigational drug clinical trial novel agent preclinical",
+            10,
+            **mem_kw,
+        )
+        f5 = ex.submit(_kegg_pathway_bundle, cond, memory_client, user_id, use_mem0_cloud)
+        f6 = ex.submit(search_protein, f"{tm} receptor kinase", "human", max_results=5, **mem_kw)
+        f7 = ex.submit(search_trials, cond, intervention=None, status="RECRUITING", max_results=12, **mem_kw)
+        f8 = ex.submit(
+            search_trials,
+            f"{cond} repurposing",
+            intervention=None,
+            status="RECRUITING",
+            max_results=8,
+            **mem_kw,
+        )
+        f9 = ex.submit(_tavily_biomedical, f"{cond} novel therapy drug discovery preclinical {ctx}"[:500])
+        f10 = ex.submit(
+            search_pubmed,
+            f"{cond} FDA approved drug mechanism small molecule biologic",
+            8,
+            **mem_kw,
+        )
+        for name, fut in (
+            ("medlineplus", f1),
+            ("pubmed_pathophysiology", f2),
+            ("pubmed_soc_limits", f3),
+            ("pubmed_investigational", f4),
+            ("kegg", f5),
+            ("uniprot_targets", f6),
+            ("trials", f7),
+            ("trials_repurpose_hint", f8),
+            ("tavily", f9),
+            ("pubmed_approved_mechanisms", f10),
+        ):
+            try:
+                gathered[name] = fut.result(timeout=85)
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+                gathered[name] = {"error": str(e)}
+
+    bundle = {
+        "condition": cond,
+        "constraints": cst,
+        "context": ctx,
+        "gathered": gathered,
+        "gather_errors": errors,
+    }
+    blob = json.dumps(bundle, ensure_ascii=False, indent=2)[:95000]
+    system = """You are Angel's theoretical treatment design agent. Using ONLY the JSON research bundle, propose a coherent THEORETICAL strategy (not clinical advice). Output ONE JSON object with keys:
+- treatment_name (string; descriptive label for the approach)
+- primary_mechanism (string; core therapeutic strategy)
+- supporting_mechanisms (array of strings)
+- delivery_strategy (string; how agents could reach target tissue — conceptual)
+- combination_rationale (string; why multi-component if applicable)
+- synergy_hypothesis (string)
+- resistance_prevention (string)
+- components (array of objects, each with: compound_or_class, mechanism, evidence_level, availability, known_risks)
+- predicted_efficacy (string; theoretical basis only)
+- safety_profile (string; known + theoretical risks)
+- feasibility (IMMEDIATE|NEAR_TERM|LONG_TERM|THEORETICAL)
+- evidence_base (string; quality of supporting open literature)
+- critical_experiments (array of strings; what must be proven)
+- technology_readiness_notes (string)
+- gap_to_clinic (string)
+- mission_relevance (LOW|MEDIUM|HIGH|CRITICAL)
+- classified_literature_note (string; use "n/a" unless open sources mention restricted programs — never claim classified access)
+- disclaimer (string; MUST be exactly: "This is a theoretical research synthesis for educational and investigative purposes only. It does not constitute medical advice. Any treatment decisions must be made with qualified medical professionals.")
+JSON only. Respect constraints.avoid and constraints.prioritize when present."""
+
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    out: dict[str, Any] = {
+        "ok": parsed.get("ok", False),
+        "mode": "design_treatment",
+        "condition": cond,
+        "constraints": cst,
+        "gathered": gathered,
+        "gather_errors": errors,
+        "analysis": data,
+    }
+    if parsed.get("error"):
+        out["error"] = parsed["error"]
+    out = _attach_treatment_disclaimer(out)
+    mr = str(data.get("mission_relevance") or "").upper()
+    if mr in ("MEDIUM", "HIGH", "CRITICAL") and files_cabinet is not None:
+        feas = str(data.get("feasibility") or "UNKNOWN")
+        ev = str(data.get("evidence_base") or "")[:80]
+        out["filed_as"] = _maybe_file_rx_intel(
+            files_cabinet,
+            folder=THEORETICAL_MEDICINE_FOLDER,
+            condition_key=f"design:{cond}",
+            body=out,
+            tags=[
+                "theoretical_treatment",
+                f"mission:{mr}",
+                f"feasibility:{feas}",
+                f"evidence:{ev[:40]}",
+            ],
+        )
+    return out
+
+
+def optimize_combination(
+    compounds: list[str],
+    target_condition: str,
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: Any | None = None,
+) -> dict[str, Any]:
+    comps = [str(c).strip() for c in (compounds or []) if str(c).strip()]
+    cond = (target_condition or "").strip()
+    ctx = (context or "").strip()
+    if len(comps) < 2:
+        return _attach_treatment_disclaimer({"ok": False, "error": "at_least_two_compounds", "mode": "optimize_combination"})
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+    errors: list[str] = []
+    labels: dict[str, Any] = {}
+    pair_q = " AND ".join(comps[:4])
+    pub_q = f"({pair_q}) drug interaction synergy pharmacokinetic contraindication adverse"
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        lfuts = {c: ex.submit(get_drug_label, c) for c in comps[:8]}
+        f_pub = ex.submit(search_pubmed, pub_q, 10, **mem_kw)
+        f_pub2 = ex.submit(search_pubmed, f"{cond} combination therapy {' '.join(comps[:4])}", 8, **mem_kw)
+        f_tav = ex.submit(_tavily_biomedical, f"{' '.join(comps[:4])} drug combination dosing interaction {cond}"[:500])
+        for c, fut in lfuts.items():
+            try:
+                labels[c] = fut.result(timeout=55)
+            except Exception as e:
+                errors.append(f"label:{c}:{e}")
+                labels[c] = {"error": str(e)}
+        try:
+            pub_inter = f_pub.result(timeout=70)
+        except Exception as e:
+            errors.append(f"pubmed:{e}")
+            pub_inter = {"error": str(e)}
+        try:
+            pub_cond = f_pub2.result(timeout=70)
+        except Exception as e:
+            errors.append(f"pubmed2:{e}")
+            pub_cond = {"error": str(e)}
+        try:
+            tav = f_tav.result(timeout=70)
+        except Exception as e:
+            errors.append(f"tavily:{e}")
+            tav = {"error": str(e)}
+
+    gathered = {
+        "compounds": comps,
+        "labels": labels,
+        "pubmed_interactions": pub_inter,
+        "pubmed_condition": pub_cond,
+        "tavily": tav,
+    }
+    blob = json.dumps(
+        {"target_condition": cond or "(unspecified)", "context": ctx, "gathered": gathered, "gather_errors": errors},
+        ensure_ascii=False,
+        indent=2,
+    )[:90000]
+    system = """Combination therapy analyst. Using ONLY the JSON bundle, output ONE JSON object:
+- optimized_regimen_summary (string)
+- synergistic_rationale (string)
+- antagonism_or_redundancy_risks (string)
+- proposed_sequencing (string)
+- dosing_considerations (string; conceptual only, not mg prescriptions)
+- contraindications_and_warnings (string)
+- monitoring_recommendations (string; conceptual)
+- mission_relevance (LOW|MEDIUM|HIGH|CRITICAL)
+- key_evidence (array up to 6 short strings)
+- gaps (string)
+- feasibility (IMMEDIATE|NEAR_TERM|LONG_TERM|THEORETICAL)
+- disclaimer (string; MUST be exactly: "This is a theoretical research synthesis for educational and investigative purposes only. It does not constitute medical advice. Any treatment decisions must be made with qualified medical professionals.")
+JSON only."""
+
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    out: dict[str, Any] = {
+        "ok": parsed.get("ok", False),
+        "mode": "optimize_combination",
+        "compounds": comps,
+        "target_condition": cond,
+        "gathered": gathered,
+        "gather_errors": errors,
+        "analysis": data,
+    }
+    if parsed.get("error"):
+        out["error"] = parsed["error"]
+    out = _attach_treatment_disclaimer(out)
+    mr = str(data.get("mission_relevance") or "").upper()
+    if mr in ("MEDIUM", "HIGH", "CRITICAL") and files_cabinet is not None:
+        key = "combo:" + "|".join(comps[:6])
+        out["filed_as"] = _maybe_file_rx_intel(
+            files_cabinet,
+            folder=THEORETICAL_MEDICINE_FOLDER,
+            condition_key=key,
+            body=out,
+            tags=["combination_optimizer", f"mission:{mr}", f"condition:{cond[:40]}"],
+        )
+    return out
+
+
+def research_repurposing_opportunities(
+    condition: str,
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: Any | None = None,
+) -> dict[str, Any]:
+    cond = (condition or "").strip()
+    ctx = (context or "").strip()
+    if not cond:
+        return _attach_treatment_disclaimer({"ok": False, "error": "empty_condition", "mode": "repurposing"})
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+    gathered: dict[str, Any] = {}
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {
+            "pubmed_repurpose": ex.submit(
+                search_pubmed,
+                f"{cond} drug repurposing off-label FDA approved mechanism",
+                12,
+                **mem_kw,
+            ),
+            "pubmed_trials": ex.submit(
+                search_pubmed,
+                f"{cond} repurposing clinical trial",
+                8,
+                **mem_kw,
+            ),
+            "ctgov": ex.submit(
+                search_trials,
+                f"{cond} repurposing OR repositioning",
+                intervention=None,
+                status="RECRUITING",
+                max_results=12,
+                **mem_kw,
+            ),
+            "tavily": ex.submit(_tavily_biomedical, f"{cond} drug repurposing clinical evidence {ctx}"[:500]),
+        }
+        for k, fut in futs.items():
+            try:
+                gathered[k] = fut.result(timeout=75)
+            except Exception as e:
+                errors.append(f"{k}: {e}")
+                gathered[k] = {"error": str(e)}
+
+    blob = json.dumps({"condition": cond, "context": ctx, "gathered": gathered, "errors": errors}, ensure_ascii=False, indent=2)[
+        :90000
+    ]
+    system = """Drug repurposing analyst. From the JSON only, output ONE JSON:
+- ranked_candidates (array of objects, each: drug_name, rationale, mechanism_fit, evidence_strength, safety_notes, availability_cost_guess, rank)
+- summary_table (string; short narrative ranking)
+- mission_relevance (LOW|MEDIUM|HIGH|CRITICAL)
+- key_findings (array up to 6 strings)
+- gaps (string)
+- feasibility (IMMEDIATE|NEAR_TERM|LONG_TERM|THEORETICAL)
+- disclaimer (string; MUST be exactly: "This is a theoretical research synthesis for educational and investigative purposes only. It does not constitute medical advice. Any treatment decisions must be made with qualified medical professionals.")
+JSON only."""
+
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    out: dict[str, Any] = {
+        "ok": parsed.get("ok", False),
+        "mode": "repurposing",
+        "condition": cond,
+        "gathered": gathered,
+        "gather_errors": errors,
+        "analysis": data,
+    }
+    if parsed.get("error"):
+        out["error"] = parsed["error"]
+    out = _attach_treatment_disclaimer(out)
+    mr = str(data.get("mission_relevance") or "").upper()
+    if mr in ("MEDIUM", "HIGH", "CRITICAL") and files_cabinet is not None:
+        out["filed_as"] = _maybe_file_rx_intel(
+            files_cabinet,
+            folder=MEDICAL_INTEL_FOLDER,
+            condition_key=f"repurpose:{cond}",
+            body=out,
+            tags=["drug_repurposing", f"mission:{mr}", f"condition:{cond[:50]}"],
+        )
+    return out
+
+
+def research_exotic_treatments(
+    condition: str,
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: Any | None = None,
+) -> dict[str, Any]:
+    cond = (condition or "").strip()
+    ctx = (context or "").strip()
+    if not cond:
+        return _attach_treatment_disclaimer({"ok": False, "error": "empty_condition", "mode": "exotic_treatments"})
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+    gathered: dict[str, Any] = {}
+    errors: list[str] = []
+    qx = (
+        f"{cond} (gene therapy OR CAR-T OR cellular therapy OR nanomedicine OR nanotechnology drug delivery OR "
+        f"photodynamic therapy OR electromagnetic therapy OR psychedelic-assisted OR fasting OR metabolic therapy)"
+    )
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        f1 = ex.submit(search_pubmed, qx, 12, **mem_kw)
+        f2 = ex.submit(
+            search_pubmed,
+            f"{cond} experimental emerging unconventional treatment clinical development",
+            8,
+            **mem_kw,
+        )
+        f3 = ex.submit(_tavily_biomedical, f"{cond} gene therapy CAR-T nanomedicine emerging treatment {ctx}"[:500])
+        for name, fut in (("pubmed_exotic", f1), ("pubmed_emerging", f2), ("tavily", f3)):
+            try:
+                gathered[name] = fut.result(timeout=75)
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+                gathered[name] = {"error": str(e)}
+
+    blob = json.dumps({"condition": cond, "context": ctx, "gathered": gathered, "errors": errors}, ensure_ascii=False, indent=2)[
+        :90000
+    ]
+    system = """Emerging / unconventional therapy survey. From JSON only, output ONE JSON:
+- approaches (array of objects: name, category, mechanism, evidence_level, development_stage, theoretical_vs_clinical, limitations)
+- categories_covered (array of strings; e.g. gene_therapy, cellular, nano_delivery, photodynamic, EM_frequency, psychedelic_assisted, metabolic_fasting — only if grounded in bundle)
+- mission_relevance (LOW|MEDIUM|HIGH|CRITICAL)
+- key_findings (array up to 6)
+- gaps (string)
+- disclaimer (string; MUST be exactly: "This is a theoretical research synthesis for educational and investigative purposes only. It does not constitute medical advice. Any treatment decisions must be made with qualified medical professionals.")
+JSON only. Flag speculative EM/frequency claims carefully."""
+
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    out: dict[str, Any] = {
+        "ok": parsed.get("ok", False),
+        "mode": "exotic_treatments",
+        "condition": cond,
+        "gathered": gathered,
+        "gather_errors": errors,
+        "analysis": data,
+    }
+    if parsed.get("error"):
+        out["error"] = parsed["error"]
+    out = _attach_treatment_disclaimer(out)
+    mr = str(data.get("mission_relevance") or "").upper()
+    if mr in ("MEDIUM", "HIGH", "CRITICAL") and files_cabinet is not None:
+        out["filed_as"] = _maybe_file_rx_intel(
+            files_cabinet,
+            folder=THEORETICAL_MEDICINE_FOLDER,
+            condition_key=f"exotic:{cond}",
+            body=out,
+            tags=["exotic_treatments", f"mission:{mr}"],
+        )
+    return out
+
+
+def research_uap_medical_effects(
+    symptom_profile: str,
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: Any | None = None,
+) -> dict[str, Any]:
+    prof = (symptom_profile or "").strip()
+    ctx = (context or "").strip()
+    if len(prof) < 8:
+        return _attach_treatment_disclaimer({"ok": False, "error": "symptom_profile_too_short", "mode": "uap_medical"})
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+    gathered: dict[str, Any] = {}
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {
+            "pubmed_uap_health": ex.submit(
+                search_pubmed,
+                f"UAP OR UFO OR unidentified aerial health witness symptom {prof[:120]}",
+                10,
+                **mem_kw,
+            ),
+            "pubmed_radiation": ex.submit(
+                search_pubmed,
+                f"{prof[:100]} ionizing radiation non-ionizing electromagnetic health effect symptom",
+                8,
+                **mem_kw,
+            ),
+            "pubmed_acoustic": ex.submit(
+                search_pubmed,
+                f"{prof[:100]} infrasound ultrasound health symptom vestibular",
+                6,
+                **mem_kw,
+            ),
+            "pubmed_analogous": ex.submit(
+                search_pubmed,
+                f"occupational radiation exposure OR electromagnetic hypersensitivity symptom management (review OR guideline)",
+                6,
+                **mem_kw,
+            ),
+            "tavily": ex.submit(_tavily_biomedical, f"UAP health effects symptoms witnesses medical {prof[:200]} {ctx}"[:500]),
+        }
+        for k, fut in futs.items():
+            try:
+                gathered[k] = fut.result(timeout=75)
+            except Exception as e:
+                errors.append(f"{k}: {e}")
+                gathered[k] = {"error": str(e)}
+
+    blob = json.dumps({"symptom_profile": prof, "context": ctx, "gathered": gathered, "errors": errors}, ensure_ascii=False, indent=2)[
+        :90000
+    ]
+    system = """Medical intelligence analyst for reported UAP-adjacent health patterns (open sources only). Output ONE JSON:
+- symptom_summary (string)
+- plausible_physical_mechanisms (array of objects: mechanism, literature_support, confidence_note)
+- analogous_clinical_protocols (string; only from open literature)
+- treatment_analogies_theoretical (string; clearly labeled hypothetical bridges, not advice)
+- open_literature_on_classified_programs (string; note if popular books mention programs — do NOT claim classified access)
+- mission_relevance (LOW|MEDIUM|HIGH|CRITICAL)
+- key_findings (array up to 6)
+- gaps (string)
+- disclaimer (string; MUST be exactly: "This is a theoretical research synthesis for educational and investigative purposes only. It does not constitute medical advice. Any treatment decisions must be made with qualified medical professionals.")
+JSON only."""
+
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    out: dict[str, Any] = {
+        "ok": parsed.get("ok", False),
+        "mode": "uap_medical",
+        "symptom_profile": prof,
+        "gathered": gathered,
+        "gather_errors": errors,
+        "analysis": data,
+    }
+    if parsed.get("error"):
+        out["error"] = parsed["error"]
+    out = _attach_treatment_disclaimer(out)
+    mr = str(data.get("mission_relevance") or "").upper()
+    if mr in ("LOW", "MEDIUM", "HIGH", "CRITICAL") and files_cabinet is not None:
+        out["filed_as"] = _maybe_file_rx_intel(
+            files_cabinet,
+            folder=UAP_MEDICAL_INTEL_FOLDER,
+            condition_key=f"uap:{prof[:80]}",
+            body=out,
+            tags=["uap_medical", f"mission:{mr}"],
         )
     return out
 
@@ -2174,6 +2741,103 @@ def _detect_biomedical_intent(msg: str) -> tuple[str | None, dict[str, Any]]:
     return None, {}
 
 
+def _detect_treatment_design_intent(msg: str) -> tuple[str | None, dict[str, Any]]:
+    if len(msg) < 14:
+        return None, {}
+    if re.search(r"(?i)\b(uap|u\.f\.o\.|ufo)\b", msg) and re.search(
+        r"(?i)\b(symptom|health|medical|radiation|burn|nausea|neurolog|witness|encounter|injury)\b",
+        msg,
+    ):
+        return "uap_medical", {"symptom_profile": msg[:600]}
+
+    if re.search(
+        r"(?i)\b(exotic treatment|emerging treatment|unconventional treatment|gene therapy for|car-t\b|car t-cell|"
+        r"nanoparticle drug|photodynamic therapy|psychedelic-assisted|fasting mimicking)\b",
+        msg,
+    ):
+        m = re.search(r"(?i)\bfor\s+([^?.!\n]{4,120})", msg)
+        cond = (m.group(1).strip() if m else msg[:120]).strip()
+        return "exotic_treatments", {"condition": cond}
+
+    if re.search(r"(?i)\b(drug repurposing|repurpose\s+(?:a\s+)?drug|off-label use|off label use)\b", msg):
+        m = re.search(r"(?i)(?:for|treat(?:ing)?)\s+([^?.!\n]{4,120})", msg)
+        cond = (m.group(1).strip() if m else msg[:120]).strip()
+        return "repurposing", {"condition": cond}
+
+    compounds: list[str] = []
+    cond_combo = ""
+    combo_intent = re.search(
+        r"(?i)\b(optimize|optimization of|combination therapy|synergistic|synergy between|"
+        r"concomitant|use together|take together|drug-drug interaction)\b",
+        msg,
+    )
+    m3 = re.search(
+        r"(?i)\b([a-z][a-z0-9\-]{2,35})\s+and\s+([a-z][a-z0-9\-]{2,35})\s+for\s+([^?.!\n]{4,120})",
+        msg,
+    )
+    if m3 and combo_intent:
+        compounds = [m3.group(1).strip(), m3.group(2).strip()]
+        cond_combo = m3.group(3).strip()
+    if len(compounds) < 2:
+        comb2 = re.search(
+            r"(?i)\bcombine\s+([a-z0-9][a-z0-9\-\s]{1,45}?)\s+(?:and|with)\s+([a-z0-9][a-z0-9\-\s]{1,45}?)(?:\s+for\s+([^?.!\n]+))?",
+            msg,
+        )
+        if comb2:
+            compounds = [comb2.group(1).strip(), comb2.group(2).strip()]
+            if comb2.group(3):
+                cond_combo = comb2.group(3).strip()[:120]
+    if len(compounds) < 2 and combo_intent:
+        cm = re.search(
+            r"(?i)\b([a-z][a-z0-9\-]+)\s*,\s*([a-z][a-z0-9\-]+)\s*,?\s+and\s+([a-z][a-z0-9\-]+)\b",
+            msg,
+        )
+        if cm:
+            compounds = [cm.group(1), cm.group(2), cm.group(3)]
+    if len(compounds) >= 2 and (combo_intent or re.search(r"(?i)\bcombine\s+", msg)):
+        if not cond_combo:
+            cm2 = re.search(r"(?i)\s+for\s+([^?.!\n]{4,120})", msg)
+            cond_combo = (cm2.group(1).strip() if cm2 else "").strip()
+        return "optimize_combination", {"compounds": compounds, "condition": cond_combo}
+
+    dt = re.search(r"(?i)\bdesign (?:a |the )?treatment(?: plan| approach)?\s+for\s+([^?.!\n]{4,120})", msg)
+    if dt:
+        return "design_treatment", {"condition": dt.group(1).strip(), "constraints": {}}
+
+    if re.search(r"(?i)\btheoretical (?:treatment )?basis\s+(?:for treating|for)\s+", msg):
+        m = re.search(r"(?i)\btheoretical (?:treatment )?basis\s+(?:for treating|for)\s+([^?.!\n]{4,120})", msg)
+        cond = (m.group(1).strip() if m else msg[:120]).strip()
+        return "design_treatment", {"condition": cond, "constraints": {}}
+
+    wit = re.search(r"(?i)\bwhat if we treated\s+(.+?)\s+with\s+(.+?)(?:\?|$)", msg)
+    if wit:
+        return "design_treatment", {
+            "condition": wit.group(1).strip()[:120],
+            "constraints": {"suggested_compounds": [wit.group(2).strip()[:80]]},
+        }
+
+    cwf = re.search(r"(?i)\bcould\s+([a-z][a-z0-9\-]{2,40})\s+work\s+for\s+([^?.!\n]{3,90})", msg)
+    if cwf:
+        return "design_treatment", {
+            "condition": cwf.group(2).strip(),
+            "constraints": {"suggested_compounds": [cwf.group(1).strip()]},
+        }
+
+    res_use = re.search(r"(?i)\bresearch on using\s+([a-z][a-z0-9\-]{2,40})\s+for\s+([^?.!\n]{3,90})", msg)
+    if res_use:
+        return "design_treatment", {
+            "condition": res_use.group(2).strip(),
+            "constraints": {"suggested_compounds": [res_use.group(1).strip()]},
+        }
+
+    if re.search(r"(?i)\bwhat would need to be true for\b", msg):
+        m = re.search(r"(?i)what would need to be true for\s+(.+?)\s+to work", msg)
+        if m:
+            return "design_treatment", {"condition": m.group(1).strip()[:200], "constraints": {}}
+
+    return None, {}
+
+
 def detect_medical_chat_intent(user_message: str) -> tuple[str | None, dict[str, Any]]:
     msg = (user_message or "").strip()
     payload: dict[str, Any] = {"original": msg[:500]}
@@ -2186,6 +2850,11 @@ def detect_medical_chat_intent(user_message: str) -> tuple[str | None, dict[str,
     if len(msg) >= 10 and re.search(r"(?i)\b(biological agent|pathogen|bioweapon|biosecurity)\b", msg):
         payload["agent"] = msg[:200]
         return "biological_threat", payload
+
+    td_cmd, td_payload = _detect_treatment_design_intent(msg)
+    if td_cmd:
+        payload.update(td_payload)
+        return td_cmd, payload
 
     bio_cmd, bio_payload = _detect_biomedical_intent(msg)
     if bio_cmd:
@@ -2227,6 +2896,67 @@ def run_medical_intent_for_chat(
 ) -> dict[str, Any]:
     ctx = str(payload.get("original") or "")
     try:
+        if intent == "design_treatment":
+            cons = payload.get("constraints")
+            if not isinstance(cons, dict):
+                cons = {}
+            return design_theoretical_treatment(
+                str(payload.get("condition") or ctx),
+                cons,
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
+        if intent == "optimize_combination":
+            raw_c = payload.get("compounds")
+            clist: list[str] = []
+            if isinstance(raw_c, list):
+                clist = [str(x).strip() for x in raw_c if str(x).strip()]
+            elif isinstance(raw_c, str) and raw_c.strip():
+                clist = [s.strip() for s in re.split(r"[,;]", raw_c) if s.strip()]
+            return optimize_combination(
+                clist,
+                str(payload.get("condition") or ""),
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
+        if intent == "repurposing":
+            return research_repurposing_opportunities(
+                str(payload.get("condition") or ctx),
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
+        if intent == "exotic_treatments":
+            return research_exotic_treatments(
+                str(payload.get("condition") or ctx),
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
+        if intent == "uap_medical":
+            return research_uap_medical_effects(
+                str(payload.get("symptom_profile") or ctx),
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
         if intent == "biomedical_research":
             return run_biomedical_research(
                 str(payload.get("target") or ctx),
@@ -2389,6 +3119,22 @@ def format_medical_block_for_prompt(result: dict[str, Any]) -> str:
             + json.dumps(analysis, ensure_ascii=False, indent=2)[:12000]
             + file_note
         )
+
+    if mode in ("design_treatment", "optimize_combination", "repurposing", "exotic_treatments", "uap_medical"):
+        analysis = result.get("analysis") if isinstance(result.get("analysis"), dict) else {}
+        labels = {
+            "design_treatment": "THEORETICAL treatment design (Build 7) — not clinical guidance",
+            "optimize_combination": "THEORETICAL combination analysis (Build 7)",
+            "repurposing": "Drug repurposing research synthesis (Build 7) — theoretical ranking only",
+            "exotic_treatments": "Emerging / unconventional modalities survey (Build 7)",
+            "uap_medical": "UAP-adjacent medical effects — open-source cross-reference (Build 7)",
+        }
+        hdr = (
+            f"\n\n[Medical intelligence — {labels.get(mode, 'Build 7')}. "
+            f"{THEORETICAL_TREATMENT_DISCLAIMER}]\n"
+        )
+        disc = f"\n\nMandatory disclaimer (repeat in reply): {THEORETICAL_TREATMENT_DISCLAIMER}\n"
+        return hdr + json.dumps(analysis, ensure_ascii=False, indent=2)[:11000] + disc + file_note
 
     analysis = result.get("analysis")
     if isinstance(analysis, dict):

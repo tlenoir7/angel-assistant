@@ -4183,6 +4183,133 @@ def create_app() -> Flask:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    @app.route("/api/medical/design-treatment", methods=["POST"])
+    def api_medical_design_treatment():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        cond = (data.get("condition") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        cons = data.get("constraints") if isinstance(data.get("constraints"), dict) else {}
+        if not cond:
+            return jsonify({"ok": False, "error": "condition required"}), 400
+        try:
+            r = angel_medical.design_theoretical_treatment(
+                cond,
+                cons,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/medical/optimize-combination", methods=["POST"])
+    def api_medical_optimize_combination():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        raw = data.get("compounds")
+        comps: list[str] = []
+        if isinstance(raw, list):
+            comps = [str(x).strip() for x in raw if str(x).strip()]
+        ctx = (data.get("context") or "").strip()
+        cond = (data.get("condition") or "").strip()
+        if len(comps) < 2:
+            return jsonify({"ok": False, "error": "compounds array with at least two names required"}), 400
+        try:
+            r = angel_medical.optimize_combination(
+                comps,
+                cond,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/medical/repurposing", methods=["POST"])
+    def api_medical_repurposing():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        cond = (data.get("condition") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        if not cond:
+            return jsonify({"ok": False, "error": "condition required"}), 400
+        try:
+            r = angel_medical.research_repurposing_opportunities(
+                cond,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/medical/exotic-treatments", methods=["POST"])
+    def api_medical_exotic_treatments():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        cond = (data.get("condition") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        if not cond:
+            return jsonify({"ok": False, "error": "condition required"}), 400
+        try:
+            r = angel_medical.research_exotic_treatments(
+                cond,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/medical/uap-medical", methods=["POST"])
+    def api_medical_uap_medical():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        prof = (data.get("symptom_profile") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        if len(prof) < 8:
+            return jsonify({"ok": False, "error": "symptom_profile required (min length)"}), 400
+        try:
+            r = angel_medical.research_uap_medical_effects(
+                prof,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.route("/api/medical/health-profile", methods=["POST"])
     def api_medical_health_profile():
         if angel is None:
