@@ -1,6 +1,8 @@
 """
-Medical Intelligence Core (Build 5) — PubMed, openFDA, MedlinePlus, ClinicalTrials.gov.
+Medical Intelligence Core (Build 5–6) — clinical DBs + biomedical research agent
+(PubMed, FDA, MedlinePlus, CT.gov, UniProt, NCBI Gene, KEGG, PDB, ClinVar, Tavily).
 Open-source APIs only; not a substitute for licensed clinical care.
+KEGG: permitted for academic/non-commercial use per KEGG license terms.
 """
 
 from __future__ import annotations
@@ -8,8 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -20,9 +24,16 @@ _log = logging.getLogger(__name__)
 
 MEDICAL_INTEL_FOLDER = "Medical Intelligence"
 BIO_INTEL_FOLDER = "Biological Intelligence"
+GENOMICS_INTEL_FOLDER = "Genomics Intelligence"
+PHARMA_INTEL_FOLDER = "Pharmacological Intelligence"
 MED_PREFIX = "MED-"
+BIO_RESEARCH_PREFIX = "BIO-"
 
 PUBMED_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+UNIPROT_REST = "https://rest.uniprot.org/"
+KEGG_REST = "https://rest.kegg.jp/"
+RCSB_SEARCH_V2 = "https://search.rcsb.org/rcsbsearch/v2/query"
+TAVILY_API_URL = "https://api.tavily.com/search"
 OPENFDA_BASE = "https://api.fda.gov/drug/"
 MEDLINEPLUS_WS = "https://wsearch.nlm.nih.gov/ws/query"
 CLINICALTRIALS_V2 = "https://clinicaltrials.gov/api/v2/studies"
@@ -659,6 +670,518 @@ def get_trial_detail(nct_id: str) -> dict[str, Any]:
     return {"ok": True, "study": data}
 
 
+# --- Build 6: UniProt, NCBI Gene, KEGG, PDB, ClinVar, Tavily ---
+
+
+def _tavily_biomedical(query: str, max_results: int = 5) -> dict[str, Any]:
+    key = (os.getenv("TAVILY_API_KEY") or "").strip()
+    if not key:
+        return {"ok": False, "error": "no_tavily_key", "results": [], "answer": ""}
+    try:
+        resp = requests.post(
+            TAVILY_API_URL,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={
+                "query": query,
+                "search_depth": "advanced",
+                "max_results": max_results,
+                "topic": "general",
+                "include_answer": True,
+            },
+            timeout=28,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "ok": True,
+            "results": data.get("results") or [],
+            "answer": (data.get("answer") or "")[:4000],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "results": [], "answer": ""}
+
+
+def _organism_taxid(name: str) -> str:
+    n = (name or "human").strip().lower()
+    if n in ("human", "homo sapiens", "hs"):
+        return "9606"
+    if n in ("mouse", "mus musculus", "mm"):
+        return "10090"
+    return "9606"
+
+
+def search_protein(
+    protein_name: str,
+    organism: str = "human",
+    *,
+    max_results: int = 5,
+    memory_client: Any | None = None,
+    user_id: str = "",
+    use_mem0_cloud: bool = False,
+) -> dict[str, Any]:
+    qn = (protein_name or "").strip()
+    if not qn:
+        return {"ok": False, "error": "empty_query", "hits": []}
+    tax = _organism_taxid(organism)
+    ck = _cache_key("uniprot_search", f"{qn}|{tax}|{max_results}")
+    if memory_client and user_id:
+        hit = _medical_cache_get(ck, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+        if hit is not None:
+            return {"ok": True, "hits": hit.get("hits", []), "cached": True}
+
+    q = urllib.parse.quote(f'({qn}) AND (organism_id:{tax})')
+    url = (
+        f"{UNIPROT_REST}uniprotkb/search?query={q}&format=json&size={max(1, min(max_results, 25))}"
+    )
+    code, body = _http_get(url)
+    if code != 200:
+        return {"ok": False, "error": f"uniprot_http_{code}", "hits": []}
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "json_parse", "hits": []}
+
+    hits: list[dict[str, Any]] = []
+    for r in (data.get("results") or [])[:max_results]:
+        if not isinstance(r, dict):
+            continue
+        acc = r.get("primaryAccession") or ""
+        pname = ""
+        pd = r.get("proteinDescription") or {}
+        if isinstance(pd, dict):
+            rec = (pd.get("recommendedName") or {})
+            if isinstance(rec, dict):
+                fname = (rec.get("fullName") or {})
+                if isinstance(fname, dict):
+                    pname = str(fname.get("value") or "")
+        genes: list[str] = []
+        for g in r.get("genes") or []:
+            if isinstance(g, dict):
+                gn = g.get("geneName") or {}
+                if isinstance(gn, dict) and gn.get("value"):
+                    genes.append(str(gn["value"]))
+        seq = r.get("sequence") or {}
+        length = seq.get("length") if isinstance(seq, dict) else None
+        mass = seq.get("molWeight") if isinstance(seq, dict) else None
+        func_txt = ""
+        disease_assoc: list[str] = []
+        locs: list[str] = []
+        for c in r.get("comments") or []:
+            if not isinstance(c, dict):
+                continue
+            ct = str(c.get("commentType") or "")
+            if ct == "FUNCTION":
+                for t in c.get("texts") or []:
+                    if isinstance(t, dict) and t.get("value"):
+                        func_txt = str(t["value"])[:2000]
+                        break
+            if ct == "SUBCELLULAR LOCATION":
+                for sl in c.get("subcellularLocations") or []:
+                    if isinstance(sl, dict):
+                        loc = sl.get("location") or {}
+                        if isinstance(loc, dict) and loc.get("value"):
+                            locs.append(str(loc["value"]))
+            if ct == "DISEASE":
+                for t in c.get("texts") or []:
+                    if isinstance(t, dict) and t.get("value"):
+                        disease_assoc.append(str(t["value"])[:500])
+        hits.append(
+            {
+                "uniprot_id": acc,
+                "protein_name": pname,
+                "gene_names": genes[:12],
+                "function": func_txt,
+                "subcellular_location": locs[:8],
+                "disease_associations": disease_assoc[:8],
+                "sequence_length": length,
+                "mass_da": mass,
+            }
+        )
+
+    out = {"ok": True, "hits": hits, "cached": False, "query": qn}
+    if memory_client and user_id:
+        _medical_cache_set(ck, {"hits": hits}, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+    return out
+
+
+def get_protein_detail(
+    uniprot_id: str,
+    *,
+    memory_client: Any | None = None,
+    user_id: str = "",
+    use_mem0_cloud: bool = False,
+) -> dict[str, Any]:
+    uid = re.sub(r"[^A-Za-z0-9_-]", "", (uniprot_id or "").strip())
+    if not uid:
+        return {"ok": False, "error": "invalid_id"}
+    ck = _cache_key("uniprot_detail", uid)
+    if memory_client and user_id:
+        hit = _medical_cache_get(ck, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+        if hit is not None and hit.get("entry"):
+            return {"ok": True, "entry": hit["entry"], "cached": True}
+
+    url = f"{UNIPROT_REST}uniprotkb/{urllib.parse.quote(uid)}.json"
+    code, body = _http_get(url)
+    if code != 200:
+        return {"ok": False, "error": f"uniprot_http_{code}"}
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "json_parse"}
+
+    features: list[dict[str, Any]] = []
+    for ft in (data.get("features") or [])[:80]:
+        if not isinstance(ft, dict):
+            continue
+        t = str(ft.get("type") or "")
+        if t in ("Active site", "Binding site", "Modified residue", "Glycosylation", "Chain"):
+            features.append(
+                {
+                    "type": t,
+                    "description": str(ft.get("description") or "")[:400],
+                    "location": ft.get("location"),
+                }
+            )
+
+    pdb_refs: list[str] = []
+    for xr in data.get("uniProtKBCrossReferences") or []:
+        if not isinstance(xr, dict):
+            continue
+        if str(xr.get("database") or "").upper() == "PDB":
+            pid = xr.get("id")
+            if pid:
+                pdb_refs.append(str(pid))
+
+    pathway_note = ""
+    for c in data.get("comments") or []:
+        if isinstance(c, dict) and str(c.get("commentType")) == "PATHWAY":
+            for t in c.get("texts") or []:
+                if isinstance(t, dict) and t.get("value"):
+                    pathway_note += str(t["value"])[:1500] + "\n"
+
+    entry = {
+        "uniprot_id": data.get("primaryAccession"),
+        "protein_name": data.get("proteinDescription"),
+        "genes": data.get("genes"),
+        "comments_summary": [c for c in (data.get("comments") or []) if isinstance(c, dict)][:25],
+        "feature_highlights": features[:40],
+        "pdb_cross_refs": pdb_refs[:20],
+        "pathway_text": pathway_note.strip()[:4000],
+        "sequence": data.get("sequence"),
+    }
+    if memory_client and user_id:
+        _medical_cache_set(ck, {"entry": entry}, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+    return {"ok": True, "entry": entry, "cached": False}
+
+
+def search_gene(
+    gene_name: str,
+    organism: str = "human",
+    *,
+    max_results: int = 5,
+    memory_client: Any | None = None,
+    user_id: str = "",
+    use_mem0_cloud: bool = False,
+) -> dict[str, Any]:
+    g = (gene_name or "").strip()
+    if not g:
+        return {"ok": False, "error": "empty_gene", "genes": []}
+    tax = "human" if _organism_taxid(organism) == "9606" else organism
+    ck = _cache_key("ncbi_gene_search", f"{g}|{tax}|{max_results}")
+    if memory_client and user_id:
+        hit = _medical_cache_get(ck, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+        if hit is not None:
+            return {"ok": True, "genes": hit.get("genes", []), "cached": True}
+
+    term = urllib.parse.quote(f"{g}[Gene Name] AND {tax}[Organism]")
+    es_url = f"{PUBMED_EUTILS}esearch.fcgi?db=gene&term={term}&retmax={max_results}&retmode=json"
+    code, body = _http_get(es_url)
+    if code != 200:
+        return {"ok": False, "error": f"esearch_{code}", "genes": []}
+    try:
+        data = json.loads(body)
+        ids = (data.get("esearchresult") or {}).get("idlist") or []
+    except Exception:
+        return {"ok": False, "error": "esearch_parse", "genes": []}
+    if not ids:
+        out = {"ok": True, "genes": [], "cached": False}
+        if memory_client and user_id:
+            _medical_cache_set(ck, {"genes": []}, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+        return out
+
+    ids_s = ",".join(ids)
+    sm_url = f"{PUBMED_EUTILS}esummary.fcgi?db=gene&id={ids_s}&retmode=json"
+    code2, body2 = _http_get(sm_url)
+    if code2 != 200:
+        return {"ok": False, "error": f"esummary_{code2}", "genes": []}
+    try:
+        sm = json.loads(body2)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "esummary_parse", "genes": []}
+
+    result = sm.get("result") or {}
+    genes_out: list[dict[str, Any]] = []
+    for gid in ids:
+        doc = result.get(str(gid))
+        if not isinstance(doc, dict):
+            continue
+        loc = str(doc.get("maplocation") or doc.get("chromosome") or "")
+        org = doc.get("organism")
+        org_name = org.get("scientificname") if isinstance(org, dict) else org
+        genes_out.append(
+            {
+                "gene_id": str(gid),
+                "symbol": doc.get("name") or "",
+                "description": doc.get("description") or "",
+                "summary": (doc.get("summary") or "")[:4000],
+                "chromosome_location": loc,
+                "organism": org_name,
+            }
+        )
+
+    out = {"ok": True, "genes": genes_out, "cached": False, "query": g}
+    if memory_client and user_id:
+        _medical_cache_set(ck, {"genes": genes_out}, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+    return out
+
+
+def get_gene_detail(
+    gene_id: str,
+    *,
+    memory_client: Any | None = None,
+    user_id: str = "",
+    use_mem0_cloud: bool = False,
+) -> dict[str, Any]:
+    gid = re.sub(r"[^\d]", "", (gene_id or "").strip())
+    if not gid:
+        return {"ok": False, "error": "invalid_gene_id"}
+    ck = _cache_key("ncbi_gene_detail", gid)
+    if memory_client and user_id:
+        hit = _medical_cache_get(ck, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+        if hit is not None and hit.get("record"):
+            return {"ok": True, "record": hit["record"], "cached": True}
+
+    sm_url = f"{PUBMED_EUTILS}esummary.fcgi?db=gene&id={gid}&retmode=json"
+    code, body = _http_get(sm_url)
+    if code != 200:
+        return {"ok": False, "error": f"esummary_{code}"}
+    try:
+        sm = json.loads(body)
+        doc = (sm.get("result") or {}).get(gid)
+    except Exception:
+        return {"ok": False, "error": "parse"}
+    if not isinstance(doc, dict):
+        return {"ok": False, "error": "not_found"}
+
+    record = {
+        "gene_id": gid,
+        "symbol": doc.get("name"),
+        "description": doc.get("description"),
+        "summary": (doc.get("summary") or "")[:8000],
+        "location": doc.get("maplocation") or doc.get("chromosome"),
+        "other_aliases": doc.get("otheraliases"),
+        "other_designations": doc.get("otherdesignations"),
+        "phenotypes": doc.get("phenotypes"),
+        "raw_esummary": {k: doc.get(k) for k in list(doc.keys())[:40]},
+    }
+    if memory_client and user_id:
+        _medical_cache_set(ck, {"record": record}, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+    return {"ok": True, "record": record, "cached": False}
+
+
+def search_pathway(query: str, *, max_hits: int = 15) -> dict[str, Any]:
+    q = (query or "").strip()
+    if not q:
+        return {"ok": False, "error": "empty_query", "pathways": []}
+    url = f"{KEGG_REST}find/pathway/{urllib.parse.quote(q)}"
+    code, txt = _http_get(url)
+    if code != 200:
+        return {"ok": False, "error": f"kegg_{code}", "pathways": []}
+    pathways: list[dict[str, str]] = []
+    for line in txt.strip().splitlines()[:max_hits]:
+        if "\t" in line:
+            pid, name = line.split("\t", 1)
+            pathways.append({"pathway_id": pid.strip(), "name": name.strip()})
+    return {"ok": True, "pathways": pathways, "query": q}
+
+
+def get_pathway_detail(pathway_id: str, *, memory_client: Any | None = None, user_id: str = "", use_mem0_cloud: bool = False) -> dict[str, Any]:
+    pid = (pathway_id or "").strip()
+    if not pid:
+        return {"ok": False, "error": "empty_pathway"}
+    ck = _cache_key("kegg_pathway", pid)
+    if memory_client and user_id:
+        hit = _medical_cache_get(ck, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+        if hit is not None and hit.get("text"):
+            return {"ok": True, "pathway_id": pid, "flatfile_excerpt": hit["text"][:12000], "cached": True}
+
+    url = f"{KEGG_REST}get/{urllib.parse.quote(pid)}"
+    code, txt = _http_get(url)
+    if code != 200:
+        return {"ok": False, "error": f"kegg_{code}"}
+    excerpt = txt[:20000]
+    if memory_client and user_id:
+        _medical_cache_set(ck, {"text": txt}, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+    return {"ok": True, "pathway_id": pid, "flatfile_excerpt": excerpt, "cached": False}
+
+
+def find_gene_pathways(gene_name: str, *, organism_prefix: str = "hsa") -> dict[str, Any]:
+    """Link NCBI Gene ID to KEGG pathways via rest.kegg.jp/link/pathway/."""
+    g = (gene_name or "").strip()
+    if not g.isdigit():
+        sg = search_gene(g, organism="human", max_results=1)
+        genes = sg.get("genes") or []
+        if not genes:
+            return {"ok": False, "error": "gene_not_found", "pathways": []}
+        gid = str((genes[0] or {}).get("gene_id") or "")
+    else:
+        gid = g
+    if not gid:
+        return {"ok": False, "error": "no_gene_id", "pathways": []}
+
+    conv_url = f"{KEGG_REST}conv/{organism_prefix}/ncbi-geneid:{gid}"
+    code, conv_txt = _http_get(conv_url)
+    kegg_gene = ""
+    if code == 200 and conv_txt.strip():
+        line = conv_txt.strip().splitlines()[0]
+        if "\t" in line:
+            kegg_gene = line.split("\t", 1)[1].strip()
+    if not kegg_gene:
+        kegg_gene = f"{organism_prefix}:{gid}"
+
+    link_url = f"{KEGG_REST}link/pathway/{urllib.parse.quote(kegg_gene)}"
+    code2, txt = _http_get(link_url)
+    if code2 != 200:
+        return {"ok": False, "error": f"kegg_link_{code2}", "pathways": []}
+    pws: list[dict[str, str]] = []
+    for line in txt.strip().splitlines()[:40]:
+        if "\t" in line:
+            a, b = line.split("\t", 1)
+            pws.append({"kegg_gene": a.strip(), "pathway_id": b.strip()})
+    return {"ok": True, "ncbi_gene_id": gid, "kegg_gene_id": kegg_gene, "pathways": pws}
+
+
+def search_structure(
+    protein_name: str,
+    *,
+    max_results: int = 10,
+    memory_client: Any | None = None,
+    user_id: str = "",
+    use_mem0_cloud: bool = False,
+) -> dict[str, Any]:
+    qn = (protein_name or "").strip()
+    if not qn:
+        return {"ok": False, "error": "empty_query", "structures": []}
+    ck = _cache_key("pdb_search", f"{qn}|{max_results}")
+    if memory_client and user_id:
+        hit = _medical_cache_get(ck, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+        if hit is not None:
+            return {"ok": True, "structures": hit.get("structures", []), "cached": True}
+
+    query_body = {
+        "query": {
+            "type": "terminal",
+            "service": "full_text",
+            "parameters": {"value": qn},
+        },
+        "return_type": "entry",
+        "request_options": {"paginate": {"start": 0, "rows": max(1, min(max_results, 25))}},
+    }
+    try:
+        resp = requests.post(
+            RCSB_SEARCH_V2,
+            json=query_body,
+            headers={**_HTTP_HEADERS, "Content-Type": "application/json"},
+            timeout=_HTTP_TIMEOUT,
+        )
+        code = resp.status_code
+        data = resp.json() if code == 200 else {}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "structures": []}
+
+    if code != 200:
+        return {"ok": False, "error": f"pdb_http_{code}", "structures": []}
+
+    raw_items = data.get("result_set") or data.get("results") or []
+    structs: list[dict[str, Any]] = []
+    for item in raw_items[:max_results]:
+        if not isinstance(item, dict):
+            continue
+        ident = item.get("identifier") or item.get("id") or ""
+        structs.append(
+            {
+                "pdb_id": ident,
+                "title": item.get("name") or item.get("title") or "",
+                "score": item.get("score"),
+            }
+        )
+
+    out = {"ok": True, "structures": structs, "cached": False, "query": qn}
+    if memory_client and user_id:
+        _medical_cache_set(ck, {"structures": structs}, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+    return out
+
+
+def get_structure_detail(pdb_id: str) -> dict[str, Any]:
+    pid = re.sub(r"[^A-Za-z0-9]", "", (pdb_id or "").strip()).upper()[:4]
+    if len(pid) < 4:
+        return {"ok": False, "error": "invalid_pdb_id"}
+    url = f"https://data.rcsb.org/rest/v1/core/entry/{pid}"
+    code, body = _http_get(url)
+    if code != 200:
+        return {"ok": False, "error": f"rcsb_data_{code}"}
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "json_parse"}
+    return {"ok": True, "pdb_id": pid, "metadata": data}
+
+
+def search_clinvar(term: str, *, max_ids: int = 15) -> dict[str, Any]:
+    t = (term or "").strip()
+    if not t:
+        return {"ok": False, "error": "empty_term", "variants": []}
+    q = urllib.parse.quote(t)
+    es_url = f"{PUBMED_EUTILS}esearch.fcgi?db=clinvar&term={q}&retmax={max_ids}&retmode=json"
+    code, body = _http_get(es_url)
+    if code != 200:
+        return {"ok": False, "error": f"esearch_{code}", "variants": []}
+    try:
+        data = json.loads(body)
+        ids = (data.get("esearchresult") or {}).get("idlist") or []
+    except Exception:
+        return {"ok": False, "error": "parse", "variants": []}
+    if not ids:
+        return {"ok": True, "variants": [], "term": t}
+
+    ids_s = ",".join(ids)
+    sm_url = f"{PUBMED_EUTILS}esummary.fcgi?db=clinvar&id={ids_s}&retmode=json"
+    code2, body2 = _http_get(sm_url)
+    if code2 != 200:
+        return {"ok": True, "variant_ids": ids, "term": t, "summaries_error": f"esummary_{code2}"}
+    try:
+        sm = json.loads(body2)
+        res = sm.get("result") or {}
+    except Exception:
+        return {"ok": True, "variant_ids": ids, "term": t}
+
+    variants: list[dict[str, Any]] = []
+    for vid in ids:
+        doc = res.get(str(vid))
+        if isinstance(doc, dict):
+            variants.append(
+                {
+                    "clinvar_id": str(vid),
+                    "title": doc.get("title") or doc.get("name"),
+                    "clinical_significance": doc.get("clinical_significance") or doc.get("germline_classification"),
+                    "review_status": doc.get("review_status"),
+                    "gene_sort": doc.get("gene_sort") or doc.get("genes"),
+                    "snippet": json.dumps(doc, default=str)[:2500],
+                }
+            )
+    return {"ok": True, "variants": variants, "term": t}
+
+
 # --- Filing ---
 
 
@@ -687,6 +1210,443 @@ def _maybe_file_medical_intel(
     except Exception as e:
         _log.debug("medical auto-file skipped: %s", e)
         return None
+
+
+def _bio_file_slug(target_key: str) -> str:
+    h = hashlib.sha256(target_key.strip().lower().encode()).hexdigest()[:10]
+    d = _now_utc().strftime("%Y%m%d")
+    return f"{BIO_RESEARCH_PREFIX}{d}-{h}"
+
+
+def _maybe_file_biomedical_intel(
+    files_cabinet: Any,
+    *,
+    folder: str,
+    target_key: str,
+    body: dict[str, Any],
+    tags: list[str],
+) -> str | None:
+    try:
+        fn = _bio_file_slug(target_key)
+        text = json.dumps(body, ensure_ascii=False, indent=2)
+        if files_cabinet.get_file(fn):
+            files_cabinet.update_file(fn, text, skip_mem0=True)
+        else:
+            files_cabinet.create_file(folder, fn, text, tags=tags, skip_mem0=True)
+        return fn
+    except Exception as e:
+        _log.debug("biomedical auto-file skipped: %s", e)
+        return None
+
+
+def _kegg_pathway_bundle(query: str, memory_client: Any, user_id: str, use_mem0_cloud: bool) -> dict[str, Any]:
+    s = search_pathway(query)
+    out: dict[str, Any] = {"search": s}
+    pws = s.get("pathways") or []
+    if pws and isinstance(pws[0], dict):
+        pid = (pws[0].get("pathway_id") or "").strip()
+        if pid:
+            out["detail"] = get_pathway_detail(pid, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+    return out
+
+
+def run_biomedical_research(
+    target: str,
+    target_type: str,
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: Any | None = None,
+    default_intel_folder: str | None = None,
+) -> dict[str, Any]:
+    """
+    Parallel gather from PubMed, UniProt, NCBI Gene, KEGG, PDB, trials (when relevant), Tavily;
+    Claude returns unified biomedical brief.
+    """
+    tgt = (target or "").strip()
+    tt = (target_type or "condition").strip().lower()
+    ctx = (context or "").strip()
+    if not tgt:
+        return {"ok": False, "error": "empty_target"}
+    if tt not in ("gene", "protein", "pathway", "compound", "condition", "agent"):
+        tt = "condition"
+
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+    gathered: dict[str, Any] = {}
+    errors: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        fmap: dict[str, Any] = {
+            "pubmed": ex.submit(
+                search_pubmed,
+                f"{tgt} (gene OR protein OR pathway OR structure OR therapy OR review)",
+                12,
+                **mem_kw,
+            ),
+            "tavily": ex.submit(_tavily_biomedical, f"{tgt} biomedical molecular research {ctx}"[:500]),
+            "uniprot": ex.submit(search_protein, tgt, "human", max_results=6, **mem_kw),
+            "ncbi_gene": ex.submit(search_gene, tgt, "human", max_results=5, **mem_kw),
+            "pdb": ex.submit(search_structure, tgt, max_results=10, **mem_kw),
+        }
+        if tt == "pathway":
+            fmap["kegg"] = ex.submit(_kegg_pathway_bundle, tgt, memory_client, user_id, use_mem0_cloud)
+        else:
+            fmap["kegg_gene_pathways"] = ex.submit(find_gene_pathways, tgt)
+        if tt in ("condition", "agent"):
+            fmap["trials"] = ex.submit(
+                lambda t=tgt: search_trials(
+                    t,
+                    intervention=None,
+                    status="RECRUITING",
+                    max_results=10,
+                    **mem_kw,
+                )
+            )
+        for name, fut in fmap.items():
+            try:
+                gathered[name] = fut.result(timeout=60)
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+
+    hits = (gathered.get("uniprot") or {}).get("hits") or []
+    if hits and isinstance(hits[0], dict) and hits[0].get("uniprot_id"):
+        uid = hits[0]["uniprot_id"]
+        try:
+            gathered["uniprot_detail"] = get_protein_detail(uid, **mem_kw)
+        except Exception as e:
+            errors.append(f"uniprot_detail: {e}")
+
+    genes = (gathered.get("ncbi_gene") or {}).get("genes") or []
+    if genes and isinstance(genes[0], dict) and genes[0].get("gene_id"):
+        try:
+            gathered["ncbi_gene_detail"] = get_gene_detail(str(genes[0]["gene_id"]), **mem_kw)
+        except Exception as e:
+            errors.append(f"ncbi_gene_detail: {e}")
+
+    pdb_list = (gathered.get("pdb") or {}).get("structures") or []
+    if pdb_list and isinstance(pdb_list[0], dict) and (pdb_list[0].get("pdb_id") or pdb_list[0].get("identifier")):
+        pid0 = pdb_list[0].get("pdb_id") or pdb_list[0].get("identifier")
+        try:
+            gathered["pdb_detail"] = get_structure_detail(str(pid0))
+        except Exception as e:
+            errors.append(f"pdb_detail: {e}")
+
+    blob = json.dumps(
+        {"target": tgt, "target_type": tt, "context": ctx, "gathered": gathered, "gather_errors": errors},
+        ensure_ascii=False,
+        indent=2,
+    )[:95000]
+
+    system = """You are Angel's biomedical research agent. Using ONLY the JSON bundle (parallel DB results + Tavily), output ONE JSON object with keys:
+- target_summary (string)
+- biological_role (string)
+- disease_associations (string)
+- pathway_context (string)
+- structural_data (string; PDB / structure availability)
+- research_status (string)
+- therapeutic_relevance (string)
+- mission_relevance (LOW|MEDIUM|HIGH|CRITICAL)
+- key_findings (array of exactly 5 strings, most significant)
+- gaps (string)
+- recommended_followup (string)
+- data_sources_used (array of short strings listing which sources contributed)
+- limitations (string; open sources; KEGG academic use; not clinical advice)
+JSON only, no markdown."""
+
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    out: dict[str, Any] = {
+        "ok": parsed.get("ok", False),
+        "mode": "biomedical_research",
+        "target": tgt,
+        "target_type": tt,
+        "gathered": gathered,
+        "gather_errors": errors,
+        "analysis": parsed.get("data") if isinstance(parsed.get("data"), dict) else {},
+        "build": 6,
+    }
+    if parsed.get("error"):
+        out["error"] = parsed["error"]
+
+    mr = str((out.get("analysis") or {}).get("mission_relevance") or "").upper()
+    if mr in ("HIGH", "CRITICAL") and files_cabinet is not None:
+        folder = default_intel_folder or MEDICAL_INTEL_FOLDER
+        if tt == "agent":
+            folder = BIO_INTEL_FOLDER
+        fn = _maybe_file_biomedical_intel(
+            files_cabinet,
+            folder=folder,
+            target_key=f"{tt}:{tgt}",
+            body=out,
+            tags=[
+                "biomedical_research",
+                f"type:{tt}",
+                f"mission:{mr}",
+                "sources:pubmed,uniprot,ncbi_gene,kegg,pdb,tavily,ctgov",
+            ],
+        )
+        out["filed_as"] = fn
+
+    return out
+
+
+def research_biological_agent(
+    agent_name: str,
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: Any | None = None,
+) -> dict[str, Any]:
+    base = run_biomedical_research(
+        agent_name,
+        "agent",
+        context,
+        anthropic_client=anthropic_client,
+        memory_client=memory_client,
+        user_id=user_id,
+        use_mem0_cloud=use_mem0_cloud,
+        files_cabinet=files_cabinet,
+        default_intel_folder=BIO_INTEL_FOLDER,
+    )
+    if not base.get("ok"):
+        return base
+    base["mode"] = "biological_agent"
+    extra = _claude_medical_json(
+        anthropic_client,
+        """From the same biomedical JSON bundle in the user message, output ONE JSON merging biosecurity focus:
+- taxonomy_notes (string)
+- genome_virulence (string)
+- toxin_structure_mechanism (string if toxin-like; else "n/a")
+- engineered_agent_notes (string)
+- detection_treatment (string)
+Add these keys alongside reiterating mission_relevance (same scale).
+JSON only merge object (all keys required).""",
+        json.dumps(base, ensure_ascii=False)[:80000],
+    )
+    if extra.get("ok") and isinstance(extra.get("data"), dict):
+        base["biosecurity_extension"] = extra["data"]
+        mr2 = str(extra["data"].get("mission_relevance") or base.get("analysis", {}).get("mission_relevance") or "").upper()
+        if mr2 in ("HIGH", "CRITICAL") and files_cabinet is not None and not base.get("filed_as"):
+            base["filed_as"] = _maybe_file_biomedical_intel(
+                files_cabinet,
+                folder=BIO_INTEL_FOLDER,
+                target_key=f"agent:{agent_name}",
+                body=base,
+                tags=["biological_intelligence", "biomedical_agent_deep", f"mission:{mr2}"],
+            )
+    return base
+
+
+def research_genetic_variant(
+    gene: str,
+    variant: str,
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: Any | None = None,
+) -> dict[str, Any]:
+    g = (gene or "").strip()
+    v = (variant or "").strip()
+    ctx = (context or "").strip()
+    if not g or not v:
+        return {"ok": False, "error": "gene and variant required"}
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+
+    gathered: dict[str, Any] = {}
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {
+            "clinvar": ex.submit(search_clinvar, f"{g} {v}"),
+            "pubmed": ex.submit(search_pubmed, f"{g} {v} variant OR mutation OR ClinVar", 10, **mem_kw),
+            "gene": ex.submit(search_gene, g, "human", max_results=2, **mem_kw),
+            "trials": ex.submit(search_trials, f"{g} genetic", None, "RECRUITING", 6, **mem_kw),
+            "tavily": ex.submit(_tavily_biomedical, f"{g} {v} variant clinical significance"),
+        }
+        for k, fut in futs.items():
+            try:
+                gathered[k] = fut.result(timeout=55)
+            except Exception as e:
+                errors.append(f"{k}: {e}")
+
+    blob = json.dumps({"gene": g, "variant": v, "context": ctx, "gathered": gathered, "errors": errors}, ensure_ascii=False, indent=2)[
+        :90000
+    ]
+    system = """Clinical genetics analyst. From JSON (ClinVar esummary, PubMed, trials, Tavily), output ONE JSON:
+- variant_summary (string)
+- clinical_significance (string)
+- population_frequency_notes (string; say unknown if not in bundle)
+- disease_association (string)
+- functional_impact (string)
+- therapeutic_implications (string)
+- trial_landscape (string)
+- mission_relevance (LOW|MEDIUM|HIGH|CRITICAL)
+- key_findings (array up to 5 strings)
+- gaps (string)
+- limitations (string)
+JSON only."""
+
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    out = {
+        "ok": parsed.get("ok", False),
+        "mode": "genetic_variant",
+        "gene": g,
+        "variant": v,
+        "gathered": gathered,
+        "analysis": parsed.get("data") if isinstance(parsed.get("data"), dict) else {},
+        "errors": errors,
+    }
+    if parsed.get("error"):
+        out["error"] = parsed["error"]
+    mr = str((out.get("analysis") or {}).get("mission_relevance") or "").upper()
+    if mr in ("HIGH", "CRITICAL") and files_cabinet is not None:
+        out["filed_as"] = _maybe_file_biomedical_intel(
+            files_cabinet,
+            folder=GENOMICS_INTEL_FOLDER,
+            target_key=f"variant:{g}:{v}",
+            body=out,
+            tags=["genomics_intelligence", "variant", f"gene:{g[:20]}", f"mission:{mr}"],
+        )
+    return out
+
+
+def research_genetic_condition(
+    condition: str,
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: Any | None = None,
+) -> dict[str, Any]:
+    c = (condition or "").strip()
+    ctx = (context or "").strip()
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+    gathered: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {
+            "base": ex.submit(
+                run_biomedical_research,
+                c,
+                "condition",
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=None,
+                default_intel_folder=None,
+            ),
+            "pubmed_gene": ex.submit(search_pubmed, f"{c} genetic basis OR gene therapy OR inheritance", 10, **mem_kw),
+            "tavily": ex.submit(_tavily_biomedical, f"{c} genetics gene therapy clinical trials"),
+        }
+        for k, fut in futs.items():
+            try:
+                gathered[k] = fut.result(timeout=90)
+            except Exception as e:
+                gathered[k] = {"error": str(e)}
+
+    blob = json.dumps({"condition": c, "context": ctx, "gathered": gathered}, ensure_ascii=False, indent=2)[:90000]
+    system = """Genetic disease analyst. Using the JSON (includes nested biomedical research bundle), output ONE JSON:
+- genetic_basis (string)
+- causative_genes (string)
+- inheritance_pattern (string)
+- molecular_mechanisms (string)
+- gene_therapy_landscape (string)
+- clinical_trial_landscape (string)
+- mission_relevance (LOW|MEDIUM|HIGH|CRITICAL)
+- key_findings (array up to 5)
+- gaps (string)
+- limitations (string)
+JSON only."""
+
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    out = {
+        "ok": parsed.get("ok", False),
+        "mode": "genetic_condition",
+        "condition": c,
+        "gathered": gathered,
+        "analysis": parsed.get("data") if isinstance(parsed.get("data"), dict) else {},
+    }
+    if parsed.get("error"):
+        out["error"] = parsed["error"]
+    mr = str((out.get("analysis") or {}).get("mission_relevance") or "").upper()
+    if mr in ("HIGH", "CRITICAL") and files_cabinet is not None:
+        out["filed_as"] = _maybe_file_biomedical_intel(
+            files_cabinet,
+            folder=GENOMICS_INTEL_FOLDER,
+            target_key=f"genetic_condition:{c}",
+            body=out,
+            tags=["genomics_intelligence", "genetic_condition", f"mission:{mr}"],
+        )
+    return out
+
+
+def research_drug_target(
+    drug_name: str,
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: Any | None = None,
+) -> dict[str, Any]:
+    d = (drug_name or "").strip()
+    ctx = (context or "").strip()
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+    label = get_drug_label(d)
+    pub = search_pubmed(f"{d} mechanism of action target receptor enzyme", 10, **mem_kw)
+    tav = _tavily_biomedical(f"{d} drug target repurposing resistance mechanism")
+
+    blob = json.dumps(
+        {"drug": d, "context": ctx, "openfda_label": label, "pubmed": pub, "tavily": tav},
+        ensure_ascii=False,
+        indent=2,
+    )[:90000]
+    system = """Pharmacology analyst. From FDA label excerpts + PubMed + Tavily, infer molecular targets (best effort from open text). Output ONE JSON:
+- mapped_targets (string; name likely proteins/pathways)
+- uniprot_followups (array of suggested protein search strings)
+- pathway_context (string)
+- resistance_mechanisms (string)
+- repurposing_ideas (string)
+- recent_research (string)
+- mission_relevance (LOW|MEDIUM|HIGH|CRITICAL)
+- key_findings (array up to 5)
+- gaps (string)
+- limitations (string; not prescribing)
+JSON only."""
+
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    out = {
+        "ok": parsed.get("ok", False),
+        "mode": "drug_target",
+        "drug": d,
+        "raw_label": label,
+        "raw_pubmed": pub,
+        "raw_tavily": tav,
+        "analysis": parsed.get("data") if isinstance(parsed.get("data"), dict) else {},
+    }
+    if parsed.get("error"):
+        out["error"] = parsed["error"]
+    mr = str((out.get("analysis") or {}).get("mission_relevance") or "").upper()
+    if mr in ("HIGH", "CRITICAL") and files_cabinet is not None:
+        out["filed_as"] = _maybe_file_biomedical_intel(
+            files_cabinet,
+            folder=PHARMA_INTEL_FOLDER,
+            target_key=f"drug_target:{d}",
+            body=out,
+            tags=["pharmacological_intelligence", "drug_target", f"mission:{mr}"],
+        )
+    return out
 
 
 # --- Claude-backed analysis ---
@@ -1112,25 +2072,132 @@ _MEDICAL_TRIGGERS = re.compile(
     r")\b"
 )
 
+_BIOMEDICAL_SIGNAL = re.compile(
+    r"(?i)\b("
+    r"uniprot|clinvar|kegg|proteomics|genomics|molecular biology|biochemical pathway|signaling pathway|"
+    r"mutation|allele|genotype|transcript|exon|intron|ortholog|paralog|crystallography|"
+    r"enzyme\b|kinase\b|receptor\b|ligand\b|post-translational|transcription factor|"
+    r"gene therapy|gene expression|protein structure|pdb\b|3d structure|"
+    r"genetic basis|pathophysiology|molecular mechanism|binding site|active site"
+    r")\b"
+)
+
+_SKIP_GENEISH = frozenset(
+    {"THE", "AND", "OR", "NOT", "DNA", "RNA", "FDA", "NIH", "CDC", "WHO", "UAP", "USA", "UK", "EU"}
+)
+
+
+def _infer_biomedical_target_type(msg: str) -> tuple[str, str]:
+    low = msg.lower()
+    pw = re.search(r"(?i)([A-Za-z0-9\-\s]{2,40}?)\s+pathway\b", msg)
+    if "pathway" in low and pw:
+        cand = pw.group(1).strip()
+        if len(cand) > 2 and cand.lower() not in ("the", "a", "in", "this"):
+            return "pathway", cand[:120]
+    if "pathway" in low:
+        return "pathway", msg[:160].strip()
+    for m in re.finditer(r"\b([A-Z][A-Z0-9]{1,5})\b", msg):
+        sym = m.group(1)
+        if sym in _SKIP_GENEISH:
+            continue
+        return "gene", sym
+    if "protein" in low:
+        pm = re.search(r"(?i)protein[:\s]+([A-Za-z0-9\-]+)", msg)
+        if pm:
+            return "protein", pm.group(1)[:80]
+        return "protein", msg[:100].strip()
+    return "condition", msg[:160].strip()
+
+
+def _detect_biomedical_intent(msg: str) -> tuple[str | None, dict[str, Any]]:
+    low = msg.lower()
+    if len(msg) < 6:
+        return None, {}
+
+    hgvs = re.search(r"\b([A-Z][A-Z0-9]{1,5})\s+(c\.[^\s]+|p\.[^\s]+)\b", msg)
+    rs_m = re.search(r"\brs(\d+)\b", msg, re.I)
+    if hgvs or rs_m:
+        gene_guess = hgvs.group(1) if hgvs else ""
+        var_part = f"{hgvs.group(2)}" if hgvs else f"rs{rs_m.group(1)}"
+        if not gene_guess:
+            gm = re.search(r"\b([A-Z][A-Z0-9]{1,5})\b", msg)
+            gene_guess = gm.group(1) if gm and gm.group(1) not in _SKIP_GENEISH else "UNKNOWN"
+        return "genetic_variant", {"gene": gene_guess, "variant": var_part}
+
+    if re.search(r"(?i)\b(genetic basis of|what is the genetic basis of|what's the genetic basis of|what is the genetic basis)\b", msg):
+        m = re.search(r"(?i)genetic basis(?:\s+of)?\s+([^?.!\n]{4,120})", msg)
+        cond = (m.group(1).strip() if m else msg[:120]).strip()
+        return "genetic_condition", {"condition": cond}
+
+    if re.search(r"(?i)\b(molecular level|mechanism of action|at the molecular)\b", msg) and re.search(
+        r"(?i)\b(drug|medication|metformin|ibuprofen|aspirin|inhibitor|antibody therapy)\b", msg
+    ):
+        dm = re.search(
+            r"(?i)\b(metformin|ibuprofen|aspirin|lisinopril|atorvastatin|omeprazole|sertraline|prednisone|insulin|warfarin|osimertinib)\b",
+            msg,
+        )
+        drug = dm.group(1) if dm else ""
+        if not drug:
+            hm = re.search(r"(?i)\bhow does\s+([a-z][a-z0-9\-]{2,40})\s+work\b", msg)
+            drug = hm.group(1).strip() if hm else ""
+        if not drug or len(drug) > 50:
+            drug = msg[:80].strip()
+        return "drug_target", {"drug": drug}
+
+    if re.search(r"(?i)\b(pathway|signaling pathway|biochemical pathway)\b", msg) or re.search(
+        r"(?i)\bwhat pathway\b", msg
+    ):
+        m = re.search(r"(?i)(?:pathway|pathways)\s+(?:for|in|of|involving)\s+([^?.!\n]{3,100})", msg)
+        tgt_use = (m.group(1).strip() if m else "").strip() or msg[:160].strip()
+        return "biomedical_research", {"target": tgt_use[:200], "target_type": "pathway"}
+
+    wdd = re.search(r"(?i)\bwhat\s+(does|is)\s+([A-Z][A-Z0-9]{1,5})\b", msg)
+    if wdd:
+        sym = wdd.group(2)
+        if sym not in _SKIP_GENEISH:
+            kind = "protein" if "protein" in low else "gene"
+            return "biomedical_research", {"target": sym, "target_type": kind}
+
+    if 8 <= len(msg) <= 140:
+        gm = re.match(r"(?i)what\s+is\s+([A-Z][A-Z0-9]{1,5})\??\s*$", msg)
+        if gm and gm.group(1) not in _SKIP_GENEISH:
+            return "biomedical_research", {"target": gm.group(1), "target_type": "gene"}
+
+    if _BIOMEDICAL_SIGNAL.search(msg):
+        tt, tgt = _infer_biomedical_target_type(msg)
+        return "biomedical_research", {"target": (tgt[:200] if tgt else msg[:160]), "target_type": tt}
+
+    if re.search(r"(?i)\b(UniProt|ClinVar|crystallography|PDB\b)\b", msg):
+        tt, tgt = _infer_biomedical_target_type(msg)
+        return "biomedical_research", {"target": (tgt[:200] if tgt else msg[:160]), "target_type": tt}
+
+    return None, {}
+
 
 def detect_medical_chat_intent(user_message: str) -> tuple[str | None, dict[str, Any]]:
     msg = (user_message or "").strip()
+    payload: dict[str, Any] = {"original": msg[:500]}
+
+    if len(msg) >= 12 and re.search(r"(?i)\b(clinical trial|recruiting trial|nct\d)", msg):
+        m = re.search(r"(?i)for\s+([^?.!\n]{3,80})", msg)
+        payload["condition"] = (m.group(1).strip() if m else msg[:120]).strip()
+        return "trials", payload
+
+    if len(msg) >= 10 and re.search(r"(?i)\b(biological agent|pathogen|bioweapon|biosecurity)\b", msg):
+        payload["agent"] = msg[:200]
+        return "biological_threat", payload
+
+    bio_cmd, bio_payload = _detect_biomedical_intent(msg)
+    if bio_cmd:
+        payload.update(bio_payload)
+        return bio_cmd, payload
+
     if len(msg) < 12:
         return None, {}
     if not _MEDICAL_TRIGGERS.search(msg):
         return None, {}
 
     low = msg.lower()
-    payload: dict[str, Any] = {"original": msg[:500]}
-
-    if re.search(r"(?i)\b(clinical trial|recruiting trial|nct\d)", msg):
-        m = re.search(r"(?i)for\s+([^?.!\n]{3,80})", msg)
-        payload["condition"] = (m.group(1).strip() if m else msg[:120]).strip()
-        return "trials", payload
-
-    if re.search(r"(?i)\b(biological agent|pathogen|bioweapon|biosecurity)\b", msg):
-        payload["agent"] = msg[:200]
-        return "biological_threat", payload
 
     if re.search(r"(?i)\b(drug|medication|pill|metformin|ibuprofen|adverse event|side effect|fda)\b", msg):
         payload["drug"] = msg[:200]
@@ -1160,6 +2227,70 @@ def run_medical_intent_for_chat(
 ) -> dict[str, Any]:
     ctx = str(payload.get("original") or "")
     try:
+        if intent == "biomedical_research":
+            return run_biomedical_research(
+                str(payload.get("target") or ctx),
+                str(payload.get("target_type") or "condition"),
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
+        if intent == "gene":
+            return run_biomedical_research(
+                str(payload.get("gene") or ctx),
+                "gene",
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
+        if intent == "protein":
+            return run_biomedical_research(
+                str(payload.get("protein") or ctx),
+                "protein",
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
+        if intent == "drug_target":
+            return research_drug_target(
+                str(payload.get("drug") or ctx),
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
+        if intent == "genetic_variant":
+            return research_genetic_variant(
+                str(payload.get("gene") or ""),
+                str(payload.get("variant") or ""),
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
+        if intent == "genetic_condition":
+            return research_genetic_condition(
+                str(payload.get("condition") or ctx),
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
         if intent == "condition":
             return analyze_condition(str(payload.get("condition") or ctx), ctx, anthropic_client=anthropic_client, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud, files_cabinet=files_cabinet)
         if intent == "drug":
@@ -1182,7 +2313,15 @@ def run_medical_intent_for_chat(
             }
         if intent == "biological_threat":
             ag = str(payload.get("agent") or ctx)[:200]
-            return analyze_biological_agent(ag, ctx, anthropic_client=anthropic_client, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud, files_cabinet=files_cabinet)
+            return research_biological_agent(
+                ag,
+                ctx,
+                anthropic_client=anthropic_client,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
     except Exception as e:
         return {"ok": False, "error": str(e)}
     return {"ok": False, "error": "unknown_intent"}
@@ -1191,26 +2330,77 @@ def run_medical_intent_for_chat(
 def format_medical_block_for_prompt(result: dict[str, Any]) -> str:
     if not result.get("ok"):
         return f"\n\n[Medical intelligence — tool error: {result.get('error', 'unknown')}]\n"
-    if result.get("mode") == "trials":
+    mode = result.get("mode")
+    file_note = f"\nAuto-filed intelligence file: {result.get('filed_as')}\n" if result.get("filed_as") else ""
+
+    if mode == "trials":
         inner = result.get("result") or {}
         return (
             "\n\n[Medical intelligence — clinical trials (ClinicalTrials.gov; open sources only; not medical advice)]\n"
             + json.dumps(inner, ensure_ascii=False, indent=2)[:14000]
         )
+
+    if mode in ("biomedical_research", "biological_agent"):
+        analysis = result.get("analysis") if isinstance(result.get("analysis"), dict) else {}
+        hdr = (
+            "[Medical intelligence — biomedical research (Build 6): PubMed, UniProt, NCBI Gene, KEGG, PDB, "
+            "ClinicalTrials.gov when relevant, Tavily. Open sources; KEGG academic/non-commercial; not clinical advice.]\n"
+        )
+        if mode == "biological_agent":
+            hdr = (
+                "[Medical intelligence — biological agent deep research (Build 6): parallel biomedical sources plus "
+                "biosecurity-focused extension. Not clinical advice.]\n"
+            )
+        parts: list[str] = ["\n\n", hdr]
+        if analysis:
+            parts.append(json.dumps(analysis, ensure_ascii=False, indent=2)[:11000])
+        if mode == "biological_agent" and isinstance(result.get("biosecurity_extension"), dict):
+            parts.append(
+                "\nBiosecurity extension:\n"
+                + json.dumps(result["biosecurity_extension"], ensure_ascii=False, indent=2)[:5000]
+            )
+        errs = result.get("gather_errors") or []
+        if errs:
+            parts.append("\nPartial gather errors: " + json.dumps(errs, ensure_ascii=False)[:1500])
+        parts.append(file_note)
+        return "".join(parts)
+
+    if mode == "genetic_variant":
+        analysis = result.get("analysis") if isinstance(result.get("analysis"), dict) else {}
+        return (
+            "\n\n[Medical intelligence — genetic variant (ClinVar, PubMed, trials, Tavily). Not clinical advice.]\n"
+            + json.dumps(analysis, ensure_ascii=False, indent=2)[:12000]
+            + file_note
+        )
+
+    if mode == "genetic_condition":
+        analysis = result.get("analysis") if isinstance(result.get("analysis"), dict) else {}
+        return (
+            "\n\n[Medical intelligence — genetic condition landscape (nested biomedical bundle + genetics literature). "
+            "Not clinical advice.]\n"
+            + json.dumps(analysis, ensure_ascii=False, indent=2)[:12000]
+            + file_note
+        )
+
+    if mode == "drug_target":
+        analysis = result.get("analysis") if isinstance(result.get("analysis"), dict) else {}
+        return (
+            "\n\n[Medical intelligence — drug–target / mechanism (openFDA label excerpts, PubMed, Tavily). Not prescribing advice.]\n"
+            + json.dumps(analysis, ensure_ascii=False, indent=2)[:12000]
+            + file_note
+        )
+
     analysis = result.get("analysis")
     if isinstance(analysis, dict):
         ev = analysis.get("evidence_quality") or analysis.get("limitations")
         header = f"Evidence quality (per synthesis): {ev}\n" if ev else ""
         body = json.dumps(analysis, ensure_ascii=False, indent=2)[:12000]
-        raw_note = ""
-        if result.get("filed_as"):
-            raw_note = f"\nAuto-filed intelligence file: {result.get('filed_as')}\n"
         return (
             "\n\n[Medical intelligence appendix — synthesized from PubMed / FDA / NIH / ClinicalTrials.gov where applicable. "
             "Not medical advice; Tyler should consult licensed professionals.]\n"
             + header
             + body
-            + raw_note
+            + file_note
         )
     return "\n\n[Medical intelligence — partial result]\n" + json.dumps(result, ensure_ascii=False, indent=2)[:8000]
 
@@ -1226,5 +2416,18 @@ def medical_databases_status() -> dict[str, Any]:
     checks["medlineplus_ws"] = c3 == 200
     c4, _ = _http_get(f"{CLINICALTRIALS_V2}?pageSize=1&format=json", timeout=12.0)
     checks["clinicaltrials_gov_v2"] = c4 == 200
+    c5, _ = _http_get(f"{UNIPROT_REST}uniprotkb/search?query=insulin&size=1&format=json", timeout=12.0)
+    checks["uniprot_rest"] = c5 == 200
+    c6, _ = _http_get(
+        f"{PUBMED_EUTILS}esearch.fcgi?db=gene&term=tp53[Gene+Name]+AND+human[Organism]&retmode=json&retmax=1",
+        timeout=12.0,
+    )
+    checks["ncbi_gene"] = c6 == 200
+    c7, _ = _http_get(f"{KEGG_REST}list/pathway/hsa", timeout=12.0)
+    checks["kegg_rest"] = c7 == 200
+    c8, _ = _http_get("https://data.rcsb.org/rest/v1/core/entry/1CRN", timeout=12.0)
+    checks["rcsb_pdb"] = c8 == 200
+    c9, _ = _http_get(f"{PUBMED_EUTILS}esearch.fcgi?db=clinvar&term=BRCA1&retmode=json&retmax=1", timeout=12.0)
+    checks["ncbi_clinvar"] = c9 == 200
     checks["all_reachable"] = all(checks.values())
     return checks
