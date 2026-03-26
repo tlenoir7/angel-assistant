@@ -4317,10 +4317,155 @@ def create_app() -> Flask:
         data = request.get_json(silent=True) or {}
         hd = data.get("health_data")
         if not isinstance(hd, dict):
-            return jsonify({"ok": False, "error": "health_data object required"}), 400
+            upd = data.get("updates")
+            hd = upd if isinstance(upd, dict) else None
+        if not isinstance(hd, dict):
+            return jsonify({"ok": False, "error": "health_data or updates object required"}), 400
         try:
             r = angel_medical.update_health_profile(
                 hd,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/health/profile", methods=["GET"])
+    def api_health_profile():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            r = angel_medical.get_health_profile(
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/health/update", methods=["POST"])
+    def api_health_update():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        upd = data.get("updates")
+        if not isinstance(upd, dict):
+            return jsonify({"ok": False, "error": "updates object required"}), 400
+        try:
+            r = angel_medical.update_health_profile(
+                upd,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/health/assess", methods=["POST"])
+    def api_health_assess():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        ctx = (data.get("context") or "").strip()
+        try:
+            r = angel_medical.get_personalized_health_assessment(
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/health/interactions", methods=["POST"])
+    def api_health_interactions():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        meds = data.get("medications") or []
+        sups = data.get("supplements") or []
+        ctx = (data.get("context") or "").strip()
+        if not isinstance(meds, list):
+            meds = []
+        if not isinstance(sups, list):
+            sups = []
+        try:
+            r = angel_medical.check_drug_interactions(
+                meds,
+                sups,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/health/recommendations", methods=["POST"])
+    def api_health_recommendations():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        goal = (data.get("goal") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        try:
+            r = angel_medical.get_personalized_recommendations(
+                goal,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/health/status", methods=["GET"])
+    def api_health_status():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            r = angel_medical.get_profile_completeness(
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/health/wearable", methods=["POST"])
+    def api_health_wearable():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        device = (data.get("device") or "").strip()
+        metrics = data.get("metrics")
+        if not device:
+            return jsonify({"ok": False, "error": "device required"}), 400
+        if not isinstance(metrics, dict):
+            return jsonify({"ok": False, "error": "metrics object required"}), 400
+        try:
+            r = angel_medical.update_wearable_data(
+                device,
+                metrics,
+                anthropic_client=angel.anthropic_client,
                 memory_client=angel.memory_client,
                 user_id=angel.user_id,
                 use_mem0_cloud=angel._use_mem0_cloud,

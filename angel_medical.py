@@ -2519,41 +2519,106 @@ JSON only."""
     return out
 
 
-# --- Personal health (Build 8 preview) ---
+# --- Personal health intelligence (Build 8) ---
 
 
-def update_health_profile(
-    health_data: dict[str, Any],
-    *,
-    memory_client: Any,
-    user_id: str,
-    use_mem0_cloud: bool,
-) -> dict[str, Any]:
-    from angel import CATEGORY_PERSONAL_HEALTH, add_structured_memory
+HEALTH_PROFILE_SCHEMA: dict[str, Any] = {
+    "personal": {
+        "age": None,
+        "sex": None,
+        "height_cm": None,
+        "weight_kg": None,
+        "bmi": None,  # calculated automatically
+        "blood_type": None,
+    },
+    "conditions": [],
+    "medications": [],
+    "allergies": [],
+    "supplements": [],
+    "family_history": [],
+    "fitness": {
+        "activity_level": None,  # sedentary/light/moderate/active/athlete
+        "exercise_types": [],
+        "resting_heart_rate": None,
+        "vo2_max": None,
+        "weekly_exercise_hours": None,
+    },
+    "sleep": {
+        "avg_hours": None,
+        "quality": None,  # poor/fair/good/excellent
+        "issues": [],
+    },
+    "vitals": {
+        "blood_pressure": None,  # "120/80"
+        "resting_hr": None,
+        "blood_glucose": None,
+        "cholesterol": None,
+        "last_updated": None,
+    },
+    "mental_health": {
+        "stress_level": None,  # low/moderate/high/severe
+        "conditions": [],
+        "notes": None,
+    },
+    "goals": [],
+    "wearable_data": {
+        "device": None,
+        "last_sync": None,
+        "recent_metrics": {},
+    },
+    "last_updated": None,
+}
 
-    if not isinstance(health_data, dict):
-        return {"ok": False, "error": "health_data must be an object"}
-    payload = {
-        "updated_at": _now_utc().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "age": health_data.get("age"),
-        "weight": health_data.get("weight"),
-        "conditions": health_data.get("conditions"),
-        "medications": health_data.get("medications"),
-        "allergies": health_data.get("allergies"),
-        "fitness_metrics": health_data.get("fitness_metrics"),
-        "sleep_data": health_data.get("sleep_data"),
-        "notes": health_data.get("notes"),
-    }
-    text = json.dumps({"personal_health_profile": payload}, ensure_ascii=False)
-    ok = add_structured_memory(
-        memory_client,
-        user_id,
-        text,
-        CATEGORY_PERSONAL_HEALTH,
-        person_name=None,
-        use_mem0_cloud=use_mem0_cloud,
-    )
-    return {"ok": bool(ok), "stored_fields": list(payload.keys())}
+
+def _deepcopy_schema(obj: Any) -> Any:
+    return json.loads(json.dumps(obj))
+
+
+def _deep_merge(dst: Any, src: Any) -> Any:
+    if isinstance(dst, dict) and isinstance(src, dict):
+        for k, v in src.items():
+            if k not in dst:
+                dst[k] = v
+                continue
+            dst[k] = _deep_merge(dst.get(k), v)
+        return dst
+    if isinstance(dst, list):
+        if src is None:
+            return dst
+        if isinstance(src, list):
+            seen = set()
+            out: list[Any] = []
+            for item in dst + src:
+                if item is None:
+                    continue
+                s = str(item).strip()
+                if not s:
+                    continue
+                key = s.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(item)
+            return out
+        if isinstance(src, str) and src.strip():
+            return _deep_merge(dst, [src.strip()])
+        return dst
+    return src if src is not None else dst
+
+
+def _calc_bmi(height_cm: Any, weight_kg: Any) -> float | None:
+    try:
+        h = float(height_cm)
+        w = float(weight_kg)
+        if h <= 0 or w <= 0:
+            return None
+        hm = h / 100.0
+        bmi = w / (hm * hm)
+        if bmi < 8 or bmi > 90:
+            return None
+        return round(bmi, 1)
+    except Exception:
+        return None
 
 
 def _load_latest_health_profile(memory_client: Any, user_id: str, use_mem0_cloud: bool) -> dict[str, Any] | None:
@@ -2578,11 +2643,411 @@ def _load_latest_health_profile(memory_client: Any, user_id: str, use_mem0_cloud
         prof = obj.get("personal_health_profile")
         if not isinstance(prof, dict):
             continue
-        ts = str(prof.get("updated_at") or "")
+        ts = str(prof.get("last_updated") or prof.get("updated_at") or "")
         if ts >= best_ts:
             best_ts = ts
             best = prof
     return best
+
+
+def get_health_profile(
+    *,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+) -> dict[str, Any]:
+    current = _load_latest_health_profile(memory_client, user_id, use_mem0_cloud) or {}
+    prof = _deepcopy_schema(HEALTH_PROFILE_SCHEMA)
+    prof = _deep_merge(prof, current)
+    personal = prof.get("personal") if isinstance(prof.get("personal"), dict) else {}
+    bmi = _calc_bmi(personal.get("height_cm"), personal.get("weight_kg"))
+    if isinstance(personal, dict):
+        personal["bmi"] = bmi
+        prof["personal"] = personal
+    if not prof.get("last_updated"):
+        prof["last_updated"] = current.get("last_updated") or current.get("updated_at")
+    return {"ok": True, "profile": prof}
+
+
+def update_health_profile(
+    updates_dict: dict[str, Any],
+    *,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+) -> dict[str, Any]:
+    from angel import CATEGORY_PERSONAL_HEALTH, add_structured_memory
+
+    if not isinstance(updates_dict, dict):
+        return {"ok": False, "error": "updates must be an object"}
+    base = get_health_profile(memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud).get("profile") or _deepcopy_schema(
+        HEALTH_PROFILE_SCHEMA
+    )
+    merged = _deep_merge(base, updates_dict)
+    personal = merged.get("personal") if isinstance(merged.get("personal"), dict) else {}
+    if isinstance(personal, dict):
+        personal["bmi"] = _calc_bmi(personal.get("height_cm"), personal.get("weight_kg"))
+        merged["personal"] = personal
+    merged["last_updated"] = _now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    text = json.dumps({"personal_health_profile": merged}, ensure_ascii=False)
+    ok = add_structured_memory(
+        memory_client,
+        user_id,
+        text,
+        CATEGORY_PERSONAL_HEALTH,
+        person_name=None,
+        use_mem0_cloud=use_mem0_cloud,
+    )
+    return {"ok": bool(ok), "profile": merged}
+
+
+def extract_health_info_from_conversation(
+    message: str,
+    *,
+    anthropic_client: Any,
+) -> dict[str, Any]:
+    msg = (message or "").strip()
+    if len(msg) < 8:
+        return {"ok": True, "confidence": "LOW", "extracted": {}, "urgent": False}
+
+    system = """You extract personal health profile updates from Tyler's message. Output ONE JSON:
+- confidence (LOW|MEDIUM|HIGH)
+- urgent (boolean)
+- urgent_reason (string; empty if not urgent)
+- updates (object; must conform to this schema shape):
+  personal {age, sex, height_cm, weight_kg, blood_type}
+  conditions[], medications[], allergies[], supplements[], family_history[], goals[]
+  fitness {activity_level, exercise_types[], resting_heart_rate, vo2_max, weekly_exercise_hours}
+  sleep {avg_hours, quality, issues[]}
+  vitals {blood_pressure, resting_hr, blood_glucose, cholesterol, last_updated}
+  mental_health {stress_level, conditions[], notes}
+  wearable_data {device, last_sync, recent_metrics}
+Rules:
+- Only extract facts explicitly stated by Tyler (no guessing).
+- Convert pounds->kg, feet/inches->cm when stated. Use numbers for numeric fields.
+- If the message contains serious symptoms (e.g., chest pain, shortness of breath, fainting, severe headache, neurological deficits, suicidal ideation), set urgent=true and urgent_reason.
+JSON only."""
+
+    parsed = _claude_medical_json(anthropic_client, system, msg[:12000])
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    conf = str(data.get("confidence") or "LOW").upper()
+    if conf not in ("LOW", "MEDIUM", "HIGH"):
+        conf = "LOW"
+    urgent = bool(data.get("urgent"))
+    updates = data.get("updates") if isinstance(data.get("updates"), dict) else {}
+    return {
+        "ok": parsed.get("ok", False),
+        "confidence": conf,
+        "urgent": urgent,
+        "urgent_reason": str(data.get("urgent_reason") or ""),
+        "extracted": updates,
+        "error": parsed.get("error"),
+    }
+
+
+def check_drug_interactions(
+    medications: list[str],
+    supplements: list[str],
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+) -> dict[str, Any]:
+    meds = [str(m).strip() for m in (medications or []) if str(m).strip()]
+    sups = [str(s).strip() for s in (supplements or []) if str(s).strip()]
+    ctx = (context or "").strip()
+    if not meds and not sups:
+        return {"ok": True, "mode": "drug_interactions", "analysis": {"summary": "No medications/supplements provided."}}
+
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+    labels: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        lfuts = {m: ex.submit(get_drug_label, m) for m in meds[:10]}
+        q = " AND ".join((meds + sups)[:6])
+        fpub = ex.submit(search_pubmed, f"{q} interaction contraindication CYP serotonin QT bleeding", 10, **mem_kw)
+        for m, fut in lfuts.items():
+            try:
+                labels[m] = fut.result(timeout=55)
+            except Exception as e:
+                labels[m] = {"error": str(e)}
+        try:
+            pub = fpub.result(timeout=70)
+        except Exception as e:
+            pub = {"error": str(e)}
+
+    blob = json.dumps({"medications": meds, "supplements": sups, "labels": labels, "pubmed": pub, "context": ctx}, ensure_ascii=False, indent=2)[:90000]
+    system = """Drug interaction analyst. Using ONLY the JSON bundle, output ONE JSON:
+- dangerous_combinations (array of strings)
+- moderate_interactions (array of strings)
+- supplement_cautions (array of strings)
+- label_based_warnings (string)
+- monitoring_notes (string; conceptual)
+- limitations (string; open sources; not prescribing)
+JSON only."""
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    return {
+        "ok": parsed.get("ok", False),
+        "mode": "drug_interactions",
+        "medications": meds,
+        "supplements": sups,
+        "analysis": parsed.get("data") if isinstance(parsed.get("data"), dict) else {},
+        "error": parsed.get("error"),
+    }
+
+
+def get_personalized_health_assessment(
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+) -> dict[str, Any]:
+    prof = get_health_profile(memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud).get("profile") or {}
+    meds = prof.get("medications") if isinstance(prof.get("medications"), list) else []
+    sups = prof.get("supplements") if isinstance(prof.get("supplements"), list) else []
+    conds = prof.get("conditions") if isinstance(prof.get("conditions"), list) else []
+
+    interactions = check_drug_interactions(
+        [str(x) for x in meds],
+        [str(x) for x in sups],
+        context,
+        anthropic_client=anthropic_client,
+        memory_client=memory_client,
+        user_id=user_id,
+        use_mem0_cloud=use_mem0_cloud,
+    )
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+    pub = {"articles": []}
+    if conds:
+        pub = search_pubmed(f"{conds[0]} guideline lifestyle risk factors", 6, **mem_kw)
+
+    brief = _health_profile_brief(prof)
+    blob = json.dumps(
+        {"profile_brief": brief, "context": context, "conditions": conds[:12], "pubmed": pub, "interactions": interactions},
+        ensure_ascii=False,
+        indent=2,
+    )[:90000]
+    system = """Personal health intelligence analyst. Using ONLY the JSON, output ONE JSON:
+- profile_brief (string)
+- key_risks (array of strings)
+- medication_and_supplement_flags (string)
+- fitness_sleep_mission_impact (string)
+- gaps_in_profile (array of strings; what would improve personalization)
+- recommendations_next_steps (array of strings; questions for clinician, monitoring ideas; not prescriptions)
+- urgent_seek_care_if (string)
+- limitations (string; not medical advice)
+JSON only."""
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    return {
+        "ok": parsed.get("ok", False),
+        "mode": "personal_health_assessment",
+        "profile_brief": brief,
+        "analysis": parsed.get("data") if isinstance(parsed.get("data"), dict) else {},
+        "interactions": interactions,
+        "error": parsed.get("error"),
+    }
+
+
+def get_personalized_recommendations(
+    goal: str,
+    context: str,
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+) -> dict[str, Any]:
+    g = (goal or "").strip()
+    ctx = (context or "").strip()
+    qgoal = g or (ctx[:160] if ctx else "")
+    prof = get_health_profile(memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud).get("profile") or {}
+    brief = _health_profile_brief(prof)
+    mem_kw = {"memory_client": memory_client, "user_id": user_id, "use_mem0_cloud": use_mem0_cloud}
+    pub = (
+        search_pubmed(f"{qgoal} intervention randomized trial guideline", 8, **mem_kw)
+        if qgoal
+        else {"ok": True, "articles": []}
+    )
+    blob = json.dumps({"goal": g, "context": ctx, "profile_brief": brief, "pubmed": pub}, ensure_ascii=False, indent=2)[:90000]
+    system = """You provide personalized, evidence-aware recommendations. Using ONLY the JSON:
+- recommendations (array of strings)
+- evidence_quality (ESTABLISHED|EMERGING|EXPERIMENTAL|THEORETICAL)
+- safety_notes (string)
+- questions_for_clinician (array of strings)
+- limitations (string; not medical advice)
+JSON only."""
+    parsed = _claude_medical_json(anthropic_client, system, blob)
+    return {
+        "ok": parsed.get("ok", False),
+        "mode": "personal_recommendations",
+        "goal": g,
+        "profile_brief": brief,
+        "analysis": parsed.get("data") if isinstance(parsed.get("data"), dict) else {},
+        "error": parsed.get("error"),
+    }
+
+
+def update_wearable_data(
+    device: str,
+    metrics: dict[str, Any],
+    *,
+    anthropic_client: Any,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+) -> dict[str, Any]:
+    dev = (device or "").strip().lower()
+    if dev not in ("apple_watch", "fitbit", "garmin"):
+        dev = "unknown"
+    met = metrics if isinstance(metrics, dict) else {}
+    upd = {
+        "wearable_data": {
+            "device": dev,
+            "last_sync": _now_utc().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "recent_metrics": met,
+        }
+    }
+    u = update_health_profile(upd, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
+    alerts: list[str] = []
+    try:
+        hr = met.get("heart_rate")
+        spo2 = met.get("spo2")
+        if isinstance(hr, (int, float)) and (hr < 35 or hr > 140):
+            alerts.append(f"concerning_heart_rate:{hr}")
+        if isinstance(spo2, (int, float)) and spo2 < 90:
+            alerts.append(f"low_spo2:{spo2}")
+    except Exception:
+        pass
+    assess = None
+    if alerts:
+        assess = get_personalized_health_assessment(
+            "Wearable metrics triggered alerts: " + ", ".join(alerts),
+            anthropic_client=anthropic_client,
+            memory_client=memory_client,
+            user_id=user_id,
+            use_mem0_cloud=use_mem0_cloud,
+        )
+    return {"ok": True, "profile": u.get("profile"), "alerts": alerts, "assessment": assess}
+
+
+def _health_profile_brief(profile: dict[str, Any]) -> str:
+    if not isinstance(profile, dict):
+        return "(no profile)"
+    p = profile.get("personal") if isinstance(profile.get("personal"), dict) else {}
+    bits: list[str] = []
+    if p.get("age"):
+        bits.append(f"age:{p.get('age')}")
+    if p.get("sex"):
+        bits.append(f"sex:{p.get('sex')}")
+    if p.get("bmi"):
+        bits.append(f"bmi:{p.get('bmi')}")
+    conds = profile.get("conditions") if isinstance(profile.get("conditions"), list) else []
+    meds = profile.get("medications") if isinstance(profile.get("medications"), list) else []
+    alls = profile.get("allergies") if isinstance(profile.get("allergies"), list) else []
+    if conds:
+        bits.append("conditions:" + ", ".join(str(x) for x in conds[:6]))
+    if meds:
+        bits.append("meds:" + ", ".join(str(x) for x in meds[:6]))
+    if alls:
+        bits.append("allergies:" + ", ".join(str(x) for x in alls[:6]))
+    fit = profile.get("fitness") if isinstance(profile.get("fitness"), dict) else {}
+    if fit.get("activity_level"):
+        bits.append(f"activity:{fit.get('activity_level')}")
+    sl = profile.get("sleep") if isinstance(profile.get("sleep"), dict) else {}
+    if sl.get("avg_hours"):
+        bits.append(f"sleep_hours:{sl.get('avg_hours')}")
+    return "; ".join(bits)[:600]
+
+
+def get_profile_completeness(
+    *,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+) -> dict[str, Any]:
+    prof = get_health_profile(memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud).get("profile") or {}
+
+    def _filled(v: Any) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, str):
+            return bool(v.strip())
+        if isinstance(v, list):
+            return any(_filled(x) for x in v)
+        if isinstance(v, dict):
+            return any(_filled(x) for x in v.values())
+        return True
+
+    sections = {
+        "personal": prof.get("personal"),
+        "conditions": prof.get("conditions"),
+        "medications": prof.get("medications"),
+        "allergies": prof.get("allergies"),
+        "supplements": prof.get("supplements"),
+        "family_history": prof.get("family_history"),
+        "fitness": prof.get("fitness"),
+        "sleep": prof.get("sleep"),
+        "vitals": prof.get("vitals"),
+        "mental_health": prof.get("mental_health"),
+        "goals": prof.get("goals"),
+        "wearable_data": prof.get("wearable_data"),
+    }
+    status: dict[str, str] = {}
+    filled_count = 0.0
+    for k, v in sections.items():
+        if not _filled(v):
+            status[k] = "empty"
+            continue
+        if isinstance(v, dict):
+            sub = list(v.values())
+            sub_filled = sum(1 for x in sub if _filled(x))
+            if sub_filled >= max(1, int(0.6 * len(sub))):
+                status[k] = "filled"
+                filled_count += 1.0
+            else:
+                status[k] = "partial"
+                filled_count += 0.5
+        else:
+            status[k] = "filled"
+            filled_count += 1.0
+    pct = int(round(100.0 * filled_count / max(1.0, float(len(sections)))))
+    suggestions: list[str] = []
+    if status.get("personal") != "filled":
+        suggestions.append("personal: age/sex/height/weight")
+    if status.get("medications") == "empty":
+        suggestions.append("medications (including dose/route if possible)")
+    if status.get("conditions") == "empty":
+        suggestions.append("diagnosed conditions")
+    if status.get("allergies") == "empty":
+        suggestions.append("allergies")
+    if status.get("fitness") == "empty":
+        suggestions.append("fitness baseline (activity level, weekly hours)")
+    if status.get("sleep") == "empty":
+        suggestions.append("sleep baseline")
+    return {"ok": True, "completeness_percent": pct, "sections": status, "top_improvements": suggestions[:6]}
+
+
+def format_health_context_for_medical_prompt(
+    *,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+) -> str:
+    prof = get_health_profile(memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud).get("profile") or {}
+    brief = _health_profile_brief(prof)
+    if not brief or brief == "(no profile)" or len(brief) < 8:
+        return ""
+    return (
+        "\n\n[Private operator health context — personalize answers only; do not recite the full profile; "
+        "never include in exports; category `personal_health` is excluded from memory digests and briefings.]\n"
+        f"Tyler's health context (brief): {brief}\n"
+        "When medications, supplements, or treatments are discussed, cross-check against his known "
+        "medications/allergies/conditions and flag plausible conflicts (open-source reasoning only; not prescribing)."
+    )
 
 
 def get_health_recommendations(
@@ -2593,37 +3058,17 @@ def get_health_recommendations(
     user_id: str,
     use_mem0_cloud: bool,
 ) -> dict[str, Any]:
-    prof = _load_latest_health_profile(memory_client, user_id, use_mem0_cloud)
-    if not prof:
-        return {"ok": False, "error": "no_health_profile", "hint": "POST /api/medical/health-profile first"}
-
-    conditions = prof.get("conditions")
-    cond_q = ""
-    if isinstance(conditions, list) and conditions:
-        cond_q = str(conditions[0])
-    elif isinstance(conditions, str):
-        cond_q = conditions
-
-    pub = {"articles": []}
-    if cond_q:
-        pub = search_pubmed(f"{cond_q} patient education OR guideline", max_results=5, memory_client=memory_client, user_id=user_id, use_mem0_cloud=use_mem0_cloud)
-
-    blob = json.dumps({"profile": prof, "context": context, "pubmed": pub}, ensure_ascii=False, indent=2)[:80000]
-    system = """You are Angel. Using the stored health profile and optional PubMed snippets, produce ONE JSON:
-- personalized_recommendations (string: lifestyle, questions for their clinician, monitoring ideas — not prescriptions)
-- research_highlights (string)
-- evidence_quality (ESTABLISHED|EMERGING|EXPERIMENTAL|THEORETICAL)
-- urgent_seek_care_if (string: red-flag symptoms to watch, generic)
-- limitations (string: not a doctor; Tyler must consult licensed professionals)
-JSON only."""
-
-    parsed = _claude_medical_json(anthropic_client, system, blob)
-    return {
-        "ok": parsed.get("ok", False),
-        "profile_snapshot": {k: prof.get(k) for k in ("age", "conditions", "medications", "allergies")},
-        "analysis": parsed.get("data") if isinstance(parsed.get("data"), dict) else {},
-        "error": parsed.get("error"),
-    }
+    """Backward-compatible name; delegates to :func:`get_personalized_recommendations`."""
+    ctx = (context or "").strip()
+    g = ctx[:220] if ctx else "general health"
+    return get_personalized_recommendations(
+        g,
+        ctx,
+        anthropic_client=anthropic_client,
+        memory_client=memory_client,
+        user_id=user_id,
+        use_mem0_cloud=use_mem0_cloud,
+    )
 
 
 # --- Intent + prompt block ---
