@@ -40,6 +40,7 @@ import angel_research
 import angel_physics
 import angel_cad
 import angel_ironman
+import angel_capability_graph
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -4905,6 +4906,58 @@ def create_app() -> Flask:
                 design, dom, specs, user_id=angel.user_id
             )
             return jsonify({"ok": True, "design": design, "domain": dom, "cad": r})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Capability Graph ---
+    @app.route("/api/capabilities/graph", methods=["GET"])
+    def api_capabilities_graph():
+        try:
+            return jsonify(angel_capability_graph.get_graph_as_json())
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/capabilities/chain", methods=["POST"])
+    def api_capabilities_chain():
+        data = request.get_json(silent=True) or {}
+        cap = (data.get("capability") or "").strip()
+        if not cap:
+            return jsonify({"ok": False, "error": "capability required"}), 400
+        try:
+            return jsonify(angel_capability_graph.get_capability_chain(cap))
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/capabilities/analyze", methods=["POST"])
+    def api_capabilities_analyze():
+        global angel
+        data = request.get_json(silent=True) or {}
+        msg = (data.get("message") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        text = (msg + "\n\n" + ctx).strip()
+        if not text:
+            return jsonify({"ok": False, "error": "message or context required"}), 400
+        try:
+            if angel is not None:
+                out = angel_capability_graph.find_optimal_combination(
+                    text, anthropic_client=angel.anthropic_client
+                )
+            else:
+                out = angel_capability_graph.find_optimal_combination(text, anthropic_client=None)
+            rec = angel_capability_graph.recognize_capability_combinations(text)
+            sug = angel_capability_graph.suggest_capability_combinations(text)
+            return jsonify({"ok": True, "recognition": rec, "optimal": out, "suggestion": sug})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/capabilities/combinations", methods=["GET"])
+    def api_capabilities_combinations():
+        try:
+            return jsonify({"ok": True, "combinations": angel_capability_graph.KNOWN_HIGH_VALUE_COMBINATIONS})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500

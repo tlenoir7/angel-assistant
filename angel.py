@@ -6445,6 +6445,14 @@ class AngelCore:
             intelligence_files_summary=self.files_cabinet.get_summary(),
         )
         try:
+            import angel_capability_graph as acg
+
+            cap_block = acg.build_capability_context_for_prompt(user_message)
+            if cap_block.strip():
+                system_prompt += "\n\n" + cap_block.strip()
+        except Exception:
+            pass
+        try:
             import angel_self_modification as _angel_self_mod2
 
             _pend = _angel_self_mod2.consume_pending_proposal_notification()
