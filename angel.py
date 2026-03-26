@@ -96,6 +96,8 @@ CATEGORY_RESEARCH_CACHE = "research_cache"
 CATEGORY_MEDICAL_CACHE = "medical_cache"
 # Tyler health profile (Build 8 preview; excluded from routine memory summaries)
 CATEGORY_PERSONAL_HEALTH = "personal_health"
+# Theoretical suit design target files (Iron Man / Batman Beyond roadmap; excluded from memory digests)
+CATEGORY_SUIT_TARGETS = "suit_targets"
 # Stage 6 — self-observation & self-modification (excluded from routine memory digests)
 CATEGORY_SELF_OBSERVATION = "self_observation"
 CATEGORY_SELF_MODIFICATION = "self_modification"
@@ -125,6 +127,7 @@ _STRUCTURED_MEMORY_CATEGORIES = frozenset(
         CATEGORY_RESEARCH_CACHE,
         CATEGORY_MEDICAL_CACHE,
         CATEGORY_PERSONAL_HEALTH,
+        CATEGORY_SUIT_TARGETS,
         CATEGORY_SELF_OBSERVATION,
         CATEGORY_SELF_MODIFICATION,
     }
@@ -1633,6 +1636,7 @@ def summarize_memories_for_prompt(memories) -> str:
             CATEGORY_RESEARCH_CACHE,
             CATEGORY_MEDICAL_CACHE,
             CATEGORY_PERSONAL_HEALTH,
+            CATEGORY_SUIT_TARGETS,
             CATEGORY_SELF_OBSERVATION,
             CATEGORY_SELF_MODIFICATION,
         ):
@@ -1782,6 +1786,8 @@ def build_memory_summary_with_sections(
         if cat == CATEGORY_MEDICAL_CACHE:
             continue
         if cat == CATEGORY_PERSONAL_HEALTH:
+            continue
+        if cat == CATEGORY_SUIT_TARGETS:
             continue
         if cat == CATEGORY_SELF_OBSERVATION:
             continue
@@ -2416,6 +2422,7 @@ IMPORTANT: This is your current state as of today. You have already been built w
 - **Theoretical research agent** (Engineering track — Build 1): you query **real** technical corpora on demand—**ArXiv** (preprints), **NASA NTRS** (technical reports), **DARPA / DTIC** (program and defense technical literature via **Tavily** `site:` search—there is no public DARPA API), and **US patents** via **PatentsView PatentSearch** when `PATENTSVIEW_API_KEY` is set, otherwise **Tavily** on **patents.google.com**. ArXiv search results are cached in Mem0 as category `research_cache` (7-day TTL). You synthesize findings into TRL estimates, gaps, mission relevance, and recommended follow-ups; when relevance is **HIGH** or **CRITICAL** you auto-file under Intelligence folder `Research Intelligence` as `RES-YYYYMMDD-*`, with cross-references to **Chemistry Intelligence** and **OSINT Dossiers** when filenames or tags overlap. Chat triggers include papers, studies, NASA/DARPA/patent wording, state of the art, and engineering questions with literature intent. APIs: `POST /api/research/query`, `/api/research/paper`, `/api/research/patent`, `GET /api/research/status`.
 - **Physics simulation engine** (Engineering track — Build 2): you run **numerical** models—not just prose—for propulsion/thrust, EM fields, structures/materials (with optional **Materials Project** hooks via chemistry), orbital mechanics (**astropy**), energy budgets, and a **THEORETICAL** lane (Casimir, warp-style energy scaling, plasma beta toy model, labeled speculative effects). Natural-language questions with engineering numbers trigger **parameter extraction** plus simulation; you present **feasibility** prominently (**FEASIBLE / MARGINAL / INFEASIBLE / THEORETICAL**), assumptions, and offers to rerun with new inputs. When **mission_relevance** is **CRITICAL**, results auto-file under Intelligence folder `Physics Simulations` as `PHYS-YYYYMMDD-*` with cross-refs to **Research Intelligence** and **Chemistry Intelligence**. APIs: `POST /api/physics/simulate`, `/api/physics/extract-params`, `/api/physics/natural`, `GET /api/physics/status`.
 - **CAD generation** (Engineering track — Build 3): you produce **downloadable** geometry (**STEP**, **STL**, **IGES** when the stack allows) using **cadquery** (preferred headless path on Linux/Railway) or **FreeCAD** Python for basic primitives when installed. Generators include boxes, cylinders, spheres, cones, toruses, **NACA 4-digit** airfoils, fuselage/nozzle/pressure-vessel/disc/lenticular shapes, and **assemblies**. Claude can turn a **design brief** into a build plan; when Tyler also ran a **physics simulation** in the same turn, sizing may use those constraints. Outputs live under the server temp `angel_cad` tree; **HIGH/CRITICAL** mission relevance can auto-file a summary under Intelligence folder `Engineering Designs`. APIs: `POST /api/cad/generate`, `/api/cad/from-brief`, `GET /api/cad/download/...`, `/api/cad/list`, `/api/cad/status`.
+- **Theoretical Suit Design Targets** (Engineering synthesis): you maintain a living roadmap toward two suit archetypes — **Design A (Iron Man: maximum power/capability)** and **Design B (Batman Beyond: stealth/agility/augmentation)** — broken into domains (power/propulsion/structure/flight/AI/biomedical vs stealth/adaptive structure/augmentation/AI/sensors/mobility). Each domain stores measurable requirements, current best TRL, gap analysis, research vectors, limiting physics, and “what would need to be true” breakthroughs. Stored in Mem0 as category `suit_targets` and **excluded from routine memory summaries/digests**. APIs: `GET /api/suit/status`, `POST /api/suit/research`, `GET /api/suit/domain/<domain>`, `POST /api/suit/roadmap`.
 - **Historical Intelligence Archives** (Batcomputer): searchable **timeline** of incidents, programs, documents, testimony, and turning points — cross-referenced with `connected_people`, programs, and locations. Stored as category `historical_record` and files `HIST-{{record_id}}` under `Historical Archives`. You connect **current** figures and programs to **prior** events (e.g. Elizondo ↔ AATIP), note when patterns **repeat**, and distinguish documented/declassified material from **contested** claims. Morning briefing may include **on-this-day** / anniversary hooks. OSINT dossiers can surface `historical_archive_links`. APIs under `/api/archives/`.
 - **Stage 6 — Self-modification (living system)**: You observe how Tyler interacts with you (category `self_observation`, excluded from routine memory summaries). On a schedule you analyze those observations and may propose **permanent** improvements to your behavior (category `self_modification`; mirrored under Intelligence folder `Self Modifications` as `MOD-{{id}}`). **Tyler must approve every change** — nothing is applied without his explicit approval. Approved instructions are merged into your system prompt via `angel_self_mods` on the server. You never weaken safety, never remove capabilities, and never bypass approval. You can mention evolution naturally; when a behavior reflects an approved modification, you may acknowledge it briefly. APIs under `/api/selfmod/`.
 - **Parallel multi-agent coordination**: For deep, multi-angle requests (e.g. comprehensive briefing, thorough research, “everything you know about X”), you can run **several specialist agents in parallel** (OSINT, **external** threat-intel angles on the **topic**, network mapping, history, patterns, etc.) with Tavily-backed context, then **synthesize** one coherent report. Specialist agents assess **open-source intelligence about the subject**—they do **not** perform “incoming user message” threat or social-engineering reviews. This is faster than sequential deep research. When you use it, say so briefly (e.g. that you ran parallel specialized analysis) and note the time advantage when helpful. APIs: `POST /api/agents/run`, `POST /api/agents/research`, `GET /api/agents/status/<task_id>`.
@@ -6350,6 +6357,14 @@ class AngelCore:
         except Exception:
             bio_cmd, bio_payload = None, {}
 
+        suit_cmd, suit_payload = None, {}
+        try:
+            import angel_ironman as asuit
+
+            suit_cmd, suit_payload = asuit.detect_suit_chat_intent(user_message)
+        except Exception:
+            suit_cmd, suit_payload = None, {}
+
         med_cmd, med_payload = None, {}
         try:
             import angel_medical as amed
@@ -6542,6 +6557,14 @@ class AngelCore:
                 "\n\nTyler's message relates to **biological / medical intelligence** (UAP-adjacent health patterns, exposure indicators, witness narratives — including the black-eyed people profile when relevant). "
                 "If a block labeled [Angel biological intelligence …] appears, integrate it with care: this is **not** a clinical diagnosis; cite uncertainty, mission relevance, and Tyler's personal connection to BEK research when on-topic. "
                 "Encourage professional medical evaluation when appropriate."
+            )
+        if suit_cmd:
+            system_prompt += (
+                "\n\nTyler's message relates to a **theoretical suit engineering roadmap** (Iron Man vs Batman Beyond design philosophies). "
+                "If a block labeled [Angel suit — suit_roadmap] or [Angel suit — suit_domain] appears, translate the JSON into a clear engineering brief: "
+                "state current best TRL, the gap vs requirements, top research vectors with who/where, and the most actionable next steps. "
+                "Be explicit about limiting physics, feasibility, and what would need to be true for breakthroughs. "
+                "Do not claim we can build weapons; keep it conceptual and research-focused."
             )
         if med_cmd:
             system_prompt += (
@@ -6768,6 +6791,7 @@ If you infer anything new about that person's preferences or dynamics, append at
         _operator_trusted = is_trusted_operator(self.user_id)
         _skip_parallel_agents = bool(
             cad_cmd
+            or bool(suit_cmd)
             or bool(med_cmd)
             or (
                 _operator_trusted
@@ -7090,6 +7114,24 @@ If you infer anything new about that person's preferences or dynamics, append at
                 )
                 if bblock.strip():
                     augmented_user_message = f"{augmented_user_message}\n\n{bblock}"
+            except Exception:
+                pass
+
+        if suit_cmd:
+            try:
+                import angel_ironman as asuit
+
+                sres = asuit.run_suit_intent_for_chat(
+                    suit_cmd,
+                    suit_payload,
+                    anthropic_client=self.anthropic_client,
+                    memory_client=self.memory_client,
+                    user_id=self.user_id,
+                    use_mem0_cloud=self._use_mem0_cloud,
+                )
+                sblock = asuit.format_suit_block_for_prompt(sres if isinstance(sres, dict) else {"ok": False, "error": "suit intent failed"})
+                if sblock.strip():
+                    augmented_user_message = f"{augmented_user_message}\n\n{sblock}"
             except Exception:
                 pass
 

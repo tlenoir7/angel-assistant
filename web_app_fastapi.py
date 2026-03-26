@@ -39,6 +39,7 @@ import angel_medical
 import angel_research
 import angel_physics
 import angel_cad
+import angel_ironman
 
 # AngelCore includes Stage 2: strategy, patterns, deep research, people profiles
 from angel import (
@@ -4767,6 +4768,143 @@ def create_app() -> Flask:
     def api_cad_status():
         try:
             return jsonify({"ok": True, **angel_cad.get_cad_status()})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    # --- Theoretical Suit Design Targets (Iron Man / Batman Beyond) ---
+    @app.route("/api/ironman/status", methods=["GET"])
+    def api_ironman_status():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            rows = []
+            for dom in angel_ironman.ALL_DOMAINS:
+                tgt = angel_ironman.get_domain_target(
+                    dom,
+                    memory_client=angel.memory_client,
+                    user_id=angel.user_id,
+                    use_mem0_cloud=angel._use_mem0_cloud,
+                ).get("target") or {}
+                cb = tgt.get("current_best") if isinstance(tgt.get("current_best"), dict) else {}
+                rows.append(
+                    {
+                        "domain": dom,
+                        "design_philosophy": tgt.get("design_philosophy"),
+                        "target_name": tgt.get("target_name"),
+                        "trl": cb.get("trl"),
+                        "gap_ratio": cb.get("gap_ratio"),
+                        "mission_relevance": tgt.get("mission_relevance"),
+                        "last_researched": tgt.get("last_researched"),
+                    }
+                )
+            return jsonify({"ok": True, "domains": rows})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/ironman/domain", methods=["POST"])
+    def api_ironman_domain():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        dom = (data.get("domain") or "").strip()
+        ctx = (data.get("context") or "").strip()
+        if not dom:
+            return jsonify({"ok": False, "error": "domain required"}), 400
+        try:
+            r = angel_ironman.research_domain(
+                dom,
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/ironman/assess", methods=["POST"])
+    def api_ironman_assess():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        design = (data.get("design") or "both").strip().lower()
+        ctx = (data.get("context") or "").strip()
+        try:
+            if design == "iron_man":
+                r = angel_ironman.run_full_ironman_assessment(
+                    ctx,
+                    anthropic_client=angel.anthropic_client,
+                    memory_client=angel.memory_client,
+                    user_id=angel.user_id,
+                    use_mem0_cloud=angel._use_mem0_cloud,
+                    files_cabinet=angel.files_cabinet,
+                )
+                return jsonify(r)
+            if design == "batman_beyond":
+                r = angel_ironman.run_full_batman_beyond_assessment(
+                    ctx,
+                    anthropic_client=angel.anthropic_client,
+                    memory_client=angel.memory_client,
+                    user_id=angel.user_id,
+                    use_mem0_cloud=angel._use_mem0_cloud,
+                    files_cabinet=angel.files_cabinet,
+                )
+                return jsonify(r)
+            r = angel_ironman.run_full_suit_assessment(
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+                files_cabinet=angel.files_cabinet,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/ironman/convergence", methods=["POST"])
+    def api_ironman_convergence():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        ctx = (data.get("context") or "").strip()
+        try:
+            r = angel_ironman.analyze_suit_convergence(
+                ctx,
+                anthropic_client=angel.anthropic_client,
+                memory_client=angel.memory_client,
+                user_id=angel.user_id,
+                use_mem0_cloud=angel._use_mem0_cloud,
+            )
+            return jsonify(r)
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/ironman/cad", methods=["POST"])
+    def api_ironman_cad():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        data = request.get_json(silent=True) or {}
+        design = (data.get("design") or "").strip().lower()
+        dom = (data.get("domain") or "").strip()
+        specs = data.get("specs") or {}
+        if design not in ("iron_man", "batman_beyond"):
+            return jsonify({"ok": False, "error": "design must be iron_man or batman_beyond"}), 400
+        if not dom:
+            return jsonify({"ok": False, "error": "domain required"}), 400
+        if not isinstance(specs, dict):
+            return jsonify({"ok": False, "error": "specs object required"}), 400
+        try:
+            r = angel_ironman.generate_suit_cad_component(
+                design, dom, specs, user_id=angel.user_id
+            )
+            return jsonify({"ok": True, "design": design, "domain": dom, "cad": r})
         except Exception as e:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
