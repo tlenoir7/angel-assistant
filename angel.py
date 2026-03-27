@@ -18,6 +18,7 @@ import wave
 
 _mission_graph_log = logging.getLogger(__name__)
 _mem0_log = logging.getLogger(__name__)
+_log = logging.getLogger(__name__)
 
 
 def _verbose_stdio() -> bool:
@@ -56,7 +57,14 @@ except ImportError:
     _WhisperModel = None
 
 BASE_DIR = Path(__file__).resolve().parent
-LOCAL_MEMORY_FILE = BASE_DIR / "tyler_memories.json"
+USE_MEM0_CLOUD = os.environ.get(
+    "DISABLE_MEM0_CLOUD", ""
+).lower() != "true"
+Path("/app/data").mkdir(parents=True, exist_ok=True)
+LOCAL_MEMORY_FILE = Path(os.environ.get(
+    "ANGEL_MEMORY_PATH",
+    "/app/data/tyler_memories.json"
+))
 # Serialize concurrent read/modify/write of tyler_memories.json (append vs list vs replace).
 _LOCAL_MEMORY_FILE_LOCK = threading.RLock()
 _WHISPER_MODEL = None
@@ -64,6 +72,8 @@ TAVILY_API_URL = "https://api.tavily.com/search"
 MEM0_API_BASE_URL = "https://api.mem0.ai"
 MEM0_READ_TIMEOUT_SEC = 8.0
 MEM0_READ_FAST_FALLBACK_SEC = 2.5
+_log.info("Memory path: %s", LOCAL_MEMORY_FILE)
+_log.info("Mem0 cloud: %s", "enabled" if USE_MEM0_CLOUD else "disabled")
 
 # Stage 2 memory categories
 CATEGORY_PATTERNS = "patterns"
@@ -411,7 +421,7 @@ def build_memory_client() -> Memory:
     Mem0 will use OpenAI embeddings via OPENAI_API_KEY.
     """
     mem0_api_key = os.getenv("MEM0_API_KEY")
-    if mem0_api_key:
+    if USE_MEM0_CLOUD and mem0_api_key:
         # Cloud storage mode
         return Mem0CloudClient(mem0_api_key)  # type: ignore[return-value]
 
@@ -6286,7 +6296,7 @@ class AngelCore:
 
         self.memory_client = build_memory_client()
         self.anthropic_client = create_anthropic_client()
-        self._use_mem0_cloud = bool(os.getenv("MEM0_API_KEY"))
+        self._use_mem0_cloud = USE_MEM0_CLOUD and bool(os.getenv("MEM0_API_KEY"))
         self.files_cabinet = FilesCabinet(
             self.memory_client, self.user_id, self._use_mem0_cloud
         )
@@ -7567,7 +7577,7 @@ def main():
     print(f"{Fore.BLUE}Initializing memory and AI brain...{Style.RESET_ALL}")
     memory_client = build_memory_client()
     anthropic_client = create_anthropic_client()
-    use_mem0_cloud_main = bool(os.getenv("MEM0_API_KEY"))
+    use_mem0_cloud_main = USE_MEM0_CLOUD and bool(os.getenv("MEM0_API_KEY"))
     files_cabinet = FilesCabinet(memory_client, user_id, use_mem0_cloud_main)
 
     # Load existing memories
@@ -7695,7 +7705,7 @@ def main():
                 anthropic_client,
                 memory_client=memory_client,
                 user_id=user_id,
-                use_mem0_cloud=bool(os.getenv("MEM0_API_KEY")),
+                use_mem0_cloud=use_mem0_cloud_main,
             )
             augmented_message = (
                 f"Research briefing (use this to answer):\n{briefing}\n\n"
@@ -7707,7 +7717,7 @@ def main():
                 store_timeline=True,
                 memory_client=memory_client,
                 user_id=user_id,
-                use_mem0_cloud=bool(os.getenv("MEM0_API_KEY")),
+                use_mem0_cloud=use_mem0_cloud_main,
             )
             if web_ctx:
                 print(f"{Fore.BLUE}Angel: let me look that up for you...{Style.RESET_ALL}")
@@ -7725,7 +7735,7 @@ def main():
                 pattern_text,
                 CATEGORY_PATTERNS,
                 person_name=None,
-                use_mem0_cloud=bool(os.getenv("MEM0_API_KEY")),
+                use_mem0_cloud=use_mem0_cloud_main,
             )
         if profile_tuple:
             pname, ptext = profile_tuple
@@ -7735,7 +7745,7 @@ def main():
                 ptext,
                 CATEGORY_PERSON_PROFILE,
                 person_name=pname,
-                use_mem0_cloud=bool(os.getenv("MEM0_API_KEY")),
+                use_mem0_cloud=use_mem0_cloud_main,
             )
         reply = cleaned_reply
 
