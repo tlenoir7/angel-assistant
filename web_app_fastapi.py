@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import os
+import shutil
 import threading
 import time
 from io import BytesIO
@@ -2054,6 +2055,66 @@ def create_app() -> Flask:
     def api_chat():
         """Alias for /api/message (mobile / OpenAI-style clients)."""
         return api_message()
+
+    @app.route("/api/admin/seed-memories", methods=["GET"])
+    def api_admin_seed_memories():
+        bundled = Path("/app/tyler_memories.json")
+        volume = Path("/app/data/tyler_memories.json")
+
+        def _file_status(p: Path) -> dict:
+            return {
+                "path": str(p),
+                "exists": p.exists(),
+                "size_bytes": (p.stat().st_size if p.exists() else 0),
+            }
+
+        def _count_memories(p: Path) -> int:
+            if not p.exists():
+                return 0
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    return len(raw)
+                if isinstance(raw, dict):
+                    users = raw.get("users")
+                    if isinstance(users, dict):
+                        return sum(len(v) for v in users.values() if isinstance(v, list))
+                    memories = raw.get("memories")
+                    if isinstance(memories, list):
+                        return len(memories)
+                return 0
+            except Exception:
+                return 0
+
+        copied = False
+        copied_memory_count = 0
+        reason = "not_needed"
+
+        if bundled.exists():
+            should_copy = (not volume.exists()) or (
+                bundled.stat().st_size > volume.stat().st_size
+            )
+            if should_copy:
+                volume.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(bundled, volume)
+                copied = True
+                copied_memory_count = _count_memories(volume)
+                reason = "copied"
+            else:
+                reason = "volume_up_to_date"
+        else:
+            reason = "bundled_missing"
+
+        return jsonify(
+            {
+                "ok": True,
+                "copied": copied,
+                "copied_memory_count": copied_memory_count,
+                "reason": reason,
+                "bundled": {**_file_status(bundled), "memory_count": _count_memories(bundled)},
+                "volume": {**_file_status(volume), "memory_count": _count_memories(volume)},
+            }
+        )
 
     @app.route("/api/voice", methods=["POST"])
     def api_voice():
