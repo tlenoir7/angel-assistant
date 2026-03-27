@@ -120,11 +120,14 @@ _network_reset_status: dict = {
 }
 
 # Isolated thread pool for /api/files/read so worker threads can time out without blocking the WSGI worker forever.
-_executor = _cf.ThreadPoolExecutor(max_workers=4)
+_executor = _cf.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="file_read",
+)
 
 
 def _do_file_read(file_b64, file_name, file_type, context):
-    # Network diagnostic
+    print("[files-thread] _do_file_read started", flush=True)
     import requests as _req
 
     try:
@@ -133,22 +136,23 @@ def _do_file_read(file_b64, file_name, file_type, context):
     except Exception as e:
         print(f"[files-thread] anthropic.com UNREACHABLE: {e}", flush=True)
 
-    # Create fresh client for thread safety
-    fresh_client = _anthropic.Anthropic(
-        api_key=os.environ.get("ANTHROPIC_API_KEY", "")
-    )
-    return angel_file_reading.read_and_analyze_file(
-        file_b64,
-        file_name,
-        file_type,
-        context,
-        fresh_client,
-        memory_client=angel.memory_client,
-        user_id=angel.user_id,
-        files_cabinet=angel.files_cabinet,
-        use_mem0_cloud=angel._use_mem0_cloud,
-        model="claude-haiku-4-5",
-    )
+    # Simplest possible Claude call
+    print("[files-thread] making simple Claude call", flush=True)
+    try:
+        fresh_client = _anthropic.Anthropic(
+            api_key=os.environ.get("ANTHROPIC_API_KEY", "")
+        )
+        resp = fresh_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=50,
+            messages=[{"role": "user", "content": "Say hello"}],
+            timeout=20.0,
+        )
+        print("[files-thread] Claude call succeeded:", resp.content[0].text[:50], flush=True)
+        return {"ok": True, "summary": "test ok", "extracted_text": "Hello World"}
+    except Exception as e:
+        print("[files-thread] Claude call FAILED:", e, flush=True)
+        return {"ok": False, "error": str(e)}
 
 
 _log = logging.getLogger(__name__)
