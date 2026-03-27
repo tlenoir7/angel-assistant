@@ -603,7 +603,6 @@ def _load_local_memories(user_id: str):
     global _LOCAL_MEMORY_CACHE_USER_VERSION
     global _LOCAL_MEMORY_CACHE_LOADED
     global _LOCAL_MEMORY_CACHE_LAST_MTIME
-    print(f"MEMORY_DEBUG: loading from {LOCAL_MEMORY_FILE}, exists={LOCAL_MEMORY_FILE.exists()}", flush=True)
     try:
         try:
             current_mtime = os.path.getmtime(LOCAL_MEMORY_FILE)
@@ -649,7 +648,6 @@ def _load_local_memories(user_id: str):
             mem_block = data.get("memories", [])
             if isinstance(mem_block, list):
                 total_file_records = len(mem_block)
-        print(f"MEMORY_DEBUG: total_records={total_file_records}", flush=True)
         _log.info("Local memory file total records discovered: %s", total_file_records)
         users = users_block
         if not isinstance(users, dict):
