@@ -133,7 +133,7 @@ def _do_file_read(file_b64, file_name, file_type, context):
         user_id=angel.user_id,
         files_cabinet=angel.files_cabinet,
         use_mem0_cloud=angel._use_mem0_cloud,
-        model="claude-haiku-4-5-20251001",
+        model="claude-haiku-4-5",
     )
 
 

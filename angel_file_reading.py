@@ -478,7 +478,7 @@ def _run_text_analysis(
     kind: str,
     context: str,
     *,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-haiku-4-5",
 ) -> dict[str, Any]:
     ctx = (context or "").strip() or "General document review for Tyler's mission."
     user_block = f"""FILE_NAME: {file_name}
@@ -652,7 +652,7 @@ def read_and_analyze_file(
     user_id: str | None = None,
     files_cabinet: Any | None = None,
     use_mem0_cloud: bool = False,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-haiku-4-5",
     skip_analysis: bool = False,
 ) -> dict[str, Any]:
     """
@@ -913,7 +913,7 @@ def analyze_pasted_text(
     user_id: str | None = None,
     files_cabinet: Any | None = None,
     use_mem0_cloud: bool = False,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-haiku-4-5",
 ) -> dict[str, Any]:
     """Direct analysis of pasted document text (no base64)."""
     result = _run_text_analysis(
