@@ -189,7 +189,13 @@ def _sanitize_transcript(s: str) -> str:
     return s.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
 
 
-async def _cleanup_sid(sid: str, sio: Any, *, emit_ended: bool = False) -> None:
+async def _cleanup_sid(
+    sid: str,
+    sio: Any,
+    *,
+    emit_ended: bool = False,
+    skip_reader_task: bool = False,
+) -> None:
     st = _realtime_sessions.pop(sid, None)
     t = _realtime_tasks.pop(sid, None)
     tt = _realtime_timeout_tasks.pop(sid, None)
@@ -201,7 +207,9 @@ async def _cleanup_sid(sid: str, sio: Any, *, emit_ended: bool = False) -> None:
         except asyncio.CancelledError:
             pass
 
-    if t and not t.done():
+    # When cleanup runs from _reader_loop's finally, the reader task is still running
+    # this coroutine — do not cancel/await it.
+    if t and not t.done() and not skip_reader_task:
         t.cancel()
         try:
             await t
