@@ -434,6 +434,26 @@ def detect_self_mod_intent(
     return None
 
 
+def _format_proposals_markdown(records: list[dict[str, Any]]) -> str:
+    """Full text for Tyler to read and approve/reject in chat."""
+    blocks: list[str] = []
+    for r in records:
+        mid = (r.get("modification_id") or "").strip()
+        title = (r.get("title") or "").strip()
+        conf = (r.get("confidence") or "?").strip()
+        obs = (r.get("observation") or "").strip()
+        prop = (r.get("proposed_change") or "").strip()
+        ctype = (r.get("change_type") or "").strip()
+        blocks.append(
+            f"### {title}\n"
+            f"- **ID:** `{mid}`\n"
+            f"- **Confidence:** {conf} · **Type:** {ctype}\n"
+            f"- **Observation:** {obs}\n"
+            f"- **Proposed change:**\n\n{prop}\n"
+        )
+    return "\n".join(blocks).strip()
+
+
 def handle_self_mod_intent(core: Any, command: str, arg: str, user_message: str) -> str:
     from angel import fetch_combined_memories
     import angel_self_mods as mods
@@ -443,21 +463,20 @@ def handle_self_mod_intent(core: Any, command: str, arg: str, user_message: str)
 
     if command == "list_proposed":
         props = [r for r in records if (r.get("status") or "") == "proposed"]
+        try:
+            props.sort(key=lambda x: str(x.get("created_at") or x.get("updated_at") or ""), reverse=True)
+        except Exception:
+            pass
         if not props:
             return (
                 "There are no pending self-modification proposals right now. "
                 "Say “generate new modification proposals” if you want me to run an analysis pass."
             )
-        lines = []
-        for r in props:
-            lines.append(
-                f"- **{r.get('title', '')}** (`{r.get('modification_id')}`) — "
-                f"{r.get('confidence', '?')} confidence. {r.get('observation', '')[:200]}"
-            )
         return (
             "Here are proposed modifications (Tyler approval required before anything is applied):\n\n"
-            + "\n".join(lines)
-            + "\n\nThis is a suggestion only. You have full control."
+            + _format_proposals_markdown(props)
+            + "\n\nThis is a suggestion only. You have full control. "
+            "Reply with **approve modification <id or title>** or **reject modification <id or title>**."
         )
 
     if command == "list_applied":
@@ -482,9 +501,24 @@ def handle_self_mod_intent(core: Any, command: str, arg: str, user_message: str)
             core._use_mem0_cloud,
         )
         if r.get("ok"):
+            saved = r.get("proposals_saved") or []
+            if not saved:
+                note = (r.get("safety_note") or "").strip()
+                tail = f"\n\n**Safety note:** {note}" if note else ""
+                return (
+                    "Analysis complete. I don’t have new self-modification proposals to save this time "
+                    "(nothing passed safety checks or the model suggested no changes)."
+                    + tail
+                )
+            body = _format_proposals_markdown(saved)
+            sn = (r.get("safety_note") or "").strip()
+            sn_block = f"\n\n**Safety note:** {sn}" if sn else ""
             return (
-                f"Analysis complete. New proposals: {r.get('count', 0)}. "
-                "Ask me to show proposed modifications when you want to review them."
+                f"Analysis complete. Here are **{len(saved)}** new self-modification proposal(s) "
+                "(Tyler approval required before anything is applied):\n\n"
+                + body
+                + sn_block
+                + "\n\nReply with **approve modification <id or title>** or **reject modification <id or title>**."
             )
         return f"I couldn’t complete modification analysis: {r.get('error', 'unknown')}"
 
@@ -633,6 +667,7 @@ If nothing is worth changing, return {"proposals": [], "safety_note": "..."}."""
         proposals = []
 
     n = 0
+    proposals_saved: list[dict[str, Any]] = []
     for p in proposals[:max_proposals]:
         if not isinstance(p, dict):
             continue
@@ -663,6 +698,7 @@ If nothing is worth changing, return {"proposals": [], "safety_note": "..."}."""
         }
         _save_modification_memory(memory_client, user_id, use_mem0_cloud, record)
         mirror_mod_file(files_cabinet, record)
+        proposals_saved.append(dict(record))
         n += 1
 
     if n:
@@ -670,7 +706,12 @@ If nothing is worth changing, return {"proposals": [], "safety_note": "..."}."""
             "I've been observing our interactions and I have a proposed modification to how I operate. Want to review it?"
         )
     print(f"[selfmod] weekly analysis: generated={len(proposals)} saved={n}", flush=True)
-    return {"ok": True, "count": n, "safety_note": data.get("safety_note")}
+    return {
+        "ok": True,
+        "count": n,
+        "safety_note": data.get("safety_note"),
+        "proposals_saved": proposals_saved,
+    }
 
 
 def seed_initial_self_modification(
