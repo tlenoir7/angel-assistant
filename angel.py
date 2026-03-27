@@ -77,6 +77,10 @@ except Exception as e:
     _log.warning("Startup memory seed skipped: %s", e)
 # Serialize concurrent read/modify/write of tyler_memories.json (append vs list vs replace).
 _LOCAL_MEMORY_FILE_LOCK = threading.RLock()
+_LOCAL_MEMORY_CACHE: list | None = None
+_LOCAL_MEMORY_CACHE_MTIME: float = 0.0
+_LOCAL_MEMORY_CACHE_USER_ID: str = ""
+_LOCAL_MEMORY_CACHE_LOCK = threading.RLock()
 _WHISPER_MODEL = None
 TAVILY_API_URL = "https://api.tavily.com/search"
 MEM0_API_BASE_URL = "https://api.mem0.ai"
@@ -468,10 +472,15 @@ _EMPTY_LOCAL_MEMORY_DOC: dict = {"memories": [], "users": {}}
 
 def _write_local_memory_file_silent_impl(data: dict) -> None:
     """Write tyler_memories.json (caller must hold lock)."""
+    global _LOCAL_MEMORY_CACHE, _LOCAL_MEMORY_CACHE_MTIME, _LOCAL_MEMORY_CACHE_USER_ID
     try:
         LOCAL_MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOCAL_MEMORY_FILE.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        with _LOCAL_MEMORY_CACHE_LOCK:
+            _LOCAL_MEMORY_CACHE = None
+            _LOCAL_MEMORY_CACHE_MTIME = 0.0
+            _LOCAL_MEMORY_CACHE_USER_ID = ""
     except Exception:
         pass
 
@@ -556,8 +565,27 @@ def _load_local_memory_file_data() -> dict:
 
 
 def _load_local_memories(user_id: str):
+    global _LOCAL_MEMORY_CACHE, _LOCAL_MEMORY_CACHE_MTIME, _LOCAL_MEMORY_CACHE_USER_ID
     print(f"MEMORY_DEBUG: loading from {LOCAL_MEMORY_FILE}, exists={LOCAL_MEMORY_FILE.exists()}", flush=True)
     try:
+        try:
+            current_mtime = os.path.getmtime(LOCAL_MEMORY_FILE)
+        except OSError:
+            current_mtime = 0.0
+        with _LOCAL_MEMORY_CACHE_LOCK:
+            if (
+                _LOCAL_MEMORY_CACHE is not None
+                and _LOCAL_MEMORY_CACHE_USER_ID == user_id
+                and _LOCAL_MEMORY_CACHE_MTIME == current_mtime
+            ):
+                _log.info(
+                    "Local memory cache hit for user=%r rows=%s mtime=%s",
+                    user_id,
+                    len(_LOCAL_MEMORY_CACHE),
+                    _LOCAL_MEMORY_CACHE_MTIME,
+                )
+                return list(_LOCAL_MEMORY_CACHE)
+
         _log.info(
             "Loading local memories from: %s (exists=%s)",
             LOCAL_MEMORY_FILE,
@@ -621,6 +649,10 @@ def _load_local_memories(user_id: str):
             converted_text_field,
             converted_data_field,
         )
+        with _LOCAL_MEMORY_CACHE_LOCK:
+            _LOCAL_MEMORY_CACHE = list(kept_rows)
+            _LOCAL_MEMORY_CACHE_MTIME = current_mtime
+            _LOCAL_MEMORY_CACHE_USER_ID = user_id
         return kept_rows
     except Exception:
         return []
