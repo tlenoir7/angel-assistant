@@ -9,7 +9,7 @@ import time
 from collections import deque
 import sys
 import traceback
-from typing import Callable
+from typing import Any, Callable
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -62,6 +62,8 @@ _LOCAL_MEMORY_FILE_LOCK = threading.RLock()
 _WHISPER_MODEL = None
 TAVILY_API_URL = "https://api.tavily.com/search"
 MEM0_API_BASE_URL = "https://api.mem0.ai"
+MEM0_READ_TIMEOUT_SEC = 8.0
+MEM0_READ_FAST_FALLBACK_SEC = 2.5
 
 # Stage 2 memory categories
 CATEGORY_PATTERNS = "patterns"
@@ -288,7 +290,14 @@ class Mem0CloudClient:
             "Content-Type": "application/json",
         }
 
-    def get_all(self, user_id: str, *, page: int = 1, page_size: int = 200):
+    def get_all(
+        self,
+        user_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 200,
+        timeout: float = MEM0_READ_TIMEOUT_SEC,
+    ):
         # v2 get memories (POST /v2/memories/)
         url = f"{MEM0_API_BASE_URL}/v2/memories/"
         payload = {
@@ -296,7 +305,7 @@ class Mem0CloudClient:
             "page": max(1, int(page)),
             "page_size": min(500, max(1, int(page_size))),
         }
-        resp = requests.post(url, headers=self._headers(), json=payload, timeout=30)
+        resp = requests.post(url, headers=self._headers(), json=payload, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
 
@@ -1879,15 +1888,67 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
     """
     uid_log = (user_id or "").strip() or "(empty)"
 
-    try:
-        raw = memory_client.get_all(user_id=user_id)
-        if isinstance(raw, dict) and "results" in raw:
-            memories = raw["results"]
+    local_rows = _load_local_memories(user_id)
+    n_local = len(local_rows) if isinstance(local_rows, list) else 0
+
+    memories = []
+    if use_mem0_cloud and isinstance(memory_client, Mem0CloudClient):
+        # Fast local-first fallback: do not block turn start on slow cloud reads.
+        box: dict[str, Any] = {"done": False, "raw": None, "err": None}
+
+        def _read_mem0_cloud() -> None:
+            try:
+                box["raw"] = memory_client.get_all(
+                    user_id=user_id, timeout=MEM0_READ_TIMEOUT_SEC
+                )
+            except Exception as ex:
+                box["err"] = ex
+            finally:
+                box["done"] = True
+
+        t = threading.Thread(target=_read_mem0_cloud, daemon=True)
+        t.start()
+        t.join(MEM0_READ_FAST_FALLBACK_SEC)
+
+        if not bool(box.get("done")):
+            n_local_sm = (
+                sum(
+                    1
+                    for r in (local_rows or [])
+                    if isinstance(r, dict) and _memory_row_category(r) == CATEGORY_SELF_MODIFICATION
+                )
+                if isinstance(local_rows, list)
+                else 0
+            )
+            print(
+                f"[fetch] user={uid_log!r} cloud=1 fast_fallback=1 "
+                f"wait_s={MEM0_READ_FAST_FALLBACK_SEC:.1f} cloud_timeout_s={MEM0_READ_TIMEOUT_SEC:.1f} "
+                f"api_n=0 local_n={n_local} merged={n_local} self_mod={n_local_sm}",
+                flush=True,
+            )
+            return list(local_rows) if isinstance(local_rows, list) else []
+
+        if box.get("err") is not None:
+            print(
+                f"{Fore.RED}Warning: could not fetch memories: {box.get('err')}{Style.RESET_ALL}"
+            )
+            memories = []
         else:
-            memories = raw
-    except Exception as e:
-        print(f"{Fore.RED}Warning: could not fetch memories: {e}{Style.RESET_ALL}")
-        memories = []
+            raw = box.get("raw")
+            if isinstance(raw, dict) and "results" in raw:
+                memories = raw["results"]
+            else:
+                memories = raw
+    else:
+        try:
+            raw = memory_client.get_all(user_id=user_id)
+            if isinstance(raw, dict) and "results" in raw:
+                memories = raw["results"]
+            else:
+                memories = raw
+        except Exception as e:
+            print(f"{Fore.RED}Warning: could not fetch memories: {e}{Style.RESET_ALL}")
+            memories = []
 
     combined: list = []
     if isinstance(memories, list):
@@ -1898,8 +1959,6 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
     n_from_api = len(combined)
 
     if not use_mem0_cloud:
-        local_rows = _load_local_memories(user_id)
-        n_local = len(local_rows) if isinstance(local_rows, list) else 0
         n_local_sm = (
             sum(
                 1
@@ -1932,8 +1991,6 @@ def fetch_combined_memories(memory_client, user_id: str, use_mem0_cloud: bool) -
             if k:
                 seen.add(k)
 
-    local_rows = _load_local_memories(user_id)
-    n_local = len(local_rows) if isinstance(local_rows, list) else 0
     n_local_sm = (
         sum(
             1
