@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -65,6 +66,15 @@ LOCAL_MEMORY_FILE = Path(os.environ.get(
     "ANGEL_MEMORY_PATH",
     "/app/data/tyler_memories.json"
 ))
+try:
+    data_file = Path("/app/data/tyler_memories.json")
+    bundled = Path("/app/tyler_memories.json")
+    if not data_file.exists() and bundled.exists():
+        data_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(bundled, data_file)
+        _log.info("Seeded persistent volume from bundled memories")
+except Exception as e:
+    _log.warning("Startup memory seed skipped: %s", e)
 # Serialize concurrent read/modify/write of tyler_memories.json (append vs list vs replace).
 _LOCAL_MEMORY_FILE_LOCK = threading.RLock()
 _WHISPER_MODEL = None
