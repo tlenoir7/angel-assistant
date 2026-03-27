@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
 import asyncio
+import anthropic as _anthropic
 import concurrent.futures as _cf
 import functools
 import requests
@@ -123,12 +124,16 @@ _executor = _cf.ThreadPoolExecutor(max_workers=4)
 
 
 def _do_file_read(file_b64, file_name, file_type, context):
+    # Create fresh client for thread safety
+    fresh_client = _anthropic.Anthropic(
+        api_key=os.environ.get("ANTHROPIC_API_KEY", "")
+    )
     return angel_file_reading.read_and_analyze_file(
         file_b64,
         file_name,
         file_type,
         context,
-        angel.anthropic_client,
+        fresh_client,
         memory_client=angel.memory_client,
         user_id=angel.user_id,
         files_cabinet=angel.files_cabinet,
