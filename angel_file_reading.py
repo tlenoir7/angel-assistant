@@ -611,6 +611,36 @@ def cross_reference_intel(
     return {"network_matches": hits[:40], "osint_dossier_hits": osint_matches[:20]}
 
 
+def _merge_cross_reference_intel(
+    out: dict[str, Any],
+    extracted_text: str,
+    entities_found: dict[str, Any] | None,
+    *,
+    memory_client: Any,
+    user_id: str,
+    use_mem0_cloud: bool,
+    files_cabinet: Any,
+) -> None:
+    """Run cross_reference_intel in a worker with a hard timeout; merge into out or log and skip."""
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as xref_ex:
+            xref_future = xref_ex.submit(
+                cross_reference_intel,
+                extracted_text,
+                entities_found,
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
+            xref_result = xref_future.result(timeout=20)
+            out.update(xref_result)
+    except concurrent.futures.TimeoutError:
+        _log.warning("cross_reference_intel timed out after 20s - skipping")
+    except Exception as e:
+        _log.warning("cross_reference_intel failed: %s - skipping", e)
+
+
 def read_and_analyze_file(
     file_content_b64: str,
     file_name: str,
@@ -708,7 +738,8 @@ def read_and_analyze_file(
         vis["extraction_method"] = "claude_vision"
         if memory_client and files_cabinet and user_id:
             _log.info("read_and_analyze_file: cross_reference_intel (image) file=%s", fn)
-            cr = cross_reference_intel(
+            _merge_cross_reference_intel(
+                vis,
                 vis.get("extracted_text") or "",
                 vis.get("entities_found") if isinstance(vis.get("entities_found"), dict) else {},
                 memory_client=memory_client,
@@ -716,7 +747,6 @@ def read_and_analyze_file(
                 use_mem0_cloud=use_mem0_cloud,
                 files_cabinet=files_cabinet,
             )
-            vis.update(cr)
         return vis
 
     if kind == "pdf":
@@ -743,15 +773,14 @@ def read_and_analyze_file(
                 if memory_client and files_cabinet and user_id:
                     _log.info("read_and_analyze_file: cross_reference_intel (pdf fallback) file=%s", fn)
                     ent = doc_json.get("entities_found") if isinstance(doc_json.get("entities_found"), dict) else {}
-                    doc_json.update(
-                        cross_reference_intel(
-                            doc_json.get("extracted_text") or "",
-                            ent,
-                            memory_client=memory_client,
-                            user_id=user_id,
-                            use_mem0_cloud=use_mem0_cloud,
-                            files_cabinet=files_cabinet,
-                        )
+                    _merge_cross_reference_intel(
+                        doc_json,
+                        doc_json.get("extracted_text") or "",
+                        ent,
+                        memory_client=memory_client,
+                        user_id=user_id,
+                        use_mem0_cloud=use_mem0_cloud,
+                        files_cabinet=files_cabinet,
                     )
                 return doc_json
             _log.warning(
@@ -844,15 +873,14 @@ def read_and_analyze_file(
     if memory_client and files_cabinet and user_id:
         _log.info("read_and_analyze_file: cross_reference_intel (text) file=%s", fn)
         ent = result.get("entities_found") if isinstance(result.get("entities_found"), dict) else {}
-        result.update(
-            cross_reference_intel(
-                extracted,
-                ent,
-                memory_client=memory_client,
-                user_id=user_id,
-                use_mem0_cloud=use_mem0_cloud,
-                files_cabinet=files_cabinet,
-            )
+        _merge_cross_reference_intel(
+            result,
+            extracted,
+            ent,
+            memory_client=memory_client,
+            user_id=user_id,
+            use_mem0_cloud=use_mem0_cloud,
+            files_cabinet=files_cabinet,
         )
 
     _log.info("read_and_analyze_file: complete ok=%s file=%s", result.get("ok"), fn)
