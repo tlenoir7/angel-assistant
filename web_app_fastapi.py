@@ -123,22 +123,6 @@ _executor = _cf.ThreadPoolExecutor(max_workers=4)
 
 
 def _do_file_read(file_b64, file_name, file_type, context):
-    # Quick connectivity test
-    try:
-        test = angel.anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=10,
-            messages=[{"role": "user", "content": "hi"}],
-            timeout=15.0,
-        )
-        ok_text = ""
-        if getattr(test, "content", None):
-            ok_text = getattr(test.content[0], "text", "") or ""
-        print("[files/read-thread] anthropic test ok:", ok_text, flush=True)
-    except Exception as e:
-        print("[files/read-thread] anthropic test FAILED:", e, flush=True)
-        return {"ok": False, "error": f"Anthropic unreachable: {e}"}
-
     return angel_file_reading.read_and_analyze_file(
         file_b64,
         file_name,
@@ -149,7 +133,7 @@ def _do_file_read(file_b64, file_name, file_type, context):
         user_id=angel.user_id,
         files_cabinet=angel.files_cabinet,
         use_mem0_cloud=angel._use_mem0_cloud,
-        skip_analysis=True,
+        model="claude-haiku-4-5-20251001",
     )
 
 
