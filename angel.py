@@ -9,6 +9,7 @@ import time
 from collections import deque
 import sys
 import traceback
+from typing import Callable
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -2876,6 +2877,7 @@ def call_claude(
     *,
     prior_turns: list[tuple[str, str]] | None = None,
     max_tokens: int | None = None,
+    stream_callback: Callable[[str], None] | None = None,
 ) -> str:
     """
     Call Claude with the Angel persona, returning plain text.
@@ -2894,6 +2896,30 @@ def call_claude(
             messages.append({"role": "assistant", "content": a if a else "."})
     messages.append({"role": "user", "content": user_message})
     mt = 2048 if max_tokens is None else max(1, int(max_tokens))
+    streamed_parts: list[str] = []
+    if stream_callback is not None:
+        try:
+            with client.messages.stream(
+                model=model,
+                max_tokens=mt,
+                temperature=0.5,
+                system=system_prompt,
+                messages=messages,
+            ) as stream:
+                for text in stream.text_stream:
+                    if not text:
+                        continue
+                    streamed_parts.append(text)
+                    try:
+                        stream_callback(text)
+                    except Exception:
+                        pass
+            streamed_reply = "".join(streamed_parts).strip()
+            if streamed_reply:
+                return streamed_reply
+        except Exception:
+            # Fall back to non-streaming for robustness.
+            pass
     try:
         response = client.messages.create(
             model=model,
@@ -2912,8 +2938,19 @@ def call_claude(
             parts.append(block.text)
         elif isinstance(block, dict) and block.get("type") == "text":
             parts.append(block.get("text", ""))
-
-    return "\n".join(parts).strip() or "(Angel responded with no text.)"
+    reply = "\n".join(parts).strip() or "(Angel responded with no text.)"
+    if stream_callback is not None:
+        try:
+            already_sent = "".join(streamed_parts)
+            if already_sent and reply.startswith(already_sent):
+                remaining = reply[len(already_sent):]
+                if remaining:
+                    stream_callback(remaining)
+            elif not already_sent:
+                stream_callback(reply)
+        except Exception:
+            pass
+    return reply
 
 
 def maybe_search_web(
@@ -6228,6 +6265,7 @@ class AngelCore:
         *,
         session_turns: list[tuple[str, str]] | None = None,
         location: dict | None = None,
+        stream_callback: Callable[[str], None] | None = None,
     ) -> str:
         def _bg_health_extract() -> None:
             try:
@@ -7327,6 +7365,7 @@ If you infer anything new about that person's preferences or dynamics, append at
             augmented_user_message,
             model=model,
             prior_turns=session_turns,
+            stream_callback=stream_callback,
         )
 
         # Parse and store Stage 2 outputs; strip from reply

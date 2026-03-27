@@ -1399,16 +1399,59 @@ def create_app() -> Flask:
             await sio.emit("angel_thinking", {}, room=sid)
             try:
                 turns = _session_turns_for(sid)
+                loop = asyncio.get_running_loop()
+                stream_state: dict[str, object] = {"chunks": [], "tokens": 0}
+
+                def _flush_stream_chunks() -> None:
+                    chunks = stream_state.get("chunks")
+                    if not isinstance(chunks, list) or not chunks:
+                        return
+                    out = "".join(str(c) for c in chunks if c)
+                    stream_state["chunks"] = []
+                    stream_state["tokens"] = 0
+                    if not out:
+                        return
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            sio.emit(
+                                "angel_chunk",
+                                {"chunk": _sanitize_text(out)},
+                                room=sid,
+                            ),
+                            loop,
+                        )
+                    except Exception:
+                        pass
+
+                def _stream_callback(chunk: str) -> None:
+                    if not isinstance(chunk, str) or not chunk:
+                        return
+                    chunks = stream_state.get("chunks")
+                    if not isinstance(chunks, list):
+                        chunks = []
+                        stream_state["chunks"] = chunks
+                    chunks.append(chunk)
+                    tok_inc = max(1, len(re.findall(r"\S+", chunk)))
+                    stream_state["tokens"] = int(stream_state.get("tokens") or 0) + tok_inc
+                    if int(stream_state["tokens"]) >= 16:
+                        _flush_stream_chunks()
+
                 reply = await asyncio.to_thread(
                     angel.generate_reply,
                     text,
                     device=sess["device"],
                     session_turns=turns or None,
                     location=location,
+                    stream_callback=_stream_callback,
                 )
+                _flush_stream_chunks()
                 clean_a = strip_markdown(reply) if angel.use_voice else reply
                 _append_turn(sid, text, clean_a)
-                await sio.emit("angel_response", {"reply": _sanitize_text(reply)}, room=sid)
+                await sio.emit(
+                    "angel_reply_complete",
+                    {"reply": _sanitize_text(reply)},
+                    room=sid,
+                )
             except Exception as e:
                 traceback.print_exc()
                 await sio.emit("angel_error", {"message": str(e)}, room=sid)
