@@ -124,6 +124,15 @@ _executor = _cf.ThreadPoolExecutor(max_workers=4)
 
 
 def _do_file_read(file_b64, file_name, file_type, context):
+    # Network diagnostic
+    import requests as _req
+
+    try:
+        r = _req.get("https://api.anthropic.com", timeout=5)
+        print(f"[files-thread] anthropic.com reachable: {r.status_code}", flush=True)
+    except Exception as e:
+        print(f"[files-thread] anthropic.com UNREACHABLE: {e}", flush=True)
+
     # Create fresh client for thread safety
     fresh_client = _anthropic.Anthropic(
         api_key=os.environ.get("ANTHROPIC_API_KEY", "")
