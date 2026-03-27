@@ -761,17 +761,18 @@ def read_and_analyze_file(
             return vis
         vis["vision_used"] = True
         vis["extraction_method"] = "claude_vision"
-        if memory_client and files_cabinet and user_id:
-            _log.info("read_and_analyze_file: cross_reference_intel (image) file=%s", fn)
-            _merge_cross_reference_intel(
-                vis,
-                vis.get("extracted_text") or "",
-                vis.get("entities_found") if isinstance(vis.get("entities_found"), dict) else {},
-                memory_client=memory_client,
-                user_id=user_id,
-                use_mem0_cloud=use_mem0_cloud,
-                files_cabinet=files_cabinet,
-            )
+        # Temporarily disabled - causes hangs
+        # if memory_client and files_cabinet and user_id:
+        #     _log.info("read_and_analyze_file: cross_reference_intel (image) file=%s", fn)
+        #     _merge_cross_reference_intel(
+        #         vis,
+        #         vis.get("extracted_text") or "",
+        #         vis.get("entities_found") if isinstance(vis.get("entities_found"), dict) else {},
+        #         memory_client=memory_client,
+        #         user_id=user_id,
+        #         use_mem0_cloud=use_mem0_cloud,
+        #         files_cabinet=files_cabinet,
+        #     )
         return vis
 
     if kind == "pdf":
@@ -795,18 +796,19 @@ def read_and_analyze_file(
                 )
                 doc_json["extraction_method"] = "claude_pdf_document"
                 doc_json["vision_used"] = False
-                if memory_client and files_cabinet and user_id:
-                    _log.info("read_and_analyze_file: cross_reference_intel (pdf fallback) file=%s", fn)
-                    ent = doc_json.get("entities_found") if isinstance(doc_json.get("entities_found"), dict) else {}
-                    _merge_cross_reference_intel(
-                        doc_json,
-                        doc_json.get("extracted_text") or "",
-                        ent,
-                        memory_client=memory_client,
-                        user_id=user_id,
-                        use_mem0_cloud=use_mem0_cloud,
-                        files_cabinet=files_cabinet,
-                    )
+                # Temporarily disabled - causes hangs
+                # if memory_client and files_cabinet and user_id:
+                #     _log.info("read_and_analyze_file: cross_reference_intel (pdf fallback) file=%s", fn)
+                #     ent = doc_json.get("entities_found") if isinstance(doc_json.get("entities_found"), dict) else {}
+                #     _merge_cross_reference_intel(
+                #         doc_json,
+                #         doc_json.get("extracted_text") or "",
+                #         ent,
+                #         memory_client=memory_client,
+                #         user_id=user_id,
+                #         use_mem0_cloud=use_mem0_cloud,
+                #         files_cabinet=files_cabinet,
+                #     )
                 return doc_json
             _log.warning(
                 "Claude PDF fallback did not return usable analysis file=%s",
@@ -910,18 +912,19 @@ def read_and_analyze_file(
     if not result.get("file_type_detected"):
         result["file_type_detected"] = kind
 
-    if memory_client and files_cabinet and user_id:
-        _log.info("read_and_analyze_file: cross_reference_intel (text) file=%s", fn)
-        ent = result.get("entities_found") if isinstance(result.get("entities_found"), dict) else {}
-        _merge_cross_reference_intel(
-            result,
-            extracted,
-            ent,
-            memory_client=memory_client,
-            user_id=user_id,
-            use_mem0_cloud=use_mem0_cloud,
-            files_cabinet=files_cabinet,
-        )
+    # Temporarily disabled - causes hangs
+    # if memory_client and files_cabinet and user_id:
+    #     _log.info("read_and_analyze_file: cross_reference_intel (text) file=%s", fn)
+    #     ent = result.get("entities_found") if isinstance(result.get("entities_found"), dict) else {}
+    #     _merge_cross_reference_intel(
+    #         result,
+    #         extracted,
+    #         ent,
+    #         memory_client=memory_client,
+    #         user_id=user_id,
+    #         use_mem0_cloud=use_mem0_cloud,
+    #         files_cabinet=files_cabinet,
+    #     )
 
     _log.info("read_and_analyze_file: complete ok=%s file=%s", result.get("ok"), fn)
     return result
