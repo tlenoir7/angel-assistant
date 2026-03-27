@@ -113,8 +113,10 @@ _log = logging.getLogger(__name__)
 
 
 def _request_json_keys_for_log() -> object:
+    """Uses get_json(silent=True) — avoids strict request.json parsing side effects."""
     try:
-        return list(request.json.keys()) if request.json else "no json"
+        data = request.get_json(silent=True)
+        return list(data.keys()) if isinstance(data, dict) else "no json"
     except Exception:
         return "no json"
 
@@ -2416,17 +2418,27 @@ def create_app() -> Flask:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    @app.route("/api/files/ping", methods=["POST"])
+    def api_files_ping():
+        return jsonify({"ok": True, "message": "files ping works"})
+
     @app.route("/api/files/read", methods=["POST"])
     def api_files_read():
         """
         Read and analyze an uploaded file: multipart form (field `file`, optional `context`, `file_type`)
         or JSON body { file_content (base64), file_name, context, file_type }.
         """
+        print("[api/files/read] handler entered", flush=True)
+        _log.info(
+            "files/read: handler entered (before body) method=%s content_type=%s",
+            request.method,
+            request.content_type or "(none)",
+        )
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
         _log.info(
             "files/read called - keys: %s",
-            list(request.json.keys()) if request.json else "no json",
+            _request_json_keys_for_log(),
         )
         context = ""
         file_name = "upload.bin"
