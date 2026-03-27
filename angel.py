@@ -83,6 +83,7 @@ MEM0_API_BASE_URL = "https://api.mem0.ai"
 MEM0_READ_TIMEOUT_SEC = 8.0
 MEM0_READ_FAST_FALLBACK_SEC = 2.5
 _log.info("Memory path: %s", LOCAL_MEMORY_FILE)
+_log.info("LOCAL_MEMORY_FILE value: %s", str(LOCAL_MEMORY_FILE))
 _log.info("Mem0 cloud: %s", "enabled" if USE_MEM0_CLOUD else "disabled")
 
 # Stage 2 memory categories
@@ -501,6 +502,17 @@ def _load_local_memory_file_data_impl() -> dict:
             _write_local_memory_file_silent_impl(dict(_EMPTY_LOCAL_MEMORY_DOC))
             return dict(_EMPTY_LOCAL_MEMORY_DOC)
 
+        if isinstance(data, list):
+            # Mem0-cloud-style export: top-level list of memory rows.
+            # Normalize into Angel's local document shape without destructive rewrite.
+            default_uid = (os.getenv("ANGEL_USER_ID") or "tyler").strip() or "tyler"
+            rows = [r for r in data if isinstance(r, dict)]
+            users: dict[str, list] = {}
+            for row in rows:
+                uid = str(row.get("user_id") or "").strip() or default_uid
+                users.setdefault(uid, []).append(row)
+            return {"memories": rows, "users": users}
+
         if not isinstance(data, dict):
             _write_local_memory_file_silent_impl(dict(_EMPTY_LOCAL_MEMORY_DOC))
             return dict(_EMPTY_LOCAL_MEMORY_DOC)
@@ -513,6 +525,17 @@ def _load_local_memory_file_data_impl() -> dict:
         else:
             data["users"] = users
         data.setdefault("memories", [])
+        if not data["users"] and isinstance(data.get("memories"), list):
+            # Recover user buckets when only a flat memories list is present.
+            default_uid = (os.getenv("ANGEL_USER_ID") or "tyler").strip() or "tyler"
+            rebuilt: dict[str, list] = {}
+            for row in data.get("memories", []):
+                if not isinstance(row, dict):
+                    continue
+                uid = str(row.get("user_id") or "").strip() or default_uid
+                rebuilt.setdefault(uid, []).append(row)
+            if rebuilt:
+                data["users"] = rebuilt
         return data
     except Exception:
         try:
@@ -534,13 +557,69 @@ def _load_local_memory_file_data() -> dict:
 
 def _load_local_memories(user_id: str):
     try:
+        _log.info(
+            "Loading local memories from: %s (exists=%s)",
+            LOCAL_MEMORY_FILE,
+            LOCAL_MEMORY_FILE.exists(),
+        )
         with _LOCAL_MEMORY_FILE_LOCK:
             data = _load_local_memory_file_data_impl()
-        users = data.get("users", {})
+        total_file_records = 0
+        users_block = data.get("users", {})
+        if isinstance(users_block, dict):
+            total_file_records = sum(
+                len(v) for v in users_block.values() if isinstance(v, list)
+            )
+        if not total_file_records:
+            mem_block = data.get("memories", [])
+            if isinstance(mem_block, list):
+                total_file_records = len(mem_block)
+        _log.info("Local memory file total records discovered: %s", total_file_records)
+        users = users_block
         if not isinstance(users, dict):
+            _log.info("Local memory skip: users block is not a dict")
             return []
         arr = users.get(user_id, [])
-        return arr if isinstance(arr, list) else []
+        if not isinstance(arr, list):
+            _log.info("Local memory skip: user bucket %r is not a list", user_id)
+            return []
+
+        total_user_rows = len(arr)
+        kept_rows: list[dict] = []
+        skipped_non_dict = 0
+        skipped_empty_text = 0
+        converted_text_field = 0
+        converted_data_field = 0
+
+        for row in arr:
+            if not isinstance(row, dict):
+                skipped_non_dict += 1
+                continue
+            out = dict(row)
+            if not isinstance(out.get("memory"), str) or not str(out.get("memory") or "").strip():
+                if isinstance(out.get("text"), str) and out.get("text", "").strip():
+                    out["memory"] = out["text"]
+                    converted_text_field += 1
+                elif isinstance(out.get("data"), str) and out.get("data", "").strip():
+                    out["memory"] = out["data"]
+                    converted_data_field += 1
+            if not str(out.get("memory") or "").strip():
+                skipped_empty_text += 1
+                continue
+            kept_rows.append(out)
+
+        _log.info(
+            "Local memory parse user=%r total_user_rows=%s kept=%s skipped_non_dict=%s "
+            "skipped_empty_text=%s converted_text_field=%s converted_data_field=%s",
+            user_id,
+            total_user_rows,
+            len(kept_rows),
+            skipped_non_dict,
+            skipped_empty_text,
+            converted_text_field,
+            converted_data_field,
+        )
+        return kept_rows
     except Exception:
         return []
 
