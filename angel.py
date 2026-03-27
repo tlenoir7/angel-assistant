@@ -77,10 +77,12 @@ except Exception as e:
     _log.warning("Startup memory seed skipped: %s", e)
 # Serialize concurrent read/modify/write of tyler_memories.json (append vs list vs replace).
 _LOCAL_MEMORY_FILE_LOCK = threading.RLock()
-_LOCAL_MEMORY_CACHE: list | None = None
-_LOCAL_MEMORY_CACHE_MTIME: float = 0.0
-_LOCAL_MEMORY_CACHE_USER_ID: str = ""
 _LOCAL_MEMORY_CACHE_LOCK = threading.RLock()
+_LOCAL_MEMORY_CACHE_BY_USER: dict[str, list[dict]] = {}
+_LOCAL_MEMORY_CACHE_VERSION: int = 0
+_LOCAL_MEMORY_CACHE_USER_VERSION: dict[str, int] = {}
+_LOCAL_MEMORY_CACHE_LOADED: bool = False
+_LOCAL_MEMORY_CACHE_LAST_MTIME: float = 0.0
 _WHISPER_MODEL = None
 TAVILY_API_URL = "https://api.tavily.com/search"
 MEM0_API_BASE_URL = "https://api.mem0.ai"
@@ -472,15 +474,46 @@ _EMPTY_LOCAL_MEMORY_DOC: dict = {"memories": [], "users": {}}
 
 def _write_local_memory_file_silent_impl(data: dict) -> None:
     """Write tyler_memories.json (caller must hold lock)."""
-    global _LOCAL_MEMORY_CACHE, _LOCAL_MEMORY_CACHE_MTIME, _LOCAL_MEMORY_CACHE_USER_ID
+    global _LOCAL_MEMORY_CACHE_BY_USER
+    global _LOCAL_MEMORY_CACHE_VERSION
+    global _LOCAL_MEMORY_CACHE_USER_VERSION
+    global _LOCAL_MEMORY_CACHE_LOADED
+    global _LOCAL_MEMORY_CACHE_LAST_MTIME
     try:
         LOCAL_MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOCAL_MEMORY_FILE.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         with _LOCAL_MEMORY_CACHE_LOCK:
-            _LOCAL_MEMORY_CACHE = None
-            _LOCAL_MEMORY_CACHE_MTIME = 0.0
-            _LOCAL_MEMORY_CACHE_USER_ID = ""
+            users = data.get("users", {}) if isinstance(data, dict) else {}
+            rebuilt: dict[str, list[dict]] = {}
+            if isinstance(users, dict):
+                for uid, rows in users.items():
+                    if not isinstance(rows, list):
+                        continue
+                    normalized: list[dict] = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        out = dict(row)
+                        if not str(out.get("memory") or "").strip():
+                            if isinstance(out.get("text"), str) and out.get("text", "").strip():
+                                out["memory"] = out["text"]
+                            elif isinstance(out.get("data"), str) and out.get("data", "").strip():
+                                out["memory"] = out["data"]
+                        if not str(out.get("memory") or "").strip():
+                            continue
+                        normalized.append(out)
+                    rebuilt[str(uid)] = normalized
+            _LOCAL_MEMORY_CACHE_BY_USER = rebuilt
+            _LOCAL_MEMORY_CACHE_VERSION += 1
+            _LOCAL_MEMORY_CACHE_USER_VERSION = {
+                uid: _LOCAL_MEMORY_CACHE_VERSION for uid in rebuilt.keys()
+            }
+            _LOCAL_MEMORY_CACHE_LOADED = True
+            try:
+                _LOCAL_MEMORY_CACHE_LAST_MTIME = os.path.getmtime(LOCAL_MEMORY_FILE)
+            except OSError:
+                _LOCAL_MEMORY_CACHE_LAST_MTIME = 0.0
     except Exception:
         pass
 
@@ -565,7 +598,11 @@ def _load_local_memory_file_data() -> dict:
 
 
 def _load_local_memories(user_id: str):
-    global _LOCAL_MEMORY_CACHE, _LOCAL_MEMORY_CACHE_MTIME, _LOCAL_MEMORY_CACHE_USER_ID
+    global _LOCAL_MEMORY_CACHE_BY_USER
+    global _LOCAL_MEMORY_CACHE_VERSION
+    global _LOCAL_MEMORY_CACHE_USER_VERSION
+    global _LOCAL_MEMORY_CACHE_LOADED
+    global _LOCAL_MEMORY_CACHE_LAST_MTIME
     print(f"MEMORY_DEBUG: loading from {LOCAL_MEMORY_FILE}, exists={LOCAL_MEMORY_FILE.exists()}", flush=True)
     try:
         try:
@@ -573,18 +610,27 @@ def _load_local_memories(user_id: str):
         except OSError:
             current_mtime = 0.0
         with _LOCAL_MEMORY_CACHE_LOCK:
-            if (
-                _LOCAL_MEMORY_CACHE is not None
-                and _LOCAL_MEMORY_CACHE_USER_ID == user_id
-                and _LOCAL_MEMORY_CACHE_MTIME == current_mtime
-            ):
+            if _LOCAL_MEMORY_CACHE_LOADED and current_mtime != _LOCAL_MEMORY_CACHE_LAST_MTIME:
                 _log.info(
-                    "Local memory cache hit for user=%r rows=%s mtime=%s",
-                    user_id,
-                    len(_LOCAL_MEMORY_CACHE),
-                    _LOCAL_MEMORY_CACHE_MTIME,
+                    "Local memory cache invalidated by external file change: old_mtime=%s new_mtime=%s",
+                    _LOCAL_MEMORY_CACHE_LAST_MTIME,
+                    current_mtime,
                 )
-                return list(_LOCAL_MEMORY_CACHE)
+                _LOCAL_MEMORY_CACHE_LOADED = False
+                _LOCAL_MEMORY_CACHE_BY_USER = {}
+                _LOCAL_MEMORY_CACHE_USER_VERSION = {}
+            if (
+                _LOCAL_MEMORY_CACHE_LOADED
+                and _LOCAL_MEMORY_CACHE_USER_VERSION.get(user_id) == _LOCAL_MEMORY_CACHE_VERSION
+            ):
+                cached_rows = _LOCAL_MEMORY_CACHE_BY_USER.get(user_id, [])
+                _log.info(
+                    "Local memory cache hit for user=%r rows=%s version=%s",
+                    user_id,
+                    len(cached_rows),
+                    _LOCAL_MEMORY_CACHE_VERSION,
+                )
+                return list(cached_rows)
 
         _log.info(
             "Loading local memories from: %s (exists=%s)",
@@ -650,9 +696,31 @@ def _load_local_memories(user_id: str):
             converted_data_field,
         )
         with _LOCAL_MEMORY_CACHE_LOCK:
-            _LOCAL_MEMORY_CACHE = list(kept_rows)
-            _LOCAL_MEMORY_CACHE_MTIME = current_mtime
-            _LOCAL_MEMORY_CACHE_USER_ID = user_id
+            rebuilt: dict[str, list[dict]] = {}
+            for uid, rows in users.items():
+                if not isinstance(rows, list):
+                    continue
+                norm_rows: list[dict] = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    out = dict(row)
+                    if not str(out.get("memory") or "").strip():
+                        if isinstance(out.get("text"), str) and out.get("text", "").strip():
+                            out["memory"] = out["text"]
+                        elif isinstance(out.get("data"), str) and out.get("data", "").strip():
+                            out["memory"] = out["data"]
+                    if not str(out.get("memory") or "").strip():
+                        continue
+                    norm_rows.append(out)
+                rebuilt[str(uid)] = norm_rows
+            _LOCAL_MEMORY_CACHE_BY_USER = rebuilt
+            _LOCAL_MEMORY_CACHE_VERSION += 1
+            _LOCAL_MEMORY_CACHE_USER_VERSION = {
+                uid: _LOCAL_MEMORY_CACHE_VERSION for uid in rebuilt.keys()
+            }
+            _LOCAL_MEMORY_CACHE_LOADED = True
+            _LOCAL_MEMORY_CACHE_LAST_MTIME = current_mtime
         return kept_rows
     except Exception:
         return []
