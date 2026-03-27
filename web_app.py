@@ -111,6 +111,13 @@ _network_reset_status: dict = {
 _log = logging.getLogger(__name__)
 
 
+def _request_json_keys_for_log() -> object:
+    try:
+        return list(request.json.keys()) if request.json else "no json"
+    except Exception:
+        return "no json"
+
+
 def _log_startup_seed_summary(name: str, r: object) -> None:
     """One short stdout line per seed job — avoids huge dicts (Railway 500 logs/sec)."""
     if not isinstance(r, dict):
@@ -1256,6 +1263,13 @@ def create_app() -> Flask:
             emit("angel_error", {"message": "No session; reconnect."})
             return
         payload = data if isinstance(data, dict) else {}
+        if any(
+            k in payload for k in ("file_content", "file_name", "attachment", "base64")
+        ):
+            _log.info(
+                "socket user_text received attachment-like payload keys=%s (attachments should use /api/files/read)",
+                list(payload.keys()),
+            )
         text = (payload.get("message") or payload.get("text") or "").strip()
         if not text:
             emit("angel_error", {"message": "Empty message."})
@@ -2154,6 +2168,9 @@ def create_app() -> Flask:
         """
         if angel is None:
             return jsonify({"ok": False, "error": "Angel not initialized"}), 503
+        _log.info(
+            "vision/forensic/file called - keys: %s", _request_json_keys_for_log()
+        )
         data = request.get_json(silent=True) or {}
         image_b64 = str(
             data.get("image_base64") or data.get("image_b64") or data.get("image") or ""
@@ -2319,6 +2336,7 @@ def create_app() -> Flask:
     def api_files_create():
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
+        _log.info("files/create called - keys: %s", _request_json_keys_for_log())
         data = request.get_json(silent=True) or {}
         folder = data.get("folder", "")
         name = (data.get("name") or "").strip()
@@ -2345,6 +2363,10 @@ def create_app() -> Flask:
         """
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
+        _log.info(
+            "files/read called - keys: %s",
+            list(request.json.keys()) if request.json else "no json",
+        )
         context = ""
         file_name = "upload.bin"
         file_type = ""
@@ -2364,8 +2386,20 @@ def create_app() -> Flask:
             file_type = (request.form.get("file_type") or request.form.get("mime") or "").strip()
         else:
             data = request.get_json(silent=True) or {}
-            file_b64 = (data.get("file_content") or data.get("content") or "").strip()
-            file_name = (data.get("file_name") or data.get("name") or "upload.bin").strip() or "upload.bin"
+            file_b64 = (
+                data.get("file_content")
+                or data.get("file_data")
+                or data.get("file_b64")
+                or data.get("image_base64")
+                or data.get("content")
+                or ""
+            ).strip()
+            file_name = (
+                data.get("file_name")
+                or data.get("filename")
+                or data.get("name")
+                or "uploaded_file"
+            ).strip() or "uploaded_file"
             context = (data.get("context") or "").strip()
             file_type = (data.get("file_type") or data.get("mime") or "").strip()
 
@@ -2376,6 +2410,14 @@ def create_app() -> Flask:
             }), 400
 
         try:
+            _log.info(
+                "files/read before angel_file_reading file=%s type=%s b64_len=%s context_len=%s content_type=%s",
+                file_name,
+                file_type or "(none)",
+                len(file_b64 or ""),
+                len(context or ""),
+                request.content_type or "(none)",
+            )
             r = angel_file_reading.read_and_analyze_file(
                 file_b64,
                 file_name,
@@ -2387,6 +2429,13 @@ def create_app() -> Flask:
                 files_cabinet=angel.files_cabinet,
                 use_mem0_cloud=angel._use_mem0_cloud,
             )
+            _log.info(
+                "files/read after angel_file_reading ok=%s extraction_method=%s file_type=%s error=%s",
+                r.get("ok"),
+                r.get("extraction_method"),
+                r.get("file_type_detected"),
+                r.get("error"),
+            )
             if r.get("ok"):
                 r["filing_offer"] = angel_file_reading.filing_suggestion_line(
                     str(r.get("intelligence_value") or "MEDIUM")
@@ -2394,6 +2443,7 @@ def create_app() -> Flask:
                 r["suggested_folder"] = angel_file_reading.suggest_filing_folder(r)
             return jsonify(r)
         except Exception as e:
+            _log.exception("files/read endpoint crashed before response")
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -2401,6 +2451,7 @@ def create_app() -> Flask:
     def api_files_list():
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
+        _log.info("files/list called")
         raw_folder = request.args.get("folder")
         folder_filter = None
         if raw_folder is not None and str(raw_folder).strip():
@@ -2412,6 +2463,7 @@ def create_app() -> Flask:
     def api_files_get():
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
+        _log.info("files/get called name=%s", (request.args.get("name") or "").strip())
         name = (request.args.get("name") or "").strip()
         if not name:
             return jsonify({"ok": False, "error": "Missing query parameter 'name'."}), 400
@@ -2424,6 +2476,7 @@ def create_app() -> Flask:
     def api_files_update():
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
+        _log.info("files/update called - keys: %s", _request_json_keys_for_log())
         data = request.get_json(silent=True) or {}
         name = (data.get("name") or "").strip()
         content = data.get("content", "")
@@ -2440,6 +2493,7 @@ def create_app() -> Flask:
     def api_files_search():
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
+        _log.info("files/search called - keys: %s", _request_json_keys_for_log())
         data = request.get_json(silent=True) or {}
         query = (data.get("query") or "").strip()
         if not query:
@@ -2451,6 +2505,7 @@ def create_app() -> Flask:
     def api_files_summary():
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
+        _log.info("files/summary called")
         text = angel.files_cabinet.get_summary()
         return jsonify({"ok": True, "summary": text})
 
@@ -2458,6 +2513,7 @@ def create_app() -> Flask:
     def api_files_delete():
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
+        _log.info("files/delete called - keys: %s", _request_json_keys_for_log())
         data = request.get_json(silent=True) or {}
         name = (data.get("name") or "").strip()
         if not name:
@@ -2474,6 +2530,7 @@ def create_app() -> Flask:
     def api_files_folders():
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
+        _log.info("files/folders called")
         folders = angel.files_cabinet.list_folders()
         return jsonify({"ok": True, "folders": folders})
 
