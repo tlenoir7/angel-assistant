@@ -2533,31 +2533,40 @@ def create_app() -> Flask:
             request.method,
             request.content_type or "(none)",
         )
+        print("[files/read] 1 - checking angel", flush=True)
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
-        _log.info(
-            "files/read called - keys: %s",
-            _request_json_keys_for_log(),
-        )
+        print("[files/read] 2 - angel ok, getting json", flush=True)
+        data = request.get_json(silent=True) or {}
+        print("[files/read] 3 - got json keys:", list(data.keys()), flush=True)
+
         context = ""
         file_name = "upload.bin"
         file_type = ""
         file_b64 = ""
 
         ct = (request.content_type or "").lower()
+        print("[files/read] 4 - content_type:", ct[:120] if ct else "(empty)", flush=True)
         if "multipart/form-data" in ct:
+            print("[files/read] 5 - multipart branch", flush=True)
             f = request.files.get("file")
+            print("[files/read] 6 - files.get('file'):", f is not None, flush=True)
             if f and f.filename:
+                print("[files/read] 7 - reading upload bytes…", flush=True)
                 try:
                     raw = f.read()
+                    print("[files/read] 8 - read raw len:", len(raw), flush=True)
                     file_b64 = base64.b64encode(raw).decode("ascii")
                     file_name = f.filename or "upload.bin"
+                    print("[files/read] 9 - base64 encoded, name:", file_name, flush=True)
                 except Exception as e:
+                    print("[files/read] 8-ERR - read failed:", e, flush=True)
                     return jsonify({"ok": False, "error": f"Could not read upload: {e}"}), 400
             context = (request.form.get("context") or "").strip()
             file_type = (request.form.get("file_type") or request.form.get("mime") or "").strip()
+            print("[files/read] 10 - multipart context/file_type set", flush=True)
         else:
-            data = request.get_json(silent=True) or {}
+            print("[files/read] 11 - JSON/non-multipart branch (reuse data from step 2)", flush=True)
             file_b64 = (
                 data.get("file_content")
                 or data.get("file_data")
@@ -2566,6 +2575,7 @@ def create_app() -> Flask:
                 or data.get("content")
                 or ""
             ).strip()
+            print("[files/read] 12 - got file_b64 length:", len(file_b64), flush=True)
             file_name = (
                 data.get("file_name")
                 or data.get("filename")
@@ -2574,14 +2584,18 @@ def create_app() -> Flask:
             ).strip() or "uploaded_file"
             context = (data.get("context") or "").strip()
             file_type = (data.get("file_type") or data.get("mime") or "").strip()
+            print("[files/read] 13 - meta file_name/context/file_type ok", flush=True)
 
+        print("[files/read] 14 - final file_b64 length:", len(file_b64), flush=True)
         if not file_b64:
+            print("[files/read] 15 - empty file_b64, returning 400", flush=True)
             return jsonify({
                 "ok": False,
                 "error": "No file content. Use multipart form field 'file' or JSON 'file_content' (base64).",
             }), 400
 
         try:
+            print("[files/read] 16 - before read_and_analyze_file", flush=True)
             _log.info(
                 "files/read before angel_file_reading file=%s type=%s b64_len=%s context_len=%s content_type=%s",
                 file_name,
@@ -2601,6 +2615,7 @@ def create_app() -> Flask:
                 files_cabinet=angel.files_cabinet,
                 use_mem0_cloud=angel._use_mem0_cloud,
             )
+            print("[files/read] 17 - after read_and_analyze_file ok=", r.get("ok"), flush=True)
             _log.info(
                 "files/read after angel_file_reading ok=%s extraction_method=%s file_type=%s error=%s",
                 r.get("ok"),
@@ -2609,12 +2624,15 @@ def create_app() -> Flask:
                 r.get("error"),
             )
             if r.get("ok"):
+                print("[files/read] 18 - adding filing_offer / suggested_folder", flush=True)
                 r["filing_offer"] = angel_file_reading.filing_suggestion_line(
                     str(r.get("intelligence_value") or "MEDIUM")
                 )
                 r["suggested_folder"] = angel_file_reading.suggest_filing_folder(r)
+            print("[files/read] 19 - returning jsonify", flush=True)
             return jsonify(r)
         except Exception as e:
+            print("[files/read] ERR - exception:", e, flush=True)
             _log.exception("files/read endpoint crashed before response")
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
