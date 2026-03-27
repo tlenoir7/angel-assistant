@@ -495,13 +495,51 @@ def run_parallel_agents(
     }
 
 
-def detect_parallel_opportunity(user_message: str) -> tuple[bool, str | None]:
+def should_skip_parallel_for_self_modification(
+    user_message: str, trusted_operator: bool
+) -> bool:
+    """
+    Trusted operator only: self-modification / Stage 6 requests must never be routed
+    through parallel agents (they can misread legitimate operator instructions as adversarial).
+    """
+    if not trusted_operator:
+        return False
+    low = (user_message or "").lower()
+    if "self-modification" in low or "self modification" in low:
+        return True
+    if "propose a modification" in low:
+        return True
+    if "modify how you" in low:
+        return True
+    if "permanent change" in low and re.search(
+        r"\b(you|yourself|your behavior|your system|angel|how you)\b", low
+    ):
+        return True
+    if re.search(
+        r"\bpropose\s+(?:a\s+)?(?:new\s+)?(?:self[- ]?)?modification",
+        low,
+    ):
+        return True
+    if re.search(r"\b(generate|run)\s+(?:new\s+)?modification\s+proposal", low):
+        return True
+    if re.search(r"\bstage\s*6\b.*\bmod", low) or re.search(
+        r"\bself[- ]?mod\b.*\b(propos|generat|chang)", low
+    ):
+        return True
+    return False
+
+
+def detect_parallel_opportunity(
+    user_message: str, trusted_operator: bool = False
+) -> tuple[bool, str | None]:
     """
     True if multi-agent parallel research is appropriate.
     Returns (True, topic_hint) or (False, None).
     """
     raw = (user_message or "").strip()
     if len(raw) < 12:
+        return False, None
+    if should_skip_parallel_for_self_modification(user_message, trusted_operator):
         return False, None
     low = raw.lower()
 

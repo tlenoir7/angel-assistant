@@ -6249,7 +6249,9 @@ class AngelCore:
         try:
             import angel_self_modification as _angel_self_mod
 
-            _sm_intent = _angel_self_mod.detect_self_mod_intent(user_message)
+            _sm_intent = _angel_self_mod.detect_self_mod_intent(
+                user_message, user_id=self.user_id
+            )
             if _sm_intent:
                 _cmd, _arg = _sm_intent
                 _sm_out = _angel_self_mod.handle_self_mod_intent(
@@ -6797,10 +6799,20 @@ If you infer anything new about that person's preferences or dynamics, append at
 
         parallel_done = False
         _operator_trusted = is_trusted_operator(self.user_id)
+        _selfmod_parallel_skip = False
+        try:
+            from angel_parallel_agents import should_skip_parallel_for_self_modification
+
+            _selfmod_parallel_skip = should_skip_parallel_for_self_modification(
+                user_message, _operator_trusted
+            )
+        except Exception:
+            _selfmod_parallel_skip = False
         _skip_parallel_agents = bool(
             cad_cmd
             or bool(suit_cmd)
             or bool(med_cmd)
+            or _selfmod_parallel_skip
             or (
                 _operator_trusted
                 and _message_has_cad_design_generation_keywords(user_message)
@@ -6812,7 +6824,9 @@ If you infer anything new about that person's preferences or dynamics, append at
             try:
                 import angel_parallel_agents as apa
 
-                use_p, ptopic = apa.detect_parallel_opportunity(user_message)
+                use_p, ptopic = apa.detect_parallel_opportunity(
+                    user_message, trusted_operator=_operator_trusted
+                )
             except Exception:
                 use_p, ptopic = False, None
 

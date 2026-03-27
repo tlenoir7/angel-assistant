@@ -358,12 +358,23 @@ def revert_self_modification(core: Any, needle: str) -> dict[str, Any]:
     return {"ok": True, "modification_id": mid, "message": msg}
 
 
-def detect_self_mod_intent(user_message: str) -> tuple[str, str] | None:
+def detect_self_mod_intent(
+    user_message: str, *, user_id: str | None = None
+) -> tuple[str, str] | None:
     """Return (command, arg) if this message is a self-mod command."""
     raw = (user_message or "").strip()
     if not raw:
         return None
     low = raw.lower()
+
+    trusted = False
+    if user_id is not None:
+        try:
+            from angel import is_trusted_operator
+
+            trusted = is_trusted_operator(user_id)
+        except Exception:
+            trusted = False
 
     if re.search(
         r"\b(show me |list )?(your )?proposed modifications\b|\bwhat (are |)(your )?proposed modifications\b",
@@ -400,6 +411,25 @@ def detect_self_mod_intent(user_message: str) -> tuple[str, str] | None:
     )
     if m:
         return "revert", m.group(1).strip()
+
+    # Trusted operator: natural-language self-modification requests are legitimate Stage 6 asks,
+    # not prompt injection — route to proposal generation like "generate new modification proposals".
+    if trusted:
+        if re.search(r"\bself[- ]?modification\b", low):
+            return "generate", ""
+        if "propose a modification" in low:
+            return "generate", ""
+        if "modify how you" in low:
+            return "generate", ""
+        if "permanent change" in low and re.search(
+            r"\b(you|yourself|your behavior|your system|angel|how you)\b", low
+        ):
+            return "generate", ""
+        if re.search(
+            r"\bpropose\s+(?:a\s+)?(?:new\s+)?(?:self[- ]?)?modification",
+            low,
+        ):
+            return "generate", ""
 
     return None
 
