@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
 import asyncio
+import concurrent.futures as _cf
 import functools
 import requests
 from flask import Flask, Response, jsonify, render_template_string, request, send_file
@@ -116,6 +117,23 @@ _network_reset_status: dict = {
     "last_reset_at": None,  # ISO 8601 UTC when last run finished
     "last_error": None,
 }
+
+# Isolated thread pool for /api/files/read so worker threads can time out without blocking the WSGI worker forever.
+_executor = _cf.ThreadPoolExecutor(max_workers=4)
+
+
+def _do_file_read(file_b64, file_name, file_type, context):
+    return angel_file_reading.read_and_analyze_file(
+        file_b64,
+        file_name,
+        file_type,
+        context,
+        angel.anthropic_client,
+        memory_client=angel.memory_client,
+        user_id=angel.user_id,
+        files_cabinet=angel.files_cabinet,
+        use_mem0_cloud=angel._use_mem0_cloud,
+    )
 
 
 _log = logging.getLogger(__name__)
@@ -2595,7 +2613,7 @@ def create_app() -> Flask:
             }), 400
 
         try:
-            print("[files/read] 16 - before read_and_analyze_file", flush=True)
+            print("[files/read] 16 - before read_and_analyze_file (thread pool)", flush=True)
             _log.info(
                 "files/read before angel_file_reading file=%s type=%s b64_len=%s context_len=%s content_type=%s",
                 file_name,
@@ -2604,17 +2622,17 @@ def create_app() -> Flask:
                 len(context or ""),
                 request.content_type or "(none)",
             )
-            r = angel_file_reading.read_and_analyze_file(
-                file_b64,
-                file_name,
-                file_type,
-                context,
-                angel.anthropic_client,
-                memory_client=angel.memory_client,
-                user_id=angel.user_id,
-                files_cabinet=angel.files_cabinet,
-                use_mem0_cloud=angel._use_mem0_cloud,
-            )
+            print("[files/read] submitted to thread pool", flush=True)
+            future = _executor.submit(_do_file_read, file_b64, file_name, file_type, context)
+            try:
+                r = future.result(timeout=50)
+            except _cf.TimeoutError:
+                _log.error("files/read thread pool timed out after 50s file=%s", file_name)
+                return jsonify({"ok": False, "error": "File analysis timed out"}), 504
+            except Exception as e:
+                _log.exception("files/read thread pool error file=%s", file_name)
+                return jsonify({"ok": False, "error": str(e)}), 500
+            print("[files/read] got result from thread pool", flush=True)
             print("[files/read] 17 - after read_and_analyze_file ok=", r.get("ok"), flush=True)
             _log.info(
                 "files/read after angel_file_reading ok=%s extraction_method=%s file_type=%s error=%s",
