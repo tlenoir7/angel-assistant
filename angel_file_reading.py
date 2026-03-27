@@ -24,6 +24,9 @@ _MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB hard guard
 
 _log = logging.getLogger("angel.file_reading")
 
+# Per-request cap so Railway logs show failures instead of hanging on stalled API calls.
+_ANTHROPIC_MESSAGES_TIMEOUT_SEC = 60.0
+
 
 def _truncate(s: str, n: int = _MAX_TEXT_FOR_MODEL) -> str:
     s = s or ""
@@ -284,6 +287,13 @@ def _analyze_with_claude_pdf_document(
         "This PDF could not be fully text-extracted. Read the document and produce the JSON analysis described in the system prompt."
     )
     try:
+        _log.info(
+            "Claude PDF document fallback: messages.create model=%s file=%s pdf_bytes=%s timeout_s=%s",
+            model,
+            file_name,
+            len(raw_pdf),
+            _ANTHROPIC_MESSAGES_TIMEOUT_SEC,
+        )
         resp = anthropic_client.messages.create(
             model=model,
             max_tokens=8192,
@@ -305,7 +315,9 @@ def _analyze_with_claude_pdf_document(
                     ],
                 }
             ],
+            timeout=_ANTHROPIC_MESSAGES_TIMEOUT_SEC,
         )
+        _log.info("Claude PDF document fallback: response received file=%s", file_name)
         return _parse_json_response(resp)
     except Exception:
         _log.exception("Claude PDF document fallback failed for file=%s", file_name)
@@ -335,6 +347,14 @@ def _vision_analyze_image(
         "suggested_filing (string folder name under Intelligence)."
     )
     try:
+        _log.info(
+            "Claude vision (file read): messages.create model=%s file=%s media=%s raw_bytes=%s timeout_s=%s",
+            model,
+            file_name,
+            image_media_type,
+            len(raw),
+            _ANTHROPIC_MESSAGES_TIMEOUT_SEC,
+        )
         resp = anthropic_client.messages.create(
             model=model,
             max_tokens=4096,
@@ -351,7 +371,9 @@ def _vision_analyze_image(
                     ],
                 }
             ],
+            timeout=_ANTHROPIC_MESSAGES_TIMEOUT_SEC,
         )
+        _log.info("Claude vision (file read): response received file=%s", file_name)
         txt = ""
         for block in resp.content:
             if getattr(block, "type", None) == "text":
@@ -373,6 +395,12 @@ def _vision_analyze_image(
             "file_type_detected": f"image ({image_media_type})",
         }
     except Exception as e:
+        _log.error(
+            "Claude vision (file read) failed file=%s err=%s\n%s",
+            file_name,
+            e,
+            traceback.format_exc(),
+        )
         return {"ok": False, "error": str(e)}
 
 
@@ -440,13 +468,38 @@ CONTEXT FROM TYLER:
 --- DOCUMENT TEXT ---
 {_truncate(extracted_text, _MAX_TEXT_FOR_MODEL)}
 """
-    resp = anthropic_client.messages.create(
-        model=model,
-        max_tokens=8192,
-        temperature=0.2,
-        system=_analysis_system_prompt(),
-        messages=[{"role": "user", "content": user_block}],
-    )
+    try:
+        _log.info(
+            "Claude text analysis: messages.create model=%s file=%s kind=%s user_block_chars=%s timeout_s=%s",
+            model,
+            file_name,
+            kind,
+            len(user_block),
+            _ANTHROPIC_MESSAGES_TIMEOUT_SEC,
+        )
+        resp = anthropic_client.messages.create(
+            model=model,
+            max_tokens=8192,
+            temperature=0.2,
+            system=_analysis_system_prompt(),
+            messages=[{"role": "user", "content": user_block}],
+            timeout=_ANTHROPIC_MESSAGES_TIMEOUT_SEC,
+        )
+        _log.info("Claude text analysis: response received file=%s", file_name)
+    except Exception as e:
+        _log.error(
+            "Claude text analysis API failed file=%s kind=%s err=%s\n%s",
+            file_name,
+            kind,
+            e,
+            traceback.format_exc(),
+        )
+        return {
+            "ok": False,
+            "error": f"Claude API error: {e}",
+            "file_type_detected": kind,
+            "extracted_text": _truncate(extracted_text, 8000),
+        }
     parsed = _parse_json_response(resp)
     if not parsed:
         return {
@@ -534,6 +587,14 @@ def read_and_analyze_file(
     Optionally cross-reference when memory_client + files_cabinet provided.
     """
     fn = (file_name or "upload.bin").strip() or "upload.bin"
+    _log.info(
+        "read_and_analyze_file: start file=%s type=%s model=%s b64_len=%s context_len=%s",
+        fn,
+        (file_type or "").strip() or "(none)",
+        model,
+        len(file_content_b64 or ""),
+        len(context or ""),
+    )
     raw = b""
     try:
         raw, decode_note = _decode_file_b64(file_content_b64 or "")
@@ -586,12 +647,25 @@ def read_and_analyze_file(
         mt = _mime_to_kind(file_type or "") or _image_media_type(kind, fn)
         if mt == "image":
             mt = _image_media_type(kind, fn)
+        _log.info(
+            "read_and_analyze_file: image branch file=%s media_type=%s raw_bytes=%s — calling Claude vision",
+            fn,
+            mt,
+            len(raw),
+        )
         vis = _vision_analyze_image(anthropic_client, raw, mt, fn, context, model)
+        _log.info(
+            "read_and_analyze_file: image branch done file=%s ok=%s err=%s",
+            fn,
+            vis.get("ok"),
+            vis.get("error"),
+        )
         if not vis.get("ok"):
             return vis
         vis["vision_used"] = True
         vis["extraction_method"] = "claude_vision"
         if memory_client and files_cabinet and user_id:
+            _log.info("read_and_analyze_file: cross_reference_intel (image) file=%s", fn)
             cr = cross_reference_intel(
                 vis.get("extracted_text") or "",
                 vis.get("entities_found") if isinstance(vis.get("entities_found"), dict) else {},
@@ -604,6 +678,7 @@ def read_and_analyze_file(
         return vis
 
     if kind == "pdf":
+        _log.info("read_and_analyze_file: pdf branch file=%s bytes=%s — extracting text", fn, len(raw))
         extracted, extraction_method = _extract_pdf(raw)
         if len(extracted) < 80:
             pdf_doc_fallback = True
@@ -624,6 +699,7 @@ def read_and_analyze_file(
                 doc_json["extraction_method"] = "claude_pdf_document"
                 doc_json["vision_used"] = False
                 if memory_client and files_cabinet and user_id:
+                    _log.info("read_and_analyze_file: cross_reference_intel (pdf fallback) file=%s", fn)
                     ent = doc_json.get("entities_found") if isinstance(doc_json.get("entities_found"), dict) else {}
                     doc_json.update(
                         cross_reference_intel(
@@ -682,6 +758,14 @@ def read_and_analyze_file(
         extraction_method = "utf-8_fallback"
         kind = "text"
 
+    _log.info(
+        "read_and_analyze_file: extraction done file=%s kind=%s method=%s extracted_chars=%s",
+        fn,
+        kind,
+        extraction_method,
+        len(extracted or ""),
+    )
+
     if not (extracted or "").strip():
         _log.error(
             "No text extracted file=%s kind=%s method=%s bytes=%s",
@@ -697,13 +781,26 @@ def read_and_analyze_file(
             "extraction_method": extraction_method,
         }
 
+    _log.info(
+        "read_and_analyze_file: invoking Claude text analysis model=%s file=%s kind=%s",
+        model,
+        fn,
+        kind,
+    )
     result = _run_text_analysis(anthropic_client, extracted, fn, kind, context, model=model)
+    _log.info(
+        "read_and_analyze_file: Claude text analysis returned ok=%s err=%s file=%s",
+        result.get("ok"),
+        result.get("error"),
+        fn,
+    )
     result["extraction_method"] = extraction_method + (";pdf_claude_fallback" if pdf_doc_fallback else "")
     result["vision_used"] = vision_used
     if not result.get("file_type_detected"):
         result["file_type_detected"] = kind
 
     if memory_client and files_cabinet and user_id:
+        _log.info("read_and_analyze_file: cross_reference_intel (text) file=%s", fn)
         ent = result.get("entities_found") if isinstance(result.get("entities_found"), dict) else {}
         result.update(
             cross_reference_intel(
@@ -716,6 +813,7 @@ def read_and_analyze_file(
             )
         )
 
+    _log.info("read_and_analyze_file: complete ok=%s file=%s", result.get("ok"), fn)
     return result
 
 

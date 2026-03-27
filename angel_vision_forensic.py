@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,6 +22,12 @@ from angel_forensic import (
     decode_image_b64,
     extract_exif_summary,
 )
+
+_log = logging.getLogger("angel.vision_forensic")
+
+# Anthropic image payloads: compress when decoded raster exceeds this (bytes).
+_FORENSIC_MAX_PRE_API_BYTES = 4 * 1024 * 1024
+_ANTHROPIC_MESSAGES_TIMEOUT_SEC = 60.0
 
 VISUAL_INTEL_FOLDER = "Visual Intelligence"
 VI_PREFIX = "VI-"
@@ -280,6 +288,37 @@ def _apply_network_updates(
     return {"applied_nodes": added_n, "applied_edges": added_e, "errors": err[:12]}
 
 
+def _maybe_compress_image_for_api(raw: bytes, file_name: str) -> tuple[bytes, str]:
+    """
+    If decoded image bytes exceed 4MB, resize to fit within 2048x2048 (aspect preserved)
+    and re-encode as JPEG quality 85 for the API.
+    """
+    if len(raw) <= _FORENSIC_MAX_PRE_API_BYTES:
+        return raw, _detect_media_type(raw, file_name)
+    from PIL import Image
+
+    xmb = len(raw) / (1024 * 1024)
+    img = Image.open(io.BytesIO(raw))
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        if img.mode == "P":
+            img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        if img.mode in ("RGBA", "LA"):
+            bg.paste(img, mask=img.split()[-1])
+        else:
+            bg.paste(img)
+        img = bg
+    else:
+        img = img.convert("RGB")
+    img.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85, optimize=True)
+    out = buf.getvalue()
+    ymb = len(out) / (1024 * 1024)
+    _log.info("Image compressed from %.2fmb to %.2fmb", xmb, ymb)
+    return out, "image/jpeg"
+
+
 def _run_forensic_vision_call(
     anthropic_client: anthropic.Anthropic,
     raw: bytes,
@@ -304,6 +343,7 @@ def _run_forensic_vision_call(
                 ],
             }
         ],
+        timeout=_ANTHROPIC_MESSAGES_TIMEOUT_SEC,
     )
     txt = ""
     for block in resp.content:
@@ -345,8 +385,8 @@ def analyze_image_forensic(
     except ValueError as e:
         return {"ok": False, "error": str(e)}
 
-    mt = _detect_media_type(raw, fn)
     exif_block = extract_exif_summary(raw)
+    raw, mt = _maybe_compress_image_for_api(raw, fn)
     ctx = (context or "").strip() or "Tyler submitted this image for forensic visual analysis."
     loc = (tyler_location or "").strip()
     intel_sum = (intelligence_files_summary or "").strip() or "(no cabinet summary)"
