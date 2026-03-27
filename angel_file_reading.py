@@ -515,7 +515,6 @@ CONTEXT FROM TYLER:
         fut = ex.submit(_call)
         try:
             resp = fut.result(timeout=_MESSAGES_FUTURE_TIMEOUT_SEC)
-            print("[run_text_analysis] messages.create returned", flush=True)
         except concurrent.futures.TimeoutError:
             _log.error(
                 "Claude text analysis timed out after %ss file=%s kind=%s",
@@ -545,7 +544,15 @@ CONTEXT FROM TYLER:
             }
     _log.info("Claude text analysis: response received file=%s", file_name)
 
+    print("[run_text_analysis] messages.create returned", flush=True)
+    raw_text = resp.content[0].text if resp.content else ""
+    print("[run_text_analysis] got raw_text length:", len(raw_text), flush=True)
     parsed = _parse_json_response(resp)
+    print(
+        "[run_text_analysis] parsed ok:",
+        parsed.get("ok") if parsed else "None",
+        flush=True,
+    )
     if not parsed:
         return {
             "ok": False,
@@ -556,6 +563,7 @@ CONTEXT FROM TYLER:
     parsed["ok"] = True
     if "extracted_text" not in parsed or not (parsed.get("extracted_text") or "").strip():
         parsed["extracted_text"] = _truncate(extracted_text, _MAX_TEXT_STORE)
+    print("[run_text_analysis] returning result", flush=True)
     return parsed
 
 
