@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import concurrent.futures
 import io
 import json
 import logging
@@ -26,6 +27,9 @@ _log = logging.getLogger("angel.file_reading")
 
 # Per-request cap so Railway logs show failures instead of hanging on stalled API calls.
 _ANTHROPIC_MESSAGES_TIMEOUT_SEC = 60.0
+# Hard ceiling: SDK timeout may not abort blocked reads; outer thread join enforces a real limit.
+_ANTHROPIC_HTTP_TIMEOUT_SEC = 30.0
+_MESSAGES_FUTURE_TIMEOUT_SEC = 45.0
 
 
 def _truncate(s: str, n: int = _MAX_TEXT_FOR_MODEL) -> str:
@@ -286,15 +290,8 @@ def _analyze_with_claude_pdf_document(
         f"FILE_NAME: {file_name}\nCONTEXT FROM TYLER:\n{ctx[:8000]}\n\n"
         "This PDF could not be fully text-extracted. Read the document and produce the JSON analysis described in the system prompt."
     )
-    try:
-        _log.info(
-            "Claude PDF document fallback: messages.create model=%s file=%s pdf_bytes=%s timeout_s=%s",
-            model,
-            file_name,
-            len(raw_pdf),
-            _ANTHROPIC_MESSAGES_TIMEOUT_SEC,
-        )
-        resp = anthropic_client.messages.create(
+    def _call_pdf():
+        return anthropic_client.messages.create(
             model=model,
             max_tokens=8192,
             temperature=0.2,
@@ -315,8 +312,32 @@ def _analyze_with_claude_pdf_document(
                     ],
                 }
             ],
-            timeout=_ANTHROPIC_MESSAGES_TIMEOUT_SEC,
+            timeout=_ANTHROPIC_HTTP_TIMEOUT_SEC,
         )
+
+    try:
+        _log.info(
+            "Claude PDF document fallback: messages.create model=%s file=%s pdf_bytes=%s http_timeout_s=%s future_timeout_s=%s",
+            model,
+            file_name,
+            len(raw_pdf),
+            _ANTHROPIC_HTTP_TIMEOUT_SEC,
+            _MESSAGES_FUTURE_TIMEOUT_SEC,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_call_pdf)
+            try:
+                resp = fut.result(timeout=_MESSAGES_FUTURE_TIMEOUT_SEC)
+            except concurrent.futures.TimeoutError:
+                _log.error(
+                    "Claude PDF document fallback timed out after %ss file=%s",
+                    _MESSAGES_FUTURE_TIMEOUT_SEC,
+                    file_name,
+                )
+                return None
+            except Exception as e:
+                _log.exception("Claude PDF document fallback failed for file=%s err=%s", file_name, e)
+                return None
         _log.info("Claude PDF document fallback: response received file=%s", file_name)
         return _parse_json_response(resp)
     except Exception:
@@ -468,38 +489,59 @@ CONTEXT FROM TYLER:
 --- DOCUMENT TEXT ---
 {_truncate(extracted_text, _MAX_TEXT_FOR_MODEL)}
 """
-    try:
-        _log.info(
-            "Claude text analysis: messages.create model=%s file=%s kind=%s user_block_chars=%s timeout_s=%s",
-            model,
-            file_name,
-            kind,
-            len(user_block),
-            _ANTHROPIC_MESSAGES_TIMEOUT_SEC,
-        )
-        resp = anthropic_client.messages.create(
+
+    def _call():
+        return anthropic_client.messages.create(
             model=model,
             max_tokens=8192,
             temperature=0.2,
             system=_analysis_system_prompt(),
             messages=[{"role": "user", "content": user_block}],
-            timeout=_ANTHROPIC_MESSAGES_TIMEOUT_SEC,
+            timeout=_ANTHROPIC_HTTP_TIMEOUT_SEC,
         )
-        _log.info("Claude text analysis: response received file=%s", file_name)
-    except Exception as e:
-        _log.error(
-            "Claude text analysis API failed file=%s kind=%s err=%s\n%s",
-            file_name,
-            kind,
-            e,
-            traceback.format_exc(),
-        )
-        return {
-            "ok": False,
-            "error": f"Claude API error: {e}",
-            "file_type_detected": kind,
-            "extracted_text": _truncate(extracted_text, 8000),
-        }
+
+    _log.info(
+        "Claude text analysis: messages.create model=%s file=%s kind=%s user_block_chars=%s http_timeout_s=%s future_timeout_s=%s",
+        model,
+        file_name,
+        kind,
+        len(user_block),
+        _ANTHROPIC_HTTP_TIMEOUT_SEC,
+        _MESSAGES_FUTURE_TIMEOUT_SEC,
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_call)
+        try:
+            resp = fut.result(timeout=_MESSAGES_FUTURE_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            _log.error(
+                "Claude text analysis timed out after %ss file=%s kind=%s",
+                _MESSAGES_FUTURE_TIMEOUT_SEC,
+                file_name,
+                kind,
+            )
+            return {
+                "ok": False,
+                "error": f"File analysis timed out after {_MESSAGES_FUTURE_TIMEOUT_SEC:.0f} seconds",
+                "file_type_detected": kind,
+                "extracted_text": _truncate(extracted_text, 8000),
+            }
+        except Exception as e:
+            _log.error(
+                "Claude text analysis API failed file=%s kind=%s err=%s\n%s",
+                file_name,
+                kind,
+                e,
+                traceback.format_exc(),
+            )
+            return {
+                "ok": False,
+                "error": f"Claude API error: {e}",
+                "file_type_detected": kind,
+                "extracted_text": _truncate(extracted_text, 8000),
+            }
+    _log.info("Claude text analysis: response received file=%s", file_name)
+
     parsed = _parse_json_response(resp)
     if not parsed:
         return {
