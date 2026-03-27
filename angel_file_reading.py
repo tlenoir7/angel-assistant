@@ -6,9 +6,12 @@ cross-reference OSINT dossiers and mission network.
 from __future__ import annotations
 
 import base64
+import binascii
 import io
 import json
+import logging
 import re
+import traceback
 from typing import Any
 
 import anthropic
@@ -17,6 +20,9 @@ import anthropic
 _MAX_TEXT_FOR_MODEL = 100_000
 _MAX_TEXT_STORE = 120_000
 _TRUNC_NOTE = "\n\n[… truncated for length …]"
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB hard guard
+
+_log = logging.getLogger("angel.file_reading")
 
 
 def _truncate(s: str, n: int = _MAX_TEXT_FOR_MODEL) -> str:
@@ -129,8 +135,36 @@ def _extract_pdf(raw: bytes) -> tuple[str, str]:
         txt = "\n\n".join(parts).strip()
         if len(txt) >= 40:
             return txt, "pdfplumber"
+        _log.warning(
+            "pdfplumber extracted too little text (len=%s) for PDF bytes=%s",
+            len(txt),
+            len(raw),
+        )
     except Exception:
-        pass
+        _log.exception("PDF extraction failed with pdfplumber")
+    try:
+        import fitz  # pymupdf
+
+        doc = fitz.open(stream=raw, filetype="pdf")
+        parts = []
+        for i, page in enumerate(doc):
+            if i >= 400:
+                break
+            try:
+                t = page.get_text("text") or ""
+                if t.strip():
+                    parts.append(t)
+            except Exception:
+                continue
+        txt = "\n\n".join(parts).strip()
+        if txt:
+            return txt, "pymupdf"
+        _log.warning(
+            "pymupdf extracted no text for PDF bytes=%s",
+            len(raw),
+        )
+    except Exception:
+        _log.exception("PDF extraction failed with pymupdf")
     try:
         from PyPDF2 import PdfReader
 
@@ -145,9 +179,42 @@ def _extract_pdf(raw: bytes) -> tuple[str, str]:
         txt = "\n\n".join(parts).strip()
         if txt:
             return txt, "PyPDF2"
+        _log.warning(
+            "PyPDF2 extracted no text for PDF bytes=%s",
+            len(raw),
+        )
     except Exception:
-        pass
+        _log.exception("PDF extraction failed with PyPDF2")
     return "", "failed"
+
+
+def _decode_file_b64(file_content_b64: str) -> tuple[bytes, str]:
+    """
+    Decode incoming base64 payload safely.
+    Handles raw base64 and data-URI forms like:
+    data:application/pdf;base64,JVBERi0x...
+    """
+    payload = (file_content_b64 or "").strip()
+    if not payload:
+        return b"", "empty"
+    note = "raw_base64"
+    if payload.lower().startswith("data:"):
+        comma = payload.find(",")
+        if comma > 0:
+            hdr = payload[:comma].lower()
+            payload = payload[comma + 1 :].strip()
+            note = f"data_uri:{hdr[:120]}"
+    payload = re.sub(r"\s+", "", payload)
+    try:
+        return base64.b64decode(payload, validate=True), note
+    except binascii.Error:
+        # Fallback for imperfect senders; still log for diagnosis.
+        _log.warning("Strict base64 decode failed; retrying permissive decode.")
+        try:
+            return base64.b64decode(payload, validate=False), note + ";permissive"
+        except Exception:
+            _log.exception("Base64 decode failed (strict+permissive)")
+            raise
 
 
 def _extract_docx(raw: bytes) -> str:
@@ -241,6 +308,7 @@ def _analyze_with_claude_pdf_document(
         )
         return _parse_json_response(resp)
     except Exception:
+        _log.exception("Claude PDF document fallback failed for file=%s", file_name)
         return None
 
 
@@ -468,14 +536,46 @@ def read_and_analyze_file(
     fn = (file_name or "upload.bin").strip() or "upload.bin"
     raw = b""
     try:
-        raw = base64.b64decode(file_content_b64 or "", validate=False)
+        raw, decode_note = _decode_file_b64(file_content_b64 or "")
+        _log.info(
+            "read_and_analyze_file decode ok file=%s type=%s bytes=%s decode=%s",
+            fn,
+            (file_type or "").strip() or "(none)",
+            len(raw),
+            decode_note,
+        )
     except Exception as e:
+        _log.error(
+            "read_and_analyze_file base64 decode failed file=%s type=%s err=%s\n%s",
+            fn,
+            (file_type or "").strip() or "(none)",
+            e,
+            traceback.format_exc(),
+        )
         return {"ok": False, "error": f"invalid base64: {e}"}
 
     if not raw:
         return {"ok": False, "error": "empty file"}
+    if len(raw) > _MAX_UPLOAD_BYTES:
+        _log.warning(
+            "read_and_analyze_file rejected oversized file=%s bytes=%s max=%s",
+            fn,
+            len(raw),
+            _MAX_UPLOAD_BYTES,
+        )
+        return {
+            "ok": False,
+            "error": f"File too large ({len(raw)} bytes). Max supported is {_MAX_UPLOAD_BYTES} bytes.",
+        }
 
     kind = classify_file(fn, file_type, raw)
+    _log.info(
+        "read_and_analyze_file classified file=%s type=%s kind=%s bytes=%s",
+        fn,
+        (file_type or "").strip() or "(none)",
+        kind,
+        len(raw),
+    )
     extraction_method = ""
     extracted = ""
     vision_used = False
@@ -507,6 +607,12 @@ def read_and_analyze_file(
         extracted, extraction_method = _extract_pdf(raw)
         if len(extracted) < 80:
             pdf_doc_fallback = True
+            _log.info(
+                "PDF text extraction low output file=%s method=%s len=%s; trying Claude document fallback.",
+                fn,
+                extraction_method or "failed",
+                len(extracted),
+            )
             doc_json = _analyze_with_claude_pdf_document(anthropic_client, raw, fn, context, model)
             if doc_json and doc_json.get("summary"):
                 doc_json["ok"] = True
@@ -530,7 +636,18 @@ def read_and_analyze_file(
                         )
                     )
                 return doc_json
+            _log.warning(
+                "Claude PDF fallback did not return usable analysis file=%s",
+                fn,
+            )
         if not extracted:
+            _log.error(
+                "PDF read failed file=%s type=%s bytes=%s extraction_method=%s",
+                fn,
+                (file_type or "").strip() or "(none)",
+                len(raw),
+                extraction_method or "failed",
+            )
             return {
                 "ok": False,
                 "error": "Could not extract text from PDF; try a different format or image export.",
@@ -566,6 +683,13 @@ def read_and_analyze_file(
         kind = "text"
 
     if not (extracted or "").strip():
+        _log.error(
+            "No text extracted file=%s kind=%s method=%s bytes=%s",
+            fn,
+            kind,
+            extraction_method,
+            len(raw),
+        )
         return {
             "ok": False,
             "error": f"No text extracted ({extraction_method}); file kind was {kind}.",
