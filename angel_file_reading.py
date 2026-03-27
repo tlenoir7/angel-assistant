@@ -480,6 +480,7 @@ def _run_text_analysis(
     *,
     model: str = "claude-haiku-4-5",
 ) -> dict[str, Any]:
+    print("[run_text_analysis] building prompt", flush=True)
     ctx = (context or "").strip() or "General document review for Tyler's mission."
     user_block = f"""FILE_NAME: {file_name}
 DETECTED_KIND: {kind}
@@ -489,6 +490,7 @@ CONTEXT FROM TYLER:
 --- DOCUMENT TEXT ---
 {_truncate(extracted_text, _MAX_TEXT_FOR_MODEL)}
 """
+    print("[run_text_analysis] calling messages.create", flush=True)
 
     def _call():
         return anthropic_client.messages.create(
@@ -513,6 +515,7 @@ CONTEXT FROM TYLER:
         fut = ex.submit(_call)
         try:
             resp = fut.result(timeout=_MESSAGES_FUTURE_TIMEOUT_SEC)
+            print("[run_text_analysis] messages.create returned", flush=True)
         except concurrent.futures.TimeoutError:
             _log.error(
                 "Claude text analysis timed out after %ss file=%s kind=%s",
