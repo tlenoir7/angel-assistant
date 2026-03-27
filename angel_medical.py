@@ -3087,15 +3087,54 @@ _MEDICAL_TRIGGERS = re.compile(
 _BIOMEDICAL_SIGNAL = re.compile(
     r"(?i)\b("
     r"uniprot|clinvar|kegg|proteomics|genomics|molecular biology|biochemical pathway|signaling pathway|"
-    r"mutation|allele|genotype|transcript|exon|intron|ortholog|paralog|crystallography|"
-    r"enzyme\b|kinase\b|receptor\b|ligand\b|post-translational|transcription factor|"
-    r"gene therapy|gene expression|protein structure|pdb\b|3d structure|"
-    r"genetic basis|pathophysiology|molecular mechanism|binding site|active site"
+    r"genetic variant|single nucleotide polymorphism|mutation|allele|genotype|transcript|exon|intron|ortholog|paralog|crystallography|"
+    r"enzyme|kinase|receptor|ligand|post-translational|transcription factor|"
+    r"gene therapy|gene expression|protein structure|protein folding|pdb|3d structure|"
+    r"genetic basis|pathophysiology|molecular mechanism|binding site|active site|"
+    r"phosphorylation|upregulation|downregulation|signal transduction"
     r")\b"
 )
 
 _SKIP_GENEISH = frozenset(
     {"THE", "AND", "OR", "NOT", "DNA", "RNA", "FDA", "NIH", "CDC", "WHO", "UAP", "USA", "UK", "EU"}
+)
+
+_COMMON_NON_GENE_WORDS = frozenset(
+    {
+        "IT",
+        "HE",
+        "SHE",
+        "THIS",
+        "THAT",
+        "WHAT",
+        "WHEN",
+        "WHERE",
+        "WHY",
+        "HOW",
+        "THEY",
+        "THEM",
+        "WITH",
+        "FROM",
+        "YOUR",
+        "ABOUT",
+        "HAVE",
+        "WERE",
+        "WILL",
+        "WOULD",
+        "SHOULD",
+        "COULD",
+        "CAN",
+        "MAY",
+        "MIGHT",
+    }
+)
+
+_BIOMEDICAL_CONTEXT = re.compile(
+    r"(?i)\b("
+    r"gene|protein|variant|mutation|pathway|molecular|biomedical|biochemistry|genetic|"
+    r"expression|transcript|receptor|kinase|enzyme|ligand|signaling|phosphorylation|"
+    r"uniprot|clinvar|kegg|pdb|crystal structure"
+    r")\b"
 )
 
 
@@ -3126,6 +3165,33 @@ def _detect_biomedical_intent(msg: str) -> tuple[str | None, dict[str, Any]]:
     if len(msg) < 6:
         return None, {}
 
+    biomedical_signal_count = len(_BIOMEDICAL_SIGNAL.findall(msg))
+    has_biomedical_context = bool(_BIOMEDICAL_CONTEXT.search(msg))
+
+    def _valid_gene_symbol(sym: str) -> bool:
+        s = (sym or "").strip()
+        if len(s) < 3:
+            return False
+        if not re.fullmatch(r"[A-Z0-9\-]{3,12}", s):
+            return False
+        if s in _SKIP_GENEISH or s in _COMMON_NON_GENE_WORDS:
+            return False
+        has_letter = any(ch.isalpha() for ch in s)
+        if not has_letter:
+            return False
+        # Accept common gene-like shapes: ALL CAPS and/or letters+numbers.
+        if s.isupper():
+            return True
+        return bool(re.search(r"[A-Z]", s) and re.search(r"\d", s))
+
+    def _biomed_confidence(count: int, ctx: bool, extra: int = 0) -> str:
+        score = count + extra + (1 if ctx else 0)
+        if score >= 4:
+            return "HIGH"
+        if score >= 3:
+            return "MEDIUM"
+        return "LOW"
+
     hgvs = re.search(r"\b([A-Z][A-Z0-9]{1,5})\s+(c\.[^\s]+|p\.[^\s]+)\b", msg)
     rs_m = re.search(r"\brs(\d+)\b", msg, re.I)
     if hgvs or rs_m:
@@ -3134,12 +3200,12 @@ def _detect_biomedical_intent(msg: str) -> tuple[str | None, dict[str, Any]]:
         if not gene_guess:
             gm = re.search(r"\b([A-Z][A-Z0-9]{1,5})\b", msg)
             gene_guess = gm.group(1) if gm and gm.group(1) not in _SKIP_GENEISH else "UNKNOWN"
-        return "genetic_variant", {"gene": gene_guess, "variant": var_part}
+        return "genetic_variant", {"gene": gene_guess, "variant": var_part, "confidence": "HIGH"}
 
     if re.search(r"(?i)\b(genetic basis of|what is the genetic basis of|what's the genetic basis of|what is the genetic basis)\b", msg):
         m = re.search(r"(?i)genetic basis(?:\s+of)?\s+([^?.!\n]{4,120})", msg)
         cond = (m.group(1).strip() if m else msg[:120]).strip()
-        return "genetic_condition", {"condition": cond}
+        return "genetic_condition", {"condition": cond, "confidence": "HIGH"}
 
     if re.search(r"(?i)\b(molecular level|mechanism of action|at the molecular)\b", msg) and re.search(
         r"(?i)\b(drug|medication|metformin|ibuprofen|aspirin|inhibitor|antibody therapy)\b", msg
@@ -3154,34 +3220,46 @@ def _detect_biomedical_intent(msg: str) -> tuple[str | None, dict[str, Any]]:
             drug = hm.group(1).strip() if hm else ""
         if not drug or len(drug) > 50:
             drug = msg[:80].strip()
-        return "drug_target", {"drug": drug}
+        conf = _biomed_confidence(biomedical_signal_count, has_biomedical_context, extra=1)
+        if conf == "LOW":
+            return None, {}
+        return "drug_target", {"drug": drug, "confidence": conf}
 
     if re.search(r"(?i)\b(pathway|signaling pathway|biochemical pathway)\b", msg) or re.search(
         r"(?i)\bwhat pathway\b", msg
     ):
         m = re.search(r"(?i)(?:pathway|pathways)\s+(?:for|in|of|involving)\s+([^?.!\n]{3,100})", msg)
         tgt_use = (m.group(1).strip() if m else "").strip() or msg[:160].strip()
-        return "biomedical_research", {"target": tgt_use[:200], "target_type": "pathway"}
+        conf = _biomed_confidence(max(2, biomedical_signal_count), True, extra=1)
+        return "biomedical_research", {"target": tgt_use[:200], "target_type": "pathway", "confidence": conf}
 
     wdd = re.search(r"(?i)\bwhat\s+(does|is)\s+([A-Z][A-Z0-9]{1,5})\b", msg)
     if wdd:
         sym = wdd.group(2)
-        if sym not in _SKIP_GENEISH:
+        if _valid_gene_symbol(sym) and has_biomedical_context:
             kind = "protein" if "protein" in low else "gene"
-            return "biomedical_research", {"target": sym, "target_type": kind}
+            conf = _biomed_confidence(max(1, biomedical_signal_count), has_biomedical_context)
+            if conf == "HIGH":
+                return "biomedical_research", {"target": sym, "target_type": kind, "confidence": conf}
 
     if 8 <= len(msg) <= 140:
         gm = re.match(r"(?i)what\s+is\s+([A-Z][A-Z0-9]{1,5})\??\s*$", msg)
-        if gm and gm.group(1) not in _SKIP_GENEISH:
-            return "biomedical_research", {"target": gm.group(1), "target_type": "gene"}
+        if gm and _valid_gene_symbol(gm.group(1)) and has_biomedical_context:
+            conf = _biomed_confidence(max(1, biomedical_signal_count), has_biomedical_context)
+            if conf == "HIGH":
+                return "biomedical_research", {"target": gm.group(1), "target_type": "gene", "confidence": conf}
 
-    if _BIOMEDICAL_SIGNAL.search(msg):
+    if biomedical_signal_count >= 2 and has_biomedical_context:
         tt, tgt = _infer_biomedical_target_type(msg)
-        return "biomedical_research", {"target": (tgt[:200] if tgt else msg[:160]), "target_type": tt}
+        conf = _biomed_confidence(biomedical_signal_count, has_biomedical_context)
+        if conf == "LOW":
+            return None, {}
+        return "biomedical_research", {"target": (tgt[:200] if tgt else msg[:160]), "target_type": tt, "confidence": conf}
 
     if re.search(r"(?i)\b(UniProt|ClinVar|crystallography|PDB\b)\b", msg):
         tt, tgt = _infer_biomedical_target_type(msg)
-        return "biomedical_research", {"target": (tgt[:200] if tgt else msg[:160]), "target_type": tt}
+        conf = _biomed_confidence(max(1, biomedical_signal_count), True, extra=1)
+        return "biomedical_research", {"target": (tgt[:200] if tgt else msg[:160]), "target_type": tt, "confidence": conf}
 
     return None, {}
 
@@ -3285,25 +3363,31 @@ def _detect_treatment_design_intent(msg: str) -> tuple[str | None, dict[str, Any
 
 def detect_medical_chat_intent(user_message: str) -> tuple[str | None, dict[str, Any]]:
     msg = (user_message or "").strip()
-    payload: dict[str, Any] = {"original": msg[:500]}
+    payload: dict[str, Any] = {"original": msg[:500], "confidence": "HIGH"}
 
     if len(msg) >= 12 and re.search(r"(?i)\b(clinical trial|recruiting trial|nct\d)", msg):
         m = re.search(r"(?i)for\s+([^?.!\n]{3,80})", msg)
         payload["condition"] = (m.group(1).strip() if m else msg[:120]).strip()
+        payload["confidence"] = "HIGH"
         return "trials", payload
 
     if len(msg) >= 10 and re.search(r"(?i)\b(biological agent|pathogen|bioweapon|biosecurity)\b", msg):
         payload["agent"] = msg[:200]
+        payload["confidence"] = "HIGH"
         return "biological_threat", payload
 
     td_cmd, td_payload = _detect_treatment_design_intent(msg)
     if td_cmd:
         payload.update(td_payload)
+        payload["confidence"] = str(payload.get("confidence") or "HIGH").upper()
         return td_cmd, payload
 
     bio_cmd, bio_payload = _detect_biomedical_intent(msg)
     if bio_cmd:
         payload.update(bio_payload)
+        payload["confidence"] = str(payload.get("confidence") or "MEDIUM").upper()
+        if payload["confidence"] != "HIGH":
+            return None, {}
         return bio_cmd, payload
 
     if len(msg) < 12:
@@ -3315,17 +3399,21 @@ def detect_medical_chat_intent(user_message: str) -> tuple[str | None, dict[str,
 
     if re.search(r"(?i)\b(drug|medication|pill|metformin|ibuprofen|adverse event|side effect|fda)\b", msg):
         payload["drug"] = msg[:200]
+        payload["confidence"] = "HIGH"
         return "drug", payload
 
     if re.search(r"(?i)\b(treatment options|standard of care|what treats)\b", msg):
         payload["condition"] = msg[:200]
+        payload["confidence"] = "HIGH"
         return "treatment", payload
 
     if re.search(r"(?i)\b(literature|pubmed|papers on|studies on|research on)\b", msg):
         payload["query"] = msg[:300]
+        payload["confidence"] = "HIGH"
         return "literature", payload
 
     payload["condition"] = msg[:200]
+    payload["confidence"] = "MEDIUM"
     return "condition", payload
 
 

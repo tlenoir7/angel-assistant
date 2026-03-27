@@ -6383,6 +6383,9 @@ class AngelCore:
             import angel_medical as amed
 
             med_cmd, med_payload = amed.detect_medical_chat_intent(user_message)
+            med_conf = str((med_payload or {}).get("confidence") or "LOW").upper()
+            if med_cmd and med_conf != "HIGH":
+                med_cmd, med_payload = None, {}
         except Exception:
             med_cmd, med_payload = None, {}
 
