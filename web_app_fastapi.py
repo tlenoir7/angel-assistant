@@ -149,6 +149,7 @@ def _do_file_read(file_b64, file_name, file_type, context):
         user_id=angel.user_id,
         files_cabinet=angel.files_cabinet,
         use_mem0_cloud=angel._use_mem0_cloud,
+        skip_analysis=True,
     )
 
 

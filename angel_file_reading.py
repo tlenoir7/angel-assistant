@@ -653,6 +653,7 @@ def read_and_analyze_file(
     files_cabinet: Any | None = None,
     use_mem0_cloud: bool = False,
     model: str = "claude-sonnet-4-5",
+    skip_analysis: bool = False,
 ) -> dict[str, Any]:
     """
     Decode base64 file, extract text by type, analyze with Claude.
@@ -837,19 +838,34 @@ def read_and_analyze_file(
         len(extracted or ""),
     )
 
-    if not (extracted or "").strip():
-        _log.error(
-            "No text extracted file=%s kind=%s method=%s bytes=%s",
+    if skip_analysis or not (extracted or "").strip():
+        if not skip_analysis:
+            _log.error(
+                "No text extracted file=%s kind=%s method=%s bytes=%s",
+                fn,
+                kind,
+                extraction_method,
+                len(raw),
+            )
+            return {
+                "ok": False,
+                "error": f"No text extracted ({extraction_method}); file kind was {kind}.",
+                "file_type_detected": kind,
+                "extraction_method": extraction_method,
+            }
+        _log.info(
+            "read_and_analyze_file: skip_analysis=True — skipping Claude text analysis file=%s kind=%s",
             fn,
             kind,
-            extraction_method,
-            len(raw),
         )
         return {
-            "ok": False,
-            "error": f"No text extracted ({extraction_method}); file kind was {kind}.",
+            "ok": True,
+            "summary": (extracted or "")[:500],
+            "extracted_text": extracted or "",
             "file_type_detected": kind,
             "extraction_method": extraction_method,
+            "intelligence_value": "MEDIUM",
+            "vision_used": False,
         }
 
     _log.info(
