@@ -490,14 +490,27 @@ CONTEXT FROM TYLER:
 --- DOCUMENT TEXT ---
 {_truncate(extracted_text, _MAX_TEXT_FOR_MODEL)}
 """
+    system_prompt = _analysis_system_prompt()
+    mt = 8192
+    print(
+        "[run_text_analysis] system_prompt length:",
+        len(system_prompt) if system_prompt else 0,
+        flush=True,
+    )
+    print(
+        "[run_text_analysis] user_block length:",
+        len(str(user_block)) if user_block else 0,
+        flush=True,
+    )
+    print("[run_text_analysis] max_tokens:", mt, flush=True)
     print("[run_text_analysis] calling messages.create", flush=True)
 
     def _call():
         return anthropic_client.messages.create(
             model=model,
-            max_tokens=8192,
+            max_tokens=mt,
             temperature=0.2,
-            system=_analysis_system_prompt(),
+            system=system_prompt,
             messages=[{"role": "user", "content": user_block}],
             timeout=_ANTHROPIC_HTTP_TIMEOUT_SEC,
         )
