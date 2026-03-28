@@ -3083,6 +3083,30 @@ def create_app() -> Flask:
             traceback.print_exc()
             return jsonify({"ok": False, "error": str(e)}), 500
 
+    @app.route("/api/system/capability-briefing", methods=["GET"])
+    def api_system_capability_briefing():
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        try:
+            import angel_capability_briefing as acb
+
+            rec = angel.files_cabinet.get_file(acb.BRIEFING_FILE_NAME)
+            if rec and (rec.get("content") or "").strip():
+                return jsonify(
+                    {
+                        "ok": True,
+                        "briefing": rec["content"],
+                        "source": "cabinet",
+                        "folder": rec.get("folder"),
+                        "name": rec.get("name"),
+                    }
+                )
+            text = acb.render_capability_briefing_text()
+            return jsonify({"ok": True, "briefing": text, "source": "template"})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     # --- Mission connection graph (network_node / network_edge + Network Intelligence files) ---
 
     @app.route("/api/network/summary", methods=["GET"])

@@ -2890,6 +2890,13 @@ Intelligence File Cabinet (your filing system):
     if (intelligence_files_summary or "").strip():
         persona += "\n" + (intelligence_files_summary or "").strip() + "\n"
 
+    try:
+        from angel_capability_briefing import get_capability_briefing_summary
+
+        persona += "\n" + get_capability_briefing_summary().strip() + "\n"
+    except Exception:
+        pass
+
     stage2 = """
 
 Stage 2 capabilities (use when relevant; also follow explicit user requests):
@@ -6577,6 +6584,13 @@ class AngelCore:
                 user_id=self.user_id,
                 use_mem0_cloud=self._use_mem0_cloud,
             )
+        except Exception:
+            pass
+
+        try:
+            import angel_capability_briefing as _acb
+
+            _acb.ensure_capability_briefing_filed(self)
         except Exception:
             pass
 
