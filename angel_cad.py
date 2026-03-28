@@ -1233,6 +1233,16 @@ def get_or_create_thumbnail_png_bytes(session_id: str, design_name: str) -> tupl
         return None, str(e)
 
 
+def _api_download_path(design_name: str, filesystem_path: str | Path | None) -> str | None:
+    """Relative app URL for a file under a design folder (matches GET /api/cad/download/<design>/<filename>)."""
+    if not design_name or not filesystem_path:
+        return None
+    fname = Path(str(filesystem_path)).name
+    if not fname:
+        return None
+    return f"/api/cad/download/{design_name}/{fname}"
+
+
 def enrich_with_download_urls(result: dict[str, Any], base_url: str) -> dict[str, Any]:
     if not result.get("ok"):
         return result
@@ -1241,23 +1251,65 @@ def enrich_with_download_urls(result: dict[str, Any], base_url: str) -> dict[str
     urls: dict[str, str] = {}
     for k, pth in (result.get("files_generated") or {}).items():
         if pth and dn:
-            urls[str(k)] = f"{base}/api/cad/download/{dn}/{Path(str(pth)).name}"
+            rel = _api_download_path(str(dn), pth)
+            if rel:
+                urls[str(k)] = f"{base}{rel}" if base else rel
     out = dict(result)
     out["download_urls"] = urls
     return out
 
 
+def cad_result_for_chat_prompt(
+    cad_result: dict[str, Any],
+    *,
+    base_url: str = "",
+) -> dict[str, Any]:
+    """
+    Copy of a CAD result for LLM / chat context: no server filesystem paths.
+    ``files_generated`` values become ``/api/cad/download/<design>/<file>`` (optional ``base_url`` prefix).
+    ``download_urls`` matches those paths. Drops ``design_dir`` and ``design_brief_json``.
+    """
+    out = dict(cad_result)
+    if not out.get("ok"):
+        return out
+    dn = str(out.get("design_name") or "").strip()
+    base = (base_url or "").rstrip("/")
+    fg_raw = out.get("files_generated") or {}
+    files_api: dict[str, str] = {}
+    download_urls: dict[str, str] = {}
+    for k, pth in fg_raw.items():
+        if not pth or not dn:
+            continue
+        rel = _api_download_path(dn, pth)
+        if not rel:
+            continue
+        key = str(k)
+        files_api[key] = rel
+        download_urls[key] = f"{base}{rel}" if base else rel
+    out["files_generated"] = files_api
+    out["download_urls"] = download_urls
+    out.pop("design_dir", None)
+    out.pop("design_brief_json", None)
+    return out
+
+
 def format_cad_block_for_prompt(cad_result: dict[str, Any], *, base_url: str = "") -> str:
+    payload = cad_result_for_chat_prompt(cad_result, base_url=base_url)
     lines = [
         "[Angel CAD generation — structured results]",
-        json.dumps(cad_result, indent=2, default=str),
+        json.dumps(payload, indent=2, default=str),
         "",
-        "Instructions: Summarize what was built, list downloadable STEP/STL paths or URLs, note assumptions. "
+        "Instructions: Summarize what was built. Tell Tyler to download STEP/STL/IGES using the "
+        "`download_urls` (or `files_generated`) entries — each value is an API path like "
+        "`/api/cad/download/<design_name>/<filename>`; prepend the site origin if needed. "
+        "Do not mention server filesystem paths such as /tmp. Note assumptions. "
         "If backend is unavailable, say cadquery must be installed.",
     ]
-    if base_url and cad_result.get("ok") and cad_result.get("design_name"):
-        dn = cad_result["design_name"]
-        lines.append(f"Download pattern: {base_url}/api/cad/download/{dn}/<filename>")
+    if payload.get("ok") and payload.get("design_name"):
+        dn = payload["design_name"]
+        root = (base_url or "").rstrip("/")
+        pat = f"{root}/api/cad/download/{dn}/<filename>" if root else f"/api/cad/download/{dn}/<filename>"
+        lines.append(f"Download pattern: {pat}")
     return "\n".join(lines)
 
 
