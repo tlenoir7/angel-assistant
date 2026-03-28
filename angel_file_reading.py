@@ -482,7 +482,6 @@ def _run_text_analysis(
     *,
     model: str = "claude-haiku-4-5",
 ) -> dict[str, Any]:
-    print("[run_text_analysis] building prompt", flush=True)
     ctx = (context or "").strip() or "General document review for Tyler's mission."
     user_block = f"""FILE_NAME: {file_name}
 DETECTED_KIND: {kind}
@@ -494,18 +493,6 @@ CONTEXT FROM TYLER:
 """
     system_prompt = _analysis_system_prompt()
     mt = 8192
-    print(
-        "[run_text_analysis] system_prompt length:",
-        len(system_prompt) if system_prompt else 0,
-        flush=True,
-    )
-    print(
-        "[run_text_analysis] user_block length:",
-        len(str(user_block)) if user_block else 0,
-        flush=True,
-    )
-    print("[run_text_analysis] max_tokens:", mt, flush=True)
-    print("[run_text_analysis] calling messages.create", flush=True)
 
     def _call():
         return anthropic_client.messages.create(
@@ -559,15 +546,7 @@ CONTEXT FROM TYLER:
             }
     _log.info("Claude text analysis: response received file=%s", file_name)
 
-    print("[run_text_analysis] messages.create returned", flush=True)
-    raw_text = resp.content[0].text if resp.content else ""
-    print("[run_text_analysis] got raw_text length:", len(raw_text), flush=True)
     parsed = _parse_json_response(resp)
-    print(
-        "[run_text_analysis] parsed ok:",
-        parsed.get("ok") if parsed else "None",
-        flush=True,
-    )
     if not parsed:
         return {
             "ok": False,
@@ -578,7 +557,6 @@ CONTEXT FROM TYLER:
     parsed["ok"] = True
     if "extracted_text" not in parsed or not (parsed.get("extracted_text") or "").strip():
         parsed["extracted_text"] = _truncate(extracted_text, _MAX_TEXT_STORE)
-    print("[run_text_analysis] returning result", flush=True)
     return parsed
 
 
