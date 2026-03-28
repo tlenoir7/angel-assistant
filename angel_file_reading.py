@@ -30,6 +30,8 @@ _ANTHROPIC_MESSAGES_TIMEOUT_SEC = 60.0
 # Hard ceiling: SDK timeout may not abort blocked reads; outer thread join enforces a real limit.
 _ANTHROPIC_HTTP_TIMEOUT_SEC = 30.0
 _MESSAGES_FUTURE_TIMEOUT_SEC = 45.0
+# cross_reference_intel: cap Mem0/graph and cabinet list_files so xref never blocks the request.
+_CROSS_REF_EXTERNAL_TIMEOUT_SEC = 10.0
 
 
 def _truncate(s: str, n: int = _MAX_TEXT_FOR_MODEL) -> str:
@@ -594,25 +596,42 @@ def cross_reference_intel(
 
     blob = (extracted_text or "")[:200_000].lower()
     hits: list[dict[str, Any]] = []
+
+    def _load_graph():
+        return ang.network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
+
+    nodes: dict[str, Any] | None = None
     try:
-        nodes, _edges = ang.network_load_graph(memory_client, user_id, use_mem0_cloud, files_cabinet)
-        for nid, node in (nodes or {}).items():
-            name = (node.get("name") or nid or "").strip()
-            if len(name) < 3:
-                continue
-            if name.lower() in blob:
-                hits.append(
-                    {
-                        "type": "network_node",
-                        "id": nid,
-                        "name": name,
-                        "relevance": node.get("relevance"),
-                    }
-                )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex_g:
+            _fut_g = _ex_g.submit(_load_graph)
+            nodes, _edges = _fut_g.result(timeout=_CROSS_REF_EXTERNAL_TIMEOUT_SEC)
+    except concurrent.futures.TimeoutError:
+        _log.warning(
+            "cross_reference_intel: network_load_graph timed out after %ss — skipping network matches",
+            _CROSS_REF_EXTERNAL_TIMEOUT_SEC,
+        )
     except Exception:
         pass
 
-    # Entity strings
+    if nodes is not None:
+        try:
+            for nid, node in (nodes or {}).items():
+                name = (node.get("name") or nid or "").strip()
+                if len(name) < 3:
+                    continue
+                if name.lower() in blob:
+                    hits.append(
+                        {
+                            "type": "network_node",
+                            "id": nid,
+                            "name": name,
+                            "relevance": node.get("relevance"),
+                        }
+                    )
+        except Exception:
+            pass
+
+    # Entity strings (local only — no Mem0)
     ent = entities_found if isinstance(entities_found, dict) else {}
     for cat in ("people", "organizations"):
         for x in ent.get(cat) or []:
@@ -621,8 +640,25 @@ def cross_reference_intel(
                 hits.append({"type": "entity_mention", "name": s, "category": cat})
 
     osint_matches: list[str] = []
+
+    def _list_osint_metas():
+        return list(files_cabinet.list_files(folder=ang.OSINT_DOSSIERS_FOLDER))
+
+    metas: list[Any] = []
     try:
-        for meta in files_cabinet.list_files(folder=ang.OSINT_DOSSIERS_FOLDER):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex_o:
+            _fut_o = _ex_o.submit(_list_osint_metas)
+            metas = _fut_o.result(timeout=_CROSS_REF_EXTERNAL_TIMEOUT_SEC)
+    except concurrent.futures.TimeoutError:
+        _log.warning(
+            "cross_reference_intel: OSINT list_files timed out after %ss — skipping dossier hits",
+            _CROSS_REF_EXTERNAL_TIMEOUT_SEC,
+        )
+    except Exception:
+        pass
+
+    try:
+        for meta in metas:
             fname = (meta.get("name") or "").strip()
             if not fname:
                 continue
@@ -645,24 +681,9 @@ def _merge_cross_reference_intel(
     use_mem0_cloud: bool,
     files_cabinet: Any,
 ) -> None:
-    """Run cross_reference_intel in a worker with a hard timeout; merge into out or log and skip."""
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as xref_ex:
-            xref_future = xref_ex.submit(
-                cross_reference_intel,
-                extracted_text,
-                entities_found,
-                memory_client=memory_client,
-                user_id=user_id,
-                use_mem0_cloud=use_mem0_cloud,
-                files_cabinet=files_cabinet,
-            )
-            xref_result = xref_future.result(timeout=20)
-            out.update(xref_result)
-    except concurrent.futures.TimeoutError:
-        _log.warning("cross_reference_intel timed out after 20s - skipping")
-    except Exception as e:
-        _log.warning("cross_reference_intel failed: %s - skipping", e)
+    # Skipped — causes deadlock with local memory lock when xref runs in a worker thread.
+    # Cross-referencing is non-critical for file reading; re-enable when lock contention is resolved.
+    return
 
 
 def read_and_analyze_file(
@@ -761,18 +782,17 @@ def read_and_analyze_file(
             return vis
         vis["vision_used"] = True
         vis["extraction_method"] = "claude_vision"
-        # Temporarily disabled - causes hangs
-        # if memory_client and files_cabinet and user_id:
-        #     _log.info("read_and_analyze_file: cross_reference_intel (image) file=%s", fn)
-        #     _merge_cross_reference_intel(
-        #         vis,
-        #         vis.get("extracted_text") or "",
-        #         vis.get("entities_found") if isinstance(vis.get("entities_found"), dict) else {},
-        #         memory_client=memory_client,
-        #         user_id=user_id,
-        #         use_mem0_cloud=use_mem0_cloud,
-        #         files_cabinet=files_cabinet,
-        #     )
+        if memory_client and files_cabinet and user_id:
+            _log.info("read_and_analyze_file: cross_reference_intel (image) file=%s", fn)
+            _merge_cross_reference_intel(
+                vis,
+                vis.get("extracted_text") or "",
+                vis.get("entities_found") if isinstance(vis.get("entities_found"), dict) else {},
+                memory_client=memory_client,
+                user_id=user_id,
+                use_mem0_cloud=use_mem0_cloud,
+                files_cabinet=files_cabinet,
+            )
         return vis
 
     if kind == "pdf":
@@ -796,19 +816,18 @@ def read_and_analyze_file(
                 )
                 doc_json["extraction_method"] = "claude_pdf_document"
                 doc_json["vision_used"] = False
-                # Temporarily disabled - causes hangs
-                # if memory_client and files_cabinet and user_id:
-                #     _log.info("read_and_analyze_file: cross_reference_intel (pdf fallback) file=%s", fn)
-                #     ent = doc_json.get("entities_found") if isinstance(doc_json.get("entities_found"), dict) else {}
-                #     _merge_cross_reference_intel(
-                #         doc_json,
-                #         doc_json.get("extracted_text") or "",
-                #         ent,
-                #         memory_client=memory_client,
-                #         user_id=user_id,
-                #         use_mem0_cloud=use_mem0_cloud,
-                #         files_cabinet=files_cabinet,
-                #     )
+                if memory_client and files_cabinet and user_id:
+                    _log.info("read_and_analyze_file: cross_reference_intel (pdf fallback) file=%s", fn)
+                    ent = doc_json.get("entities_found") if isinstance(doc_json.get("entities_found"), dict) else {}
+                    _merge_cross_reference_intel(
+                        doc_json,
+                        doc_json.get("extracted_text") or "",
+                        ent,
+                        memory_client=memory_client,
+                        user_id=user_id,
+                        use_mem0_cloud=use_mem0_cloud,
+                        files_cabinet=files_cabinet,
+                    )
                 return doc_json
             _log.warning(
                 "Claude PDF fallback did not return usable analysis file=%s",
@@ -912,19 +931,18 @@ def read_and_analyze_file(
     if not result.get("file_type_detected"):
         result["file_type_detected"] = kind
 
-    # Temporarily disabled - causes hangs
-    # if memory_client and files_cabinet and user_id:
-    #     _log.info("read_and_analyze_file: cross_reference_intel (text) file=%s", fn)
-    #     ent = result.get("entities_found") if isinstance(result.get("entities_found"), dict) else {}
-    #     _merge_cross_reference_intel(
-    #         result,
-    #         extracted,
-    #         ent,
-    #         memory_client=memory_client,
-    #         user_id=user_id,
-    #         use_mem0_cloud=use_mem0_cloud,
-    #         files_cabinet=files_cabinet,
-    #     )
+    if memory_client and files_cabinet and user_id:
+        _log.info("read_and_analyze_file: cross_reference_intel (text) file=%s", fn)
+        ent = result.get("entities_found") if isinstance(result.get("entities_found"), dict) else {}
+        _merge_cross_reference_intel(
+            result,
+            extracted,
+            ent,
+            memory_client=memory_client,
+            user_id=user_id,
+            use_mem0_cloud=use_mem0_cloud,
+            files_cabinet=files_cabinet,
+        )
 
     _log.info("read_and_analyze_file: complete ok=%s file=%s", result.get("ok"), fn)
     return result
