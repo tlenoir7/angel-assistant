@@ -71,6 +71,8 @@ from angel import (
     run_threat_detection,
     format_threat_intelligence_for_briefing,
     OSINT_DOSSIERS_FOLDER,
+    list_osint_dossiers_from_local_memory,
+    is_cabinet_record_osint_dossier,
     run_osint_background,
     NETWORK_INTEL_FOLDER,
     add_network_node,
@@ -3057,7 +3059,7 @@ def create_app() -> Flask:
         if angel is None:
             return jsonify({"error": "Angel not initialized"}), 503
         try:
-            recs = angel.files_cabinet.list_files(folder=OSINT_DOSSIERS_FOLDER)
+            recs = list_osint_dossiers_from_local_memory(angel.user_id)
             return jsonify({"ok": True, "folder": OSINT_DOSSIERS_FOLDER, "dossiers": recs})
         except Exception as e:
             traceback.print_exc()
@@ -3074,7 +3076,7 @@ def create_app() -> Flask:
             rec = angel.files_cabinet.get_file(fname)
             if not rec:
                 return jsonify({"ok": False, "error": f"No file named {fname!r}."}), 404
-            if (rec.get("folder") or "").strip().lower() != OSINT_DOSSIERS_FOLDER.lower():
+            if not is_cabinet_record_osint_dossier(rec):
                 return jsonify({"ok": False, "error": "Not an OSINT dossier file."}), 404
             return jsonify({"ok": True, "dossier": rec})
         except Exception as e:

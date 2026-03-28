@@ -904,6 +904,83 @@ def _parse_intelligence_tags(meta: dict) -> list[str]:
     return []
 
 
+def _local_entry_matches_osint_dossier(meta: dict) -> bool:
+    """
+    True if a local memory row should be treated as an OSINT dossier for listing/API.
+    Matches: Intelligence folder, category substring osint_dossier, tag osint_dossier, or filename pattern.
+    """
+    if not isinstance(meta, dict):
+        return False
+    folder = (meta.get("folder") or "").strip().lower()
+    if folder == OSINT_DOSSIERS_FOLDER.lower():
+        return True
+    cat = str(meta.get("category") or "").strip().lower()
+    if "osint_dossier" in cat:
+        return True
+    tags_l = [t.lower() for t in _parse_intelligence_tags(meta)]
+    if any("osint_dossier" in t for t in tags_l):
+        return True
+    fname = (meta.get("file_name") or "").strip().lower()
+    if fname.startswith("osint") or fname.endswith("-osint"):
+        return True
+    return False
+
+
+def list_osint_dossiers_from_local_memory(user_id: str) -> list[dict]:
+    """
+    List OSINT dossiers from tyler_memories.json (local), including rows that are not
+    category intelligence_file (e.g. legacy Mem0 migration metadata).
+    Each item matches FilesCabinet.list_files metadata shape (no content).
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    uid = (user_id or "").strip() or "default-user"
+    for entry in _load_local_memory_entries(uid):
+        if not isinstance(entry, dict):
+            continue
+        meta = entry.get("metadata")
+        if not isinstance(meta, dict):
+            continue
+        fname = (meta.get("file_name") or "").strip()
+        if not fname:
+            continue
+        if not _local_entry_matches_osint_dossier(meta):
+            continue
+        rec = {
+            "name": fname,
+            "folder": (meta.get("folder") or "").strip() or "Uncategorized",
+            "created_at": (meta.get("created_at") or entry.get("created_at") or "").strip(),
+            "updated_at": (
+                (meta.get("updated_at") or meta.get("timestamp") or meta.get("created_at") or "")
+            ).strip(),
+            "tags": _parse_intelligence_tags(meta),
+        }
+        key = fname.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(rec)
+    try:
+        out.sort(key=lambda r: (r["folder"].lower(), r["name"].lower()))
+    except Exception:
+        pass
+    return out
+
+
+def is_cabinet_record_osint_dossier(rec: dict) -> bool:
+    """Whether a FilesCabinet record (from get_file) should be exposed as an OSINT dossier."""
+    if not isinstance(rec, dict):
+        return False
+    folder = (rec.get("folder") or "").strip().lower()
+    if folder == OSINT_DOSSIERS_FOLDER.lower():
+        return True
+    name = (rec.get("name") or "").strip().lower()
+    if name.startswith("osint") or name.endswith("-osint"):
+        return True
+    tags = [str(t).lower() for t in (rec.get("tags") or [])]
+    return any("osint_dossier" in t for t in tags)
+
+
 def _intelligence_file_metadata(
     *,
     file_name: str,
@@ -1007,9 +1084,11 @@ class FilesCabinet:
             meta = entry.get("metadata")
             if not isinstance(meta, dict):
                 continue
-            if meta.get("category") != CATEGORY_INTELLIGENCE_FILE:
+            if (meta.get("file_name") or "").strip() != target:
                 continue
-            if (meta.get("file_name") or "").strip() == target:
+            if meta.get("category") == CATEGORY_INTELLIGENCE_FILE:
+                return i
+            if _local_entry_matches_osint_dossier(meta):
                 return i
         return None
 
