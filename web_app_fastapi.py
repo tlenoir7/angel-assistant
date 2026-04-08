@@ -2147,6 +2147,31 @@ def create_app() -> Flask:
             }
         )
 
+    @app.route("/api/admin/delete-last-memories", methods=["DELETE"])
+    def api_admin_delete_last_memories():
+        """
+        Admin maintenance: delete the last N local memories for a given user bucket.
+
+        DELETE /api/admin/delete-last-memories?n=20&user_id=tyler
+        """
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        n_raw = (request.args.get("n") or "").strip()
+        uid = (request.args.get("user_id") or "").strip() or (angel.user_id or "tyler")
+        try:
+            n = int(n_raw) if n_raw else 20
+        except ValueError:
+            return jsonify({"ok": False, "error": "Invalid n (must be int)."}), 400
+        try:
+            import angel as _ang
+
+            r = _ang.delete_last_n_local_memories(uid, n)
+            code = 200 if r.get("ok") else 400
+            return jsonify(r), code
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.route("/api/memories/search", methods=["GET"])
     def api_memories_search():
         """
