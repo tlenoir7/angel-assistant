@@ -290,41 +290,32 @@ use your systems.]
 
 def file_capability_briefing(angel_instance: Any) -> str:
     """
-    File the capability briefing to the Intelligence File Cabinet.
-    Returns the briefing text (whether or not a new file was created).
+    Write the latest capability briefing to the Intelligence File Cabinet.
+    Creates the file if missing; overwrites content if it already exists.
+    Returns the briefing text.
     """
     content = render_capability_briefing_text()
     fc = getattr(angel_instance, "files_cabinet", None) if angel_instance else None
     if fc is None:
         return content
+    tags = [
+        "capability_briefing",
+        "self_knowledge",
+        "operational_reference",
+        "system",
+    ]
     try:
-        fc.create_file(
-            BRIEFING_FOLDER,
-            BRIEFING_FILE_NAME,
-            content,
-            tags=[
-                "capability_briefing",
-                "self_knowledge",
-                "operational_reference",
-                "system",
-            ],
-        )
-    except ValueError:
-        # Already exists (unique name constraint)
-        pass
+        if fc.get_file(BRIEFING_FILE_NAME):
+            fc.update_file(BRIEFING_FILE_NAME, content)
+        else:
+            fc.create_file(BRIEFING_FOLDER, BRIEFING_FILE_NAME, content, tags=tags)
     except Exception:
         pass
     return content
 
 
 def ensure_capability_briefing_filed(angel_instance: Any) -> None:
-    """On startup: create the cabinet file once if missing."""
+    """On startup: always sync the cabinet briefing from the latest template (create or overwrite)."""
     if not angel_instance or not getattr(angel_instance, "files_cabinet", None):
-        return
-    fc = angel_instance.files_cabinet
-    try:
-        if fc.get_file(BRIEFING_FILE_NAME):
-            return
-    except Exception:
         return
     file_capability_briefing(angel_instance)
