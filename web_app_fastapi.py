@@ -2147,6 +2147,127 @@ def create_app() -> Flask:
             }
         )
 
+    @app.route("/api/memories/search", methods=["GET"])
+    def api_memories_search():
+        """
+        Search Tyler's *local* memories (tyler_memories.json) for a substring match.
+        Returns up to 50 matches with {id, content}.
+        """
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        q = (request.args.get("q") or "").strip()
+        if not q:
+            return jsonify({"ok": True, "q": "", "matches": []})
+        ql = q.lower()
+        try:
+            import angel as _ang
+
+            uid = (angel.user_id or "").strip() or "tyler"
+            matches: list[dict] = []
+            with _ang._LOCAL_MEMORY_FILE_LOCK:
+                data = _ang._load_local_memory_file_data_impl()
+                users = data.get("users") if isinstance(data, dict) else {}
+                rows = users.get(uid, []) if isinstance(users, dict) else []
+                if not isinstance(rows, list):
+                    rows = []
+                for i, row in enumerate(rows):
+                    if not isinstance(row, dict):
+                        continue
+                    body = row.get("memory") or row.get("data") or row.get("text") or ""
+                    if not isinstance(body, str):
+                        body = str(body or "")
+                    if ql not in body.lower():
+                        continue
+                    mid = None
+                    for k in ("id", "memory_id", "memoryId"):
+                        v = row.get(k)
+                        if v and isinstance(v, str) and v.strip():
+                            mid = v.strip()
+                            break
+                    if mid is None:
+                        meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                        v = (meta.get("mem0_memory_id") or "").strip() if isinstance(meta, dict) else ""
+                        if v:
+                            mid = v
+                    if mid is None:
+                        mid = f"local:{i}"
+                    matches.append({"id": mid, "content": body})
+                    if len(matches) >= 50:
+                        break
+            return jsonify({"ok": True, "q": q, "matches": matches})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.route("/api/memories/delete/<path:memory_id>", methods=["DELETE"])
+    def api_memories_delete(memory_id):
+        """
+        Delete a single memory row from tyler_memories.json by id.
+        Supports:
+        - row['id'] / row['memory_id'] / row['memoryId']
+        - row['metadata']['mem0_memory_id']
+        - synthetic ids returned by /api/memories/search: local:<index>
+        """
+        if angel is None:
+            return jsonify({"error": "Angel not initialized"}), 503
+        mid_in = (memory_id or "").strip()
+        if not mid_in:
+            return jsonify({"ok": False, "error": "Missing memory_id."}), 400
+        try:
+            import angel as _ang
+
+            uid = (angel.user_id or "").strip() or "tyler"
+            deleted = False
+            with _ang._LOCAL_MEMORY_FILE_LOCK:
+                data = _ang._load_local_memory_file_data_impl()
+                if not isinstance(data, dict):
+                    return jsonify({"ok": False, "error": "Memory store is not a dict."}), 500
+                users = data.get("users")
+                if not isinstance(users, dict):
+                    return jsonify({"ok": False, "error": "Memory store missing users bucket."}), 500
+                rows = users.get(uid, [])
+                if not isinstance(rows, list):
+                    rows = []
+                # Fast path for local:<index>
+                if mid_in.lower().startswith("local:"):
+                    try:
+                        idx = int(mid_in.split(":", 1)[1])
+                    except Exception:
+                        idx = -1
+                    if 0 <= idx < len(rows):
+                        rows.pop(idx)
+                        users[uid] = rows
+                        _ang._write_local_memory_file_silent_impl(data)
+                        deleted = True
+                if not deleted:
+                    kept: list = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            kept.append(row)
+                            continue
+                        row_ids: list[str] = []
+                        for k in ("id", "memory_id", "memoryId"):
+                            v = row.get(k)
+                            if v and isinstance(v, str) and v.strip():
+                                row_ids.append(v.strip())
+                        meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                        v2 = (meta.get("mem0_memory_id") or "").strip() if isinstance(meta, dict) else ""
+                        if v2:
+                            row_ids.append(v2)
+                        if mid_in in row_ids:
+                            deleted = True
+                            continue
+                        kept.append(row)
+                    if deleted:
+                        users[uid] = kept
+                        _ang._write_local_memory_file_silent_impl(data)
+            if not deleted:
+                return jsonify({"ok": False, "error": "Memory not found."}), 404
+            return jsonify({"ok": True, "deleted": True, "memory_id": mid_in})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.route("/api/voice", methods=["POST"])
     def api_voice():
         global last_activity_at, check_in_message, check_in_generated_at
