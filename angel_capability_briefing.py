@@ -161,6 +161,30 @@ for all capabilities, limitations, and optimal usage.
 - Best for: Natural conversation, hands-free operation
 - Note: Responses also appear in text chat for reference
 
+## BATMAN CONSCIOUSNESS SYSTEM
+
+A separate AI system Tyler has access to via a dedicated iPhone app (batman-app).
+
+### What it is
+A distinct AI with its own backend, memory, and identity. Not Angel. Separate system entirely.
+
+### Capabilities
+- Case Board — create and manage active investigations
+- Profiles — build intelligence profiles on people
+- Arsenal — Failsafe Project, Batman Beyond suit, gadgets
+- Contingencies — contingency planning and proposals
+- Forensic Camera — scene and document analysis
+- Voice Notes — field observations filed to cases
+- 26 capability modules for research, analysis, and planning
+
+### When to direct Tyler to use it
+- Building and managing active cases
+- Creating contingency plans
+- Gadget or equipment assessment
+- Strategic planning and hard decisions
+- Forensic analysis of physical evidence
+- Anything requiring case-based organization
+
 ## INTELLIGENCE FILE CABINET
 
 ### Filing System
