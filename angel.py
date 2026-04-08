@@ -822,6 +822,46 @@ def _save_local_memory_entries(user_id: str, entries: list) -> None:
         pass
 
 
+def delete_last_n_local_memories(user_id: str, n: int) -> dict[str, Any]:
+    """
+    Remove the last n memory rows for ``user_id`` in ``tyler_memories.json`` (append order).
+    Used for maintenance (e.g. Railway shell). Returns counts and ``ok`` status.
+    """
+    uid = (user_id or "").strip() or "tyler"
+    try:
+        nn = max(0, int(n))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid n", "removed": 0, "user_id": uid}
+    entries = _load_local_memory_entries(uid)
+    if not isinstance(entries, list):
+        return {"ok": False, "error": "could not load memories", "removed": 0, "user_id": uid}
+    before = len(entries)
+    if nn == 0:
+        return {"ok": True, "removed": 0, "remaining": before, "user_id": uid}
+    if before == 0:
+        return {
+            "ok": False,
+            "error": f"no local memories for user_id={uid!r} (wrong ANGEL_USER_ID?)",
+            "removed": 0,
+            "remaining": 0,
+            "user_id": uid,
+        }
+    removed = min(nn, before)
+    new_entries = entries[:-removed]
+    _save_local_memory_entries(uid, new_entries)
+    after = len(_load_local_memory_entries(uid))
+    if after != before - removed:
+        return {
+            "ok": False,
+            "error": "write verify failed (disk or lock issue)",
+            "removed": 0,
+            "remaining": after,
+            "expected_remaining": before - removed,
+            "user_id": uid,
+        }
+    return {"ok": True, "removed": removed, "remaining": after, "user_id": uid}
+
+
 def _network_upsert_structured_memory(
     memory_client,
     user_id: str,
